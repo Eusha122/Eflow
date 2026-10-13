@@ -90,7 +90,7 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 |---|---|---|
 | 0 | Mascot asset: art, rig, expressions, clips, export pipeline | done |
 | 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | done |
-| 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | |
+| 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | done |
 | 2 | Music: SMTC, artwork, progress, controls, mascot states | |
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex installers (`eflow-hook --install`) | |
 | 4 | Notifications: sparse package identity, listener, history (SQLite), per-app/privacy | |
@@ -113,6 +113,12 @@ the runtime asset:
      `permission` (2.4 s loop), keyed from small motion functions.
    - `export_glb.py`: `assets/mascot/eflow.glb`.
 4. Preview renders (EEVEE, unlit) and `build/mascot/render/preview.html`.
+
+In the app the mascot lives inside the open panel (right-hand side), anchored to the live panel rect so
+it rides the open/close springs and rises in with the content. It renders only while the panel is
+visible: a closed, idle island renders no frames at all. Notifications and AI permission requests open
+the panel on their own (a notification closes again after a few seconds; a permission request stays
+until it is answered) on the matching tab.
 
 Runtime contract for the app's player:
 

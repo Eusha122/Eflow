@@ -17,9 +17,9 @@ public:
 
     bool Init(ID3D11Device* device, const MascotAsset& asset);
 
-    // Draws the base mesh and the face patches for `face` into `target`.
+    // Draws the base mesh and the face patches for `face` into `target`, clipped to `clip` (pixels).
     // `viewProj` maps model space to clip space (row-vector convention).
-    void Draw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* target, UINT width, UINT height,
+    void Draw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* target, UINT width, UINT height, const RECT& clip,
               const DirectX::XMFLOAT4X4& viewProj, const std::vector<DirectX::XMFLOAT4X4>& skin,
               const char* face, float opacity);
 

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 #include "core/Messages.h"
 #include "mascot/MascotRenderer.h"
@@ -14,8 +15,7 @@ namespace eflow {
 namespace {
 
 // ---- design tokens (DIPs) --------------------------------------------------------------------
-constexpr float kTopInsetPlain = 6.0f;     // gap between the screen edge and the island (no mascot)
-constexpr float kTopInsetMascot = 32.0f;   // with the mascot: room for its head above the bar
+constexpr float kTopInset = 6.0f;          // gap between the screen edge and the island
 constexpr float kMargin = 26.0f;           // room around the island for the shadow and spring overshoot
 constexpr float kCollapsedW = 196.0f;
 constexpr float kCollapsedH = 7.0f;
@@ -35,16 +35,22 @@ constexpr UINT kOpenDelayMs = 70;          // hover intent before opening
 constexpr UINT kCloseDelayMs = 380;        // grace period before closing
 constexpr UINT_PTR kOpenTimer = 1;
 constexpr UINT_PTR kCloseTimer = 2;
-constexpr UINT_PTR kMascotTimer = 3;       // paces mascot frames while the panel itself is still
+constexpr UINT_PTR kMascotTimer = 3;       // paces mascot frames while the panel is open and still
+constexpr UINT_PTR kAutoCloseTimer = 4;    // closes a panel that opened itself for a notification
 constexpr UINT kMascotCalmMs = 33;         // ~30 fps for idle breathing/blinks
 constexpr UINT kMascotActiveMs = 16;       // ~60 fps while reacting
+constexpr UINT kAutoCloseMs = 3200;
 
-// Mascot placement. Model space: 1 unit = 1000 px of the 1024-px art canvas, y up, origin at its centre.
-constexpr float kMascotH = 40.0f;          // on-screen height of the full art (ears + antenna to tail)
+// Mascot placement inside the open panel. Model space: 1 unit = 1000 px of the 1024-px art canvas,
+// y up, origin at its centre.
+constexpr float kMascotH = 92.0f;          // on-screen height of the full art (ears + antenna to tail)
 constexpr float kMascotArtH = 0.672f;      // model-space height of the art
 constexpr float kMascotK = kMascotH / kMascotArtH;   // DIPs per model unit
-constexpr float kMascotPawsY = -0.268f;    // model y of the paw bottoms; they rest on the bar
-constexpr float kMascotHalfW = 0.45f;      // model half-width (tail included)
+constexpr float kMascotPawsY = -0.268f;    // model y of the paw bottoms
+constexpr float kMascotFromRight = 92.0f;  // mascot centre, measured from the panel's right edge
+constexpr float kMascotFloor = 12.0f;      // paw bottoms above the panel's bottom edge
+constexpr float kMascotRise = 12.0f;       // it rises this far into place as the panel opens
+constexpr float kMascotLane = 172.0f;      // panel width reserved on the right for the mascot
 
 constexpr D2D1_COLOR_F Rgba(float r, float g, float b, float a) { return {r, g, b, a}; }
 constexpr D2D1_COLOR_F kIslandFill = Rgba(0.051f, 0.051f, 0.063f, 1.0f);
@@ -146,13 +152,25 @@ D2D1_RECT_F IslandWindow::IslandRect() const {
     return D2D1::RectF(x, TopInset(), x + w_.x, TopInset() + h_.x);
 }
 
-float IslandWindow::TopInset() const { return mascot_ ? kTopInsetMascot : kTopInsetPlain; }
+float IslandWindow::TopInset() const { return kTopInset; }
+
+float IslandWindow::ContentAlpha() const {
+    const float progress = Clamp01((h_.x - kCollapsedH) / (kExpandedH - kCollapsedH));
+    return SmoothStep(0.62f, 1.0f, progress);
+}
 
 D2D1_POINT_2F IslandWindow::MascotPoint(float x, float y) const {
-    // Paw bottoms sit one DIP below the idle bar's lower edge, centred on the window.
-    const float cx = pxW_ / scale_ / 2.0f;
-    const float cy = TopInset() + kCollapsedH + 1.0f + kMascotPawsY * kMascotK;
+    // Anchored to the live panel rect, so it rides the open/close springs; it also rises into place
+    // as the content fades in, which keeps it in step with the rest of the panel.
+    const D2D1_RECT_F r = IslandRect();
+    const float cx = r.right - kMascotFromRight;
+    const float cy = r.bottom - kMascotFloor + (1.0f - ContentAlpha()) * kMascotRise + kMascotPawsY * kMascotK;
     return {cx + x * kMascotK, cy - y * kMascotK};
+}
+
+bool IslandWindow::Pinned() const {
+    // A pending AI permission request keeps the panel open until it is answered.
+    return pressed_ >= 0 || (mascot_ && mascot_->state() == Mascot::State::Permission);
 }
 
 std::array<D2D1_RECT_F, 3> IslandWindow::TabRects(const D2D1_RECT_F& island) const {
@@ -193,16 +211,9 @@ void IslandWindow::SetHitRegion(bool full) {
         const float winW = pxW_ / scale_;
         const float x0 = (winW - kCollapsedW) / 2.0f - kHotSlackX;
         const float x1 = x0 + kCollapsedW + 2 * kHotSlackX;
-        const float y0 = mascot_ ? TopInset() - 4.0f : 0.0f;
         const float y1 = TopInset() + kCollapsedH + kHotSlackY;
         auto px = [&](float v) { return static_cast<int>(std::lround(v * scale_)); };
-        rgn = CreateRectRgn(px(x0), px(y0), px(x1), px(y1));
-        if (mascot_) {                          // the mascot itself is hoverable too
-            const D2D1_POINT_2F left = MascotPoint(-kMascotHalfW, 0.0f);
-            HRGN body = CreateRectRgn(px(left.x), 0, px(left.x + 2 * kMascotHalfW * kMascotK), px(y1));
-            CombineRgn(rgn, rgn, body, RGN_OR);
-            DeleteObject(body);
-        }
+        rgn = CreateRectRgn(px(x0), 0, px(x1), px(y1));
     }
     SetWindowRgn(hwnd_, rgn, TRUE);   // the system owns rgn from here
 }
@@ -214,7 +225,6 @@ void IslandWindow::Expand() {
     expanded_ = true;
     KillTimer(hwnd_, kCloseTimer);
     SetHitRegion(true);
-    if (mascot_) mascot_->ClearBadge();        // the panel is open: the user has seen it
     SetOpenSprings(w_, h_);
     w_.target = kExpandedW;
     h_.target = kExpandedH;
@@ -225,6 +235,9 @@ void IslandWindow::Collapse() {
     if (!expanded_) return;
     expanded_ = false;
     hover_ = pressed_ = -1;
+    KillTimer(hwnd_, kAutoCloseTimer);
+    autoClosePending_ = false;
+    if (mascot_) mascot_->ClearBadge();        // the panel was open: the user has seen it
     SetCloseSprings(w_, h_);
     w_.target = kCollapsedW;
     h_.target = kCollapsedH;
@@ -236,6 +249,7 @@ void IslandWindow::SetSuppressed(bool suppressed) {
     suppressed_ = suppressed;
     if (suppressed) {
         KillTimer(hwnd_, kMascotTimer);       // nothing renders while hidden
+        KillTimer(hwnd_, kAutoCloseTimer);
         KillTimer(hwnd_, kOpenTimer);
         KillTimer(hwnd_, kCloseTimer);
         openPending_ = false;
@@ -255,6 +269,19 @@ void IslandWindow::SetSuppressed(bool suppressed) {
 void IslandWindow::SetMascotState(Mascot::State state) {
     if (!mascot_) return;
     mascot_->SetState(state);
+    using State = Mascot::State;
+    if (state == State::Notify || state == State::Permission) {
+        // Events worth attention open the island by themselves. A notification closes again on its own
+        // (unless the pointer is on it); a permission request stays until it is answered.
+        const bool wasOpen = expanded_;
+        OnClick(state == State::Notify ? 1 : 2);   // open on the tab the event belongs to
+        Expand();
+        KillTimer(hwnd_, kAutoCloseTimer);
+        autoClosePending_ = state == State::Notify && !wasOpen;
+        if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, kAutoCloseMs, nullptr);
+    } else if (expanded_ && !CursorInIsland(kLeaveSlack)) {
+        SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);   // a request was resolved: let it close
+    }
     Animate();
 }
 
@@ -281,7 +308,7 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
     const D2D1_RECT_F r = IslandRect();
     const bool inside = p.x >= r.left - kLeaveSlack && p.x <= r.right + kLeaveSlack && p.y <= r.bottom + kLeaveSlack;
     if (inside) KillTimer(hwnd_, kCloseTimer);
-    else SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
+    else if (!Pinned()) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
 
     const int hit = HitTest(p);
     if (hit != hover_) {
@@ -310,6 +337,10 @@ void IslandWindow::Animate() {
 
 void IslandWindow::Frame() {
     frameQueued_ = false;
+#ifndef NDEBUG
+    // Debug builds expose a frame counter so tests can verify that a closed, idle island renders nothing.
+    SetPropW(hwnd_, L"Eflow.Frames", reinterpret_cast<HANDLE>(reinterpret_cast<UINT_PTR>(GetPropW(hwnd_, L"Eflow.Frames")) + 1));
+#endif
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&freq);
@@ -319,16 +350,17 @@ void IslandWindow::Frame() {
     lastFrame_ = now;
 
     const bool moving = StepAnimation(dt);
-    if (mascot_) mascot_->Update(dt);
+    const bool mascotVisible = mascot_ && ContentAlpha() > 0.003f;
+    if (mascotVisible) mascot_->Update(dt);
     Render();                                   // Present(1) paces this loop to the display refresh
     if (deviceLost_ || suppressed_) return;
 
     if (moving) {                               // panel animating: run at the display's refresh rate
         frameQueued_ = true;
         PostMessageW(hwnd_, WM_APP_FRAME, 0, 0);
-    } else if (mascot_) {                       // only the mascot is alive: a gentler cadence
+    } else if (mascotVisible) {                 // open and still: only the mascot moves, at a gentler cadence
         SetTimer(hwnd_, kMascotTimer, mascot_->calm() ? kMascotCalmMs : kMascotActiveMs, nullptr);
-    }
+    }                                           // closed and still: no frames at all
     if (panelMoving_ && !moving) OnSettled();
     panelMoving_ = moving;
 }
@@ -349,7 +381,8 @@ bool IslandWindow::StepAnimation(float dt) {
 
 void IslandWindow::OnSettled() {
     if (expanded_) {
-        if (!CursorInIsland(kLeaveSlack) && pressed_ < 0) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
+        // Opened by hover but the pointer already left: start closing. (Self-opened panels have their own timer.)
+        if (!CursorInIsland(kLeaveSlack) && !Pinned() && !autoClosePending_) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
     } else if (fullRegion_) {
         SetHitRegion(false);
     }
@@ -403,10 +436,11 @@ void IslandWindow::Render() {
     dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
     if (!suppressed_) DrawIsland(dc_.Get(), progress);
     HRESULT hr = dc_->EndDraw();
-    if (SUCCEEDED(hr) && mascot_ && !suppressed_) {
-        DrawMascot();
+    const float mascotAlpha = mascot_ && !suppressed_ ? ContentAlpha() : 0.0f;
+    if (SUCCEEDED(hr) && mascotAlpha > 0.003f) {
+        DrawMascot(mascotAlpha);
         dc_->BeginDraw();
-        DrawMascotEffects(dc_.Get());
+        DrawMascotEffects(dc_.Get(), mascotAlpha);
         hr = dc_->EndDraw();
     }
     if (SUCCEEDED(hr)) hr = swap_->Present(1, 0);
@@ -501,16 +535,17 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         const float a = sectionAlpha_[i] * alpha;
         if (a < 0.003f) continue;
         const float slide = (1.0f - sectionAlpha_[i]) * 8.0f;
-        DrawText(dc, kEmptyTitle[i], titleFont, D2D1::RectF(base.left + 24, mid - 26 + slide, base.right - 24, mid + slide),
+        const float right = base.right - (mascot_ ? kMascotLane : 24.0f);
+        DrawText(dc, kEmptyTitle[i], titleFont, D2D1::RectF(base.left + 24, mid - 26 + slide, right, mid + slide),
                  WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawText(dc, kEmptyBody[i], bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, base.right - 24, mid + 24 + slide),
+        DrawText(dc, kEmptyBody[i], bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
                  WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
 
 // ---- mascot ----------------------------------------------------------------------------------
 
-void IslandWindow::DrawMascot() {
+void IslandWindow::DrawMascot(float opacity) {
     mascot_->ComputeSkin(skin_);
     // Model space -> clip space for this window (row-vector convention).
     const float k = kMascotK * scale_;
@@ -520,10 +555,14 @@ void IslandWindow::DrawMascot() {
                                        0, 2 * k / H, 0, 0,
                                        0, 0, 0, 0,
                                        2 * o.x * scale_ / W - 1, 1 - 2 * o.y * scale_ / H, 0.5f, 1);
-    mascotRenderer_->Draw(gfx_.d3dContext(), rtv_.Get(), pxW_, pxH_, viewProj, skin_, mascot_->Face(), 1.0f);
+    // Clip to the panel so spring overshoot or the rising entrance never draws outside it.
+    const D2D1_RECT_F r = IslandRect();
+    const RECT clip{static_cast<LONG>(r.left * scale_), static_cast<LONG>(r.top * scale_),
+                    static_cast<LONG>(std::ceil(r.right * scale_)), static_cast<LONG>(std::ceil(r.bottom * scale_))};
+    mascotRenderer_->Draw(gfx_.d3dContext(), rtv_.Get(), pxW_, pxH_, clip, viewProj, skin_, mascot_->Face(), opacity);
 }
 
-void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc) {
+void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc, float opacity) {
     using State = Mascot::State;
     const float t = mascot_->time();
     const float st = mascot_->stateTime();
@@ -531,27 +570,27 @@ void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc) {
 
     // Music: a few notes drift up and away from the head, each on its own phase.
     if (mascot_->baseState() == State::Music) {
-        IDWriteTextFormat* fmt = gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        IDWriteTextFormat* fmt = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         const wchar_t* glyphs[3] = {L"♪", L"♫", L"♪"};
         const D2D1_POINT_2F from = MascotPoint(0.36f, 0.16f);
         const float fadeIn = std::min(1.0f, st / 0.6f);
         for (int i = 0; i < 3; ++i) {
             const float phase = std::fmod(t * 0.55f + i / 3.0f, 1.0f);
-            const float x = from.x + phase * 15.0f + std::sin(phase * kTau + i) * 2.5f;
-            const float y = from.y - phase * 22.0f;
-            const float a = std::sin(phase * 3.14159f) * 0.85f * fadeIn;
-            DrawText(dc, glyphs[i], fmt, D2D1::RectF(x - 8, y - 8, x + 8, y + 8), D2D1::ColorF(0.80f, 0.76f, 1.0f, a),
+            const float x = from.x + phase * 18.0f + std::sin(phase * kTau + i) * 3.0f;
+            const float y = from.y - phase * 26.0f;
+            const float a = std::sin(phase * 3.14159f) * 0.85f * fadeIn * opacity;
+            DrawText(dc, glyphs[i], fmt, D2D1::RectF(x - 10, y - 10, x + 10, y + 10), D2D1::ColorF(0.80f, 0.76f, 1.0f, a),
                      DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     }
 
     // AI permission: a small "?" bobbing above the head, popping in when the request arrives.
     if (mascot_->state() == State::Permission) {
-        const float pop = std::min(1.0f, st / 0.25f);
+        const float pop = std::min(1.0f, st / 0.25f) * opacity;
         const float bob = std::sin(t * 3.2f) * 1.6f;
-        const D2D1_POINT_2F at = MascotPoint(-0.34f, 0.36f);
-        IDWriteTextFormat* fmt = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_BOLD);
-        DrawText(dc, L"?", fmt, D2D1::RectF(at.x - 9, at.y - 10 + bob, at.x + 9, at.y + 10 + bob),
+        const D2D1_POINT_2F at = MascotPoint(-0.40f, 0.30f);
+        IDWriteTextFormat* fmt = gfx_.Text(18.0f, DWRITE_FONT_WEIGHT_BOLD);
+        DrawText(dc, L"?", fmt, D2D1::RectF(at.x - 12, at.y - 13 + bob, at.x + 12, at.y + 13 + bob),
                  D2D1::ColorF(0.82f, 0.78f, 1.0f, 0.95f * pop), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
@@ -563,15 +602,14 @@ void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc) {
             s = 1.0f + 2.7f * u * u * u + 1.7f * u * u;
         }
         const D2D1_POINT_2F c = MascotPoint(0.27f, 0.25f);
-        const float r = 5.5f * s;
-        brush_->SetColor(D2D1::ColorF(1.0f, 0.271f, 0.227f, 1.0f));   // system red
+        const float r = 8.0f * s;
+        brush_->SetColor(D2D1::ColorF(1.0f, 0.271f, 0.227f, opacity));   // system red
         dc->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
-        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.9f));
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.9f * opacity));
         dc->DrawEllipse(D2D1::Ellipse(c, r, r), brush_.Get(), 0.8f);
-        wchar_t label[4];
-        swprintf_s(label, count > 9 ? L"9+" : L"%d", count);
-        DrawText(dc, label, gfx_.Text(7.5f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r),
-                 D2D1::ColorF(1, 1, 1, s > 0.2f ? 1.0f : 0.0f), DWRITE_TEXT_ALIGNMENT_CENTER);
+        const std::wstring label = count > 9 ? L"9+" : std::to_wstring(count);
+        DrawText(dc, label.c_str(), gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r),
+                 D2D1::ColorF(1, 1, 1, s > 0.2f ? opacity : 0.0f), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
 
@@ -598,7 +636,7 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         tracking_ = false;
         if (expanded_) {
-            if (pressed_ < 0) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
+            if (!Pinned()) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
             if (hover_ != -1) { hover_ = -1; Animate(); }
         } else {
             KillTimer(hwnd_, kOpenTimer);
@@ -630,9 +668,10 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt;
             GetCursorPos(&pt);
             if (WindowFromPoint(pt) == hwnd_) Expand();   // still hovering after the intent delay
-        } else if (wp == kCloseTimer) {
-            KillTimer(hwnd_, kCloseTimer);
-            if (pressed_ < 0 && !CursorInIsland(kLeaveSlack)) Collapse();
+        } else if (wp == kCloseTimer || wp == kAutoCloseTimer) {
+            KillTimer(hwnd_, wp);
+            if (wp == kAutoCloseTimer) autoClosePending_ = false;
+            if (!Pinned() && !CursorInIsland(kLeaveSlack)) Collapse();
         } else if (wp == kMascotTimer) {
             KillTimer(hwnd_, kMascotTimer);
             Animate();

@@ -19,10 +19,15 @@ add_custom_command(
     VERBATIM)
 
 # ---- app ---------------------------------------------------------------------------------------
+# Packaged (installer) builds turn on "Start with Windows" the first time they run. Local builds never
+# touch the user's startup settings, whatever their configuration.
+option(EFLOW_PACKAGED "Build for distribution" OFF)
+
 add_executable(eflow WIN32
     src/main.cpp
     src/App.cpp
     src/core/Gfx.cpp
+    src/core/Log.cpp
     src/island/IslandWindow.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
@@ -35,10 +40,13 @@ add_executable(eflow WIN32
 target_include_directories(eflow PRIVATE src ${SHADER_OUT})
 target_include_directories(eflow SYSTEM PRIVATE third_party/cgltf)
 target_compile_definitions(eflow PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+if(EFLOW_PACKAGED)
+    target_compile_definitions(eflow PRIVATE EFLOW_PACKAGED)
+endif()
 target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc /external:W0)
-# Third-party implementation file: its own warning level and CRT deprecation noise off.
+# Third-party implementation file (its header is external, so /external:W0 silences it): CRT deprecation off.
 set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
-    COMPILE_OPTIONS "/W1" COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
+    COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs shell32 user32 advapi32
     shcore ole32)
 

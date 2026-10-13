@@ -7,6 +7,7 @@
 
 #include "core/Gfx.h"
 #include "island/IslandWindow.h"
+#include "mascot/MascotRenderer.h"
 
 namespace eflow {
 
@@ -22,7 +23,9 @@ private:
     static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD);
 
     bool CreateMessageWindow();
+    void LoadMascot();
     void BuildIslands();
+    void SetMascotState(Mascot::State state);
     void RebuildGraphics();
     void UpdateFullscreenState();
     void AddTrayIcon();
@@ -39,6 +42,9 @@ private:
     NOTIFYICONDATAW tray_{};
     std::vector<HWINEVENTHOOK> hooks_;
     std::vector<std::unique_ptr<IslandWindow>> islands_;
+    std::shared_ptr<const MascotAsset> mascotAsset_;   // null if the asset is missing or invalid
+    MascotRenderer mascotRenderer_;
+    bool mascotReady_ = false;
 };
 
 } // namespace eflow

@@ -47,6 +47,7 @@ bool MascotRenderer::Init(ID3D11Device* device, const MascotAsset& asset) {
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
+    rd.ScissorEnable = TRUE;
     if (FAILED(device->CreateRasterizerState(&rd, &raster_))) return false;
 
     Com<ID3D11DeviceContext> ctx;
@@ -91,7 +92,7 @@ bool MascotRenderer::Init(ID3D11Device* device, const MascotAsset& asset) {
 }
 
 void MascotRenderer::Draw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* target, UINT width, UINT height,
-                          const DirectX::XMFLOAT4X4& viewProj, const std::vector<DirectX::XMFLOAT4X4>& skin,
+                          const RECT& clip, const DirectX::XMFLOAT4X4& viewProj, const std::vector<DirectX::XMFLOAT4X4>& skin,
                           const char* face, float opacity) {
     if (!vs_ || meshes_.empty()) return;
 
@@ -108,6 +109,7 @@ void MascotRenderer::Draw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targ
     ctx->OMSetRenderTargets(1, &target, nullptr);
     ctx->OMSetBlendState(blend_.Get(), nullptr, 0xffffffff);
     ctx->RSSetViewports(1, &vp);
+    ctx->RSSetScissorRects(1, &clip);
     ctx->RSSetState(raster_.Get());
     ctx->IASetInputLayout(layout_.Get());
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

@@ -1,8 +1,10 @@
 #include "App.h"
 
+#include <filesystem>
 #include <string>
 #include <utility>
 
+#include "core/Log.h"
 #include "core/Messages.h"
 
 namespace eflow {
@@ -18,6 +20,8 @@ const wchar_t kRunValue[] = L"Eflow";
 constexpr UINT_PTR kDisplayDebounceTimer = 1;   // display changes arrive in bursts
 constexpr UINT kMenuAutostart = 1;
 constexpr UINT kMenuQuit = 2;
+constexpr UINT kMenuMascotFirst = 10;           // Mascot test submenu: Idle, Music, Notification, AI request
+constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
 std::wstring ExePath() {
     std::wstring path(MAX_PATH, L'\0');
@@ -57,10 +61,11 @@ int App::Run() {
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     if (!gfx_.Init() || !CreateMessageWindow()) return 1;
 
-#ifdef NDEBUG
-    ApplyFirstRunDefaults();                 // dev builds never register themselves to start with Windows
+#ifdef EFLOW_PACKAGED
+    ApplyFirstRunDefaults();                 // only installed builds register themselves to start with Windows
 #endif
     AddTrayIcon();
+    LoadMascot();
     BuildIslands();
 
     // Fullscreen guard, event-driven: the shell's own fullscreen notification (sent to app bars, the
@@ -109,6 +114,23 @@ bool App::CreateMessageWindow() {
     return msgWnd_ != nullptr;
 }
 
+void App::LoadMascot() {
+    // The asset ships next to the executable. Without it Eflow still runs, just without the mascot.
+    const std::filesystem::path file = std::filesystem::path(ExePath()).parent_path() / L"assets" / L"mascot" / L"eflow.glb";
+    auto asset = std::make_shared<MascotAsset>();
+    std::string error;
+    if (!asset->Load(file, kMascotTextureScale, error)) {
+        Log("mascot disabled: %s", error.c_str());
+        return;
+    }
+    Log("mascot loaded: %zu meshes, %zu clips", asset->meshes.size(), asset->clips.size());
+    mascotAsset_ = std::move(asset);
+}
+
+void App::SetMascotState(Mascot::State state) {
+    for (auto& island : islands_) island->SetMascotState(state);
+}
+
 void App::BuildIslands() {
     islands_.clear();
     std::vector<HMONITOR> monitors;
@@ -116,8 +138,13 @@ void App::BuildIslands() {
         reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(m);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&monitors));
+    // GPU resources for the mascot belong to the current device; (re)create them with it.
+    mascotReady_ = mascotAsset_ && mascotRenderer_.Init(gfx_.d3d(), *mascotAsset_);
+    if (mascotAsset_ && !mascotReady_) Log("mascot renderer failed to initialise; continuing without it");
+    Log("building islands for %zu monitor(s)", monitors.size());
     for (HMONITOR m : monitors) {
-        auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_);
+        auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_, mascotReady_ ? mascotAsset_ : nullptr,
+                                                     mascotReady_ ? &mascotRenderer_ : nullptr);
         if (island->Create()) islands_.push_back(std::move(island));
     }
 }
@@ -164,6 +191,12 @@ void App::AddTrayIcon() {
 void App::ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), kMenuAutostart, L"Start with Windows");
+    if (mascotReady_) {                      // temporary: trigger reactions until real events are wired up
+        HMENU test = CreatePopupMenu();
+        const wchar_t* labels[] = {L"Idle", L"Music playing", L"New notification", L"AI permission request"};
+        for (UINT i = 0; i < 4; ++i) AppendMenuW(test, MF_STRING, kMenuMascotFirst + i, labels[i]);
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(test), L"Mascot test");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuQuit, L"Quit Eflow");
     POINT pt;
@@ -173,6 +206,8 @@ void App::ShowTrayMenu() {
     DestroyMenu(menu);
     if (cmd == kMenuAutostart) SetAutostart(!AutostartEnabled());
     else if (cmd == kMenuQuit) PostQuitMessage(0);
+    else if (cmd >= kMenuMascotFirst && cmd < kMenuMascotFirst + 4)
+        SetMascotState(static_cast<Mascot::State>(cmd - kMenuMascotFirst));
 }
 
 // ---- autostart -------------------------------------------------------------------------------
@@ -242,8 +277,15 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_APP_DEVICE_LOST:
+        Log("GPU device lost; rebuilding");
         SetTimer(hwnd, kDisplayDebounceTimer, 100, nullptr);
         return 0;
+#ifndef NDEBUG
+    case WM_APP_DEBUG_MASCOT:
+        Log("debug: mascot state %u -> %zu island(s)", static_cast<unsigned>(wp), islands_.size());
+        if (wp <= static_cast<WPARAM>(Mascot::State::Permission)) SetMascotState(static_cast<Mascot::State>(wp));
+        return 0;
+#endif
     case WM_APP_APPBAR:
         if (wp == ABN_FULLSCREENAPP) UpdateFullscreenState();
         return 0;

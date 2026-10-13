@@ -7,8 +7,9 @@ companion that reacts to what is happening.
 <p align="center"><img src="docs/media/mascot.webp" width="360" alt="Eflow mascot reacting to music"></p>
 
 > **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
-> fullscreen auto-hide, tray icon) and the mascot asset are done. Music, notifications, AI requests and
-> the in-app mascot player come next.
+> fullscreen auto-hide, tray icon) and the animated mascot inside it are done; the mascot's reactions
+> can be previewed from the tray menu ("Mascot test"). Real music, notification and AI-request sources
+> come next.
 
 ## Planned features
 
@@ -50,8 +51,9 @@ tools\build_app.ps1            # debug build   -> build\debug\eflow.exe
 tools\build_app.ps1 release    # release build -> build\release\eflow.exe
 ```
 
-Eflow lives in the tray: right-click its icon for "Start with Windows" and "Quit Eflow". Release
-builds turn on "Start with Windows" the first time they run; debug builds never change it.
+Eflow lives in the tray: right-click its icon for "Start with Windows" and "Quit Eflow". Only
+packaged builds (`-DEFLOW_PACKAGED=ON`, for the installer) turn on "Start with Windows" the first time
+they run; local builds never change it.
 
 ## Rebuilding the mascot
 

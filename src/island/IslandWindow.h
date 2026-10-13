@@ -15,7 +15,8 @@ class MascotRenderer;
 
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
 // DirectComposition swap chain (true per-pixel alpha). The window never moves or resizes while
-// animating; a window region keeps everything outside the idle bar (and mascot) click-through.
+// animating; a window region keeps everything outside the idle bar click-through. The mascot lives
+// inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
     enum class Section { Music, Notifications, Ai };
@@ -40,9 +41,11 @@ private:
 
     // geometry (DIPs unless noted)
     float TopInset() const;
+    float ContentAlpha() const;                  // 0 (closed) .. 1 (open): panel content and mascot opacity
+    bool Pinned() const;                         // something needs the panel to stay open
     D2D1_RECT_F IslandRect() const;              // island in window-client DIPs
     std::array<D2D1_RECT_F, 3> TabRects(const D2D1_RECT_F& island) const;
-    D2D1_POINT_2F MascotPoint(float x, float y) const;   // mascot model space -> window DIPs
+    D2D1_POINT_2F MascotPoint(float x, float y) const;   // mascot model space -> window DIPs (inside the panel)
     void Place();                                // size/position the HWND for the monitor + DPI
     void UpdateScale();
     D2D1_POINT_2F ToDip(POINT clientPx) const { return {clientPx.x / scale_, clientPx.y / scale_}; }
@@ -66,8 +69,8 @@ private:
     void DrawShadow(ID2D1DeviceContext* dc, D2D1_ROUNDED_RECT shape, float progress);
     void DrawIsland(ID2D1DeviceContext* dc, float progress);
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
-    void DrawMascot();
-    void DrawMascotEffects(ID2D1DeviceContext* dc);
+    void DrawMascot(float opacity);
+    void DrawMascotEffects(ID2D1DeviceContext* dc, float opacity);
     void DrawText(ID2D1DeviceContext* dc, const wchar_t* text, IDWriteTextFormat* fmt, D2D1_RECT_F r,
                   D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING);
 
@@ -100,6 +103,7 @@ private:
     bool tracking_ = false;
     bool openPending_ = false;
     bool fullRegion_ = false;
+    bool autoClosePending_ = false;              // opened itself for a notification; closes on a timer
     int hover_ = -1;
     int pressed_ = -1;
     LARGE_INTEGER lastFrame_{};
