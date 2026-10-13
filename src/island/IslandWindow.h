@@ -10,6 +10,7 @@
 #include "island/Spring.h"
 #include "mascot/Mascot.h"
 #include "services/MediaService.h"
+#include "services/PermissionServer.h"
 
 namespace eflow {
 
@@ -41,6 +42,10 @@ public:
     void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
     void SetMedia(const MediaInfo& media);
     void SetMediaHandler(std::function<void(MediaCommand)> handler) { mediaHandler_ = std::move(handler); }
+    void SetPermissions(const std::vector<PermissionRequest>& pending);
+    void SetPermissionHandler(std::function<void(uint64_t, PermissionDecision)> handler) {
+        permissionHandler_ = std::move(handler);
+    }
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -78,6 +83,8 @@ private:
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
     void DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_POINT_2F, 3> ControlCenters(const D2D1_RECT_F& island) const;   // previous, play/pause, next
+    void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;  // reject, approve, defer
     void UpdateArtwork();
     void DrawMascot(float opacity);
     void DrawMascotEffects(ID2D1DeviceContext* dc, float opacity);
@@ -129,6 +136,10 @@ private:
     Com<ID2D1Bitmap1> artwork_;
     uint64_t artworkId_ = 0;
     std::array<float, 3> controlHover_{};        // previous, play/pause, next
+
+    std::vector<PermissionRequest> permissions_;  // oldest first; the first one is on screen
+    std::function<void(uint64_t, PermissionDecision)> permissionHandler_;
+    std::array<float, 3> permissionHover_{};      // reject, approve, defer
 };
 
 } // namespace eflow

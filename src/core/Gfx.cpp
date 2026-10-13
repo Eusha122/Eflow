@@ -48,6 +48,28 @@ IDWriteTextFormat* Gfx::Text(float size, DWRITE_FONT_WEIGHT weight, bool icons) 
     return formats_.emplace(key, std::move(fmt)).first->second.Get();
 }
 
+IDWriteTextFormat* Gfx::Mono(float size) {
+    const unsigned key = 0x80000000u | static_cast<unsigned>(size * 10);
+    auto it = formats_.find(key);
+    if (it != formats_.end()) return it->second.Get();
+    Com<IDWriteTextFormat> fmt;
+    for (const wchar_t* family : {L"Cascadia Mono", L"Consolas"}) {
+        Com<IDWriteFontCollection> fonts;
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        if (SUCCEEDED(dwrite_->GetSystemFontCollection(&fonts)) && SUCCEEDED(fonts->FindFamilyName(family, &index, &exists)) &&
+            exists && SUCCEEDED(dwrite_->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                          DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &fmt)))
+            break;
+    }
+    if (!fmt) return Text(size, DWRITE_FONT_WEIGHT_NORMAL);
+    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);      // long commands break anywhere
+    DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+    Com<IDWriteInlineObject> ellipsis;
+    if (SUCCEEDED(dwrite_->CreateEllipsisTrimmingSign(fmt.Get(), &ellipsis))) fmt->SetTrimming(&trim, ellipsis.Get());
+    return formats_.emplace(key, std::move(fmt)).first->second.Get();
+}
+
 float Gfx::MeasureWidth(const wchar_t* text, IDWriteTextFormat* fmt) {
     Com<IDWriteTextLayout> layout;
     if (!fmt || FAILED(dwrite_->CreateTextLayout(text, static_cast<UINT32>(wcslen(text)), fmt, 10000.0f, 1000.0f, &layout)))

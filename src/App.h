@@ -8,7 +8,9 @@
 #include "core/Gfx.h"
 #include "island/IslandWindow.h"
 #include "mascot/MascotRenderer.h"
+#include "services/HookInstaller.h"
 #include "services/MediaService.h"
+#include "services/PermissionServer.h"
 
 namespace eflow {
 
@@ -28,6 +30,8 @@ private:
     void BuildIslands();
     void SetMascotState(Mascot::State state);
     void OnMediaChanged();
+    void OnPermissionsChanged();
+    void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
     void AddTrayIcon();
@@ -48,6 +52,7 @@ private:
     MascotRenderer mascotRenderer_;
     bool mascotReady_ = false;
     std::unique_ptr<MediaService> media_;
+    std::unique_ptr<PermissionServer> permissions_;
 };
 
 } // namespace eflow

@@ -28,13 +28,16 @@ add_executable(eflow WIN32
     src/App.cpp
     src/core/Gfx.cpp
     src/core/Image.cpp
+    src/core/Json.cpp
     src/core/Log.cpp
     src/island/IslandWindow.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
     src/mascot/MascotRenderer.cpp
     src/mascot/cgltf_impl.cpp
+    src/services/HookInstaller.cpp
     src/services/MediaService.cpp
+    src/services/PermissionServer.cpp
     src/app.manifest
     ${SHADER_OUT}/mascot_vs.h
     ${SHADER_OUT}/mascot_ps.h
@@ -55,6 +58,15 @@ set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
     COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs windowsapp shell32 user32
     advapi32 shcore ole32)
+
+# The PermissionRequest hook command run by Claude Code / Codex; lives next to eflow.exe (it verifies
+# that the pipe it talks to is served by that eflow.exe).
+add_executable(eflow-hook src/hook/main.cpp)
+target_include_directories(eflow-hook PRIVATE src)
+target_compile_definitions(eflow-hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(eflow-hook PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(eflow-hook PRIVATE advapi32)
+add_dependencies(eflow eflow-hook)
 
 # Runtime assets live next to the executable.
 add_custom_command(TARGET eflow POST_BUILD

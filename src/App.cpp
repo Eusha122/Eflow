@@ -20,6 +20,8 @@ const wchar_t kRunValue[] = L"Eflow";
 constexpr UINT_PTR kDisplayDebounceTimer = 1;   // display changes arrive in bursts
 constexpr UINT kMenuAutostart = 1;
 constexpr UINT kMenuQuit = 2;
+constexpr UINT kMenuConnectClaude = 3;
+constexpr UINT kMenuConnectCodex = 4;
 constexpr UINT kMenuMascotFirst = 10;           // Mascot test submenu: Idle, Music, Notification, AI request
 constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
@@ -69,6 +71,8 @@ int App::Run() {
     BuildIslands();
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
+    permissions_ = std::make_unique<PermissionServer>(msgWnd_);
+    permissions_->Start();
 
     // Fullscreen guard, event-driven: the shell's own fullscreen notification (sent to app bars, the
     // same signal the taskbar uses) plus foreground/minimize changes. No polling, no per-move events.
@@ -89,6 +93,7 @@ int App::Run() {
         DispatchMessageW(&msg);
     }
 
+    permissions_.reset();                    // pending requests fall back to each tool's own prompt
     media_.reset();                          // joins the media worker thread
     for (HWINEVENTHOOK h : hooks_) UnhookWinEvent(h);
     if (appBar_) {
@@ -149,6 +154,30 @@ void App::OnMediaChanged() {
     }
 }
 
+void App::OnPermissionsChanged() {
+    if (!permissions_) return;
+    const auto pending = permissions_->Pending();
+    for (auto& island : islands_) island->SetPermissions(pending);
+}
+
+void App::ToggleAiTool(AiTool tool) {
+    const wchar_t* name = tool == AiTool::ClaudeCode ? L"Claude Code" : L"Codex";
+    const bool connected = HookInstaller::IsConnected(tool);
+    const std::wstring file = HookInstaller::ConfigPath(tool).wstring();
+    std::wstring prompt = connected
+        ? std::wstring(L"Stop sending ") + name + L" permission requests to Eflow?\n\nEflow will remove its hook from:\n" + file
+        : std::wstring(L"Send ") + name + L" permission requests to Eflow?\n\n" + name +
+              L" will ask in the island instead of its own prompt. If Eflow is closed or you don't answer, " + name +
+              L" asks as usual. Nothing is ever approved automatically.\n\nEflow will add one hook entry to:\n" + file +
+              L"\n(a backup of the original is kept next to it)";
+    if (tool == AiTool::Codex && !connected)
+        prompt += L"\n\nCodex asks you to trust new hooks: run /hooks in Codex once after connecting.";
+    if (MessageBoxW(msgWnd_, prompt.c_str(), L"Eflow", MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND) != IDOK) return;
+    std::wstring error;
+    const bool ok = connected ? HookInstaller::Disconnect(tool, error) : HookInstaller::Connect(tool, error);
+    if (!ok) MessageBoxW(msgWnd_, error.c_str(), L"Eflow", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+}
+
 void App::BuildIslands() {
     islands_.clear();
     std::vector<HMONITOR> monitors;
@@ -167,6 +196,9 @@ void App::BuildIslands() {
         island->SetMediaHandler([this](MediaCommand cmd) {
             if (media_) media_->Send(cmd);
         });
+        island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
+            if (permissions_) permissions_->Resolve(id, decision);
+        });
         islands_.push_back(std::move(island));
     }
 }
@@ -179,6 +211,7 @@ void App::RebuildGraphics() {
     }
     BuildIslands();
     OnMediaChanged();                        // fresh islands start with the current track
+    OnPermissionsChanged();
     UpdateFullscreenState();
 }
 
@@ -214,6 +247,11 @@ void App::AddTrayIcon() {
 void App::ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), kMenuAutostart, L"Start with Windows");
+    HMENU ai = CreatePopupMenu();
+    AppendMenuW(ai, MF_STRING | (HookInstaller::IsConnected(AiTool::ClaudeCode) ? MF_CHECKED : 0), kMenuConnectClaude,
+                L"Claude Code");
+    AppendMenuW(ai, MF_STRING | (HookInstaller::IsConnected(AiTool::Codex) ? MF_CHECKED : 0), kMenuConnectCodex, L"Codex");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(ai), L"Approve AI requests from");
     if (mascotReady_) {                      // temporary: trigger reactions until real events are wired up
         HMENU test = CreatePopupMenu();
         const wchar_t* labels[] = {L"Idle", L"Music playing", L"New notification", L"AI permission request"};
@@ -229,6 +267,8 @@ void App::ShowTrayMenu() {
     DestroyMenu(menu);
     if (cmd == kMenuAutostart) SetAutostart(!AutostartEnabled());
     else if (cmd == kMenuQuit) PostQuitMessage(0);
+    else if (cmd == kMenuConnectClaude) ToggleAiTool(AiTool::ClaudeCode);
+    else if (cmd == kMenuConnectCodex) ToggleAiTool(AiTool::Codex);
     else if (cmd >= kMenuMascotFirst && cmd < kMenuMascotFirst + 4)
         SetMascotState(static_cast<Mascot::State>(cmd - kMenuMascotFirst));
 }
@@ -311,6 +351,9 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
     case WM_APP_MEDIA:
         OnMediaChanged();
+        return 0;
+    case WM_APP_PERMISSION:
+        OnPermissionsChanged();
         return 0;
     case WM_APP_APPBAR:
         if (wp == ABN_FULLSCREENAPP) UpdateFullscreenState();

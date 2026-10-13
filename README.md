@@ -9,8 +9,15 @@ companion that reacts to what is happening.
 > **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
 > fullscreen auto-hide, tray icon), the animated mascot inside it and the Music tab (any app using
 > Windows media sessions: Spotify, YouTube and other sites in Chrome/Edge/Firefox, Media Player...) are
-> done. AI permission requests and notifications come next; their mascot reactions can already be
-> previewed from the tray menu ("Mascot test").
+> done, and so are AI permission requests from Claude Code and Codex. Windows notifications come next.
+
+### Approving AI requests in the island
+
+Right-click the tray icon, then **Approve AI requests from** and pick Claude Code and/or Codex. Eflow
+adds one hook entry to that tool's user settings (a backup is kept). From then on the tool's
+permission prompts appear in the island with **Approve**, **Reject** and **Answer in <tool>**. If Eflow
+is closed, or you don't answer within about five minutes, the tool simply asks in its own window;
+nothing is ever approved automatically. Codex asks you to trust new hooks once: run `/hooks` in Codex.
 
 ## Planned features
 

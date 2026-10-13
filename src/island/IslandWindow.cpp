@@ -58,6 +58,7 @@ constexpr D2D1_COLOR_F kText = Rgba(0.96f, 0.96f, 0.98f, 1.0f);
 constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
+constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
 constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
@@ -327,6 +328,12 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     const auto tabs = TabRects(island);
     for (int i = 0; i < 3; ++i)
         if (p.x >= tabs[i].left && p.x <= tabs[i].right && p.y >= tabs[i].top && p.y <= tabs[i].bottom) return i;
+    if (section_ == Section::Ai && !permissions_.empty()) {
+        const auto buttons = PermissionButtons(island);
+        for (int i = 0; i < 3; ++i)
+            if (p.x >= buttons[i].left && p.x <= buttons[i].right && p.y >= buttons[i].top && p.y <= buttons[i].bottom)
+                return kHitReject + i;
+    }
     if (section_ == Section::Music && media_.hasSession) {
         const auto centers = ControlCenters(island);
         for (int i = 0; i < 3; ++i) {
@@ -362,6 +369,18 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitReject && id <= kHitDefer) {
+        if (permissions_.empty() || !permissionHandler_) return;
+        const PermissionDecision d = id == kHitApprove ? PermissionDecision::Allow
+                                   : id == kHitReject  ? PermissionDecision::Deny
+                                                       : PermissionDecision::Defer;
+        permissionHandler_(permissions_.front().id, d);
+        permissions_.erase(permissions_.begin());     // the server confirms with a fresh list right away
+        hover_ = -1;
+        if (permissions_.empty()) SetPermissionPending(false);
+        Animate();
+        return;
+    }
     if (id >= kHitPrev && id <= kHitNext) {
         const bool enabled = id == kHitPlay ? media_.canToggle : id == kHitNext ? media_.canNext : media_.canPrevious;
         if (!enabled || !mediaHandler_) return;
@@ -431,6 +450,7 @@ bool IslandWindow::StepAnimation(float dt) {
     }
     for (int i = 0; i < 3; ++i) {
         moving |= Approach(controlHover_[i], hover_ == kHitPrev + i ? 1.0f : 0.0f, dt, 22.0f);
+        moving |= Approach(permissionHover_[i], hover_ == kHitReject + i ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(sectionAlpha_[i], i == static_cast<int>(section_) ? 1.0f : 0.0f, dt, 16.0f);
     }
@@ -593,6 +613,10 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         const float a = sectionAlpha_[i] * alpha;
         if (a < 0.003f) continue;
         const float slide = (1.0f - sectionAlpha_[i]) * 8.0f;
+        if (i == static_cast<int>(Section::Ai) && !permissions_.empty()) {
+            DrawPermission(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Music) && media_.hasSession) {
             DrawMusic(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
@@ -719,6 +743,77 @@ void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alp
     }
 }
 
+// ---- AI permission requests -------------------------------------------------------------------
+
+void IslandWindow::SetPermissions(const std::vector<PermissionRequest>& pending) {
+    permissions_ = pending;
+    SetPermissionPending(!permissions_.empty());   // opens on the AI tab for a new request; closes when done
+    Animate();
+}
+
+std::array<D2D1_RECT_F, 3> IslandWindow::PermissionButtons(const D2D1_RECT_F& island) const {
+    const float x0 = island.left + 24;
+    const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+    const float top = island.top + 136, bottom = top + 28;
+    const D2D1_RECT_F approve = D2D1::RectF(x1 - 96, top, x1, bottom);
+    const D2D1_RECT_F reject = D2D1::RectF(approve.left - 8 - 84, top, approve.left - 8, bottom);
+    const D2D1_RECT_F defer = D2D1::RectF(x0, top, reject.left - 8, bottom);
+    return {reject, approve, defer};
+}
+
+void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    const PermissionRequest& r = permissions_.front();
+    const float x0 = base.left + 24;
+    const float x1 = base.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+
+    // "<Source> wants to <action>" with the source in semibold.
+    IDWriteTextFormat* strong = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* normal = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    const float sourceW = std::ceil(gfx_.MeasureWidth(r.source.c_str(), strong));
+    DrawText(dc, r.source.c_str(), strong, D2D1::RectF(x0, base.top + 58, x0 + sourceW + 1, base.top + 76),
+             WithAlpha(kText, alpha));
+    const std::wstring rest = L" wants to " + r.action;
+    DrawText(dc, rest.c_str(), normal, D2D1::RectF(x0 + sourceW, base.top + 58, x1, base.top + 76),
+             WithAlpha(kText, 0.85f * alpha));
+
+    // Project, queue position, and a warning for destructive-looking commands.
+    std::wstring meta = r.project.empty() ? std::wstring() : L"in " + r.project;
+    if (permissions_.size() > 1)
+        meta += (meta.empty() ? L"" : L"  \u00B7  ") + std::wstring(L"1 of ") + std::to_wstring(permissions_.size());
+    IDWriteTextFormat* smallFont = gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    const float metaW = std::ceil(gfx_.MeasureWidth(meta.c_str(), smallFont));
+    DrawText(dc, meta.c_str(), smallFont, D2D1::RectF(x0, base.top + 76, x1, base.top + 92), WithAlpha(kTextDim, alpha));
+    const D2D1_COLOR_F warn = D2D1::ColorF(1.0f, 0.42f, 0.38f, alpha);
+    if (r.risky)
+        DrawText(dc, meta.empty() ? L"Potentially destructive" : L"  \u00B7  Potentially destructive", smallFont,
+                 D2D1::RectF(x0 + metaW, base.top + 76, x1, base.top + 92), warn);
+
+    // The exact command / path, verbatim, in a monospace box (two lines, then an ellipsis).
+    const D2D1_RECT_F box = D2D1::RectF(x0, base.top + 96, x1, base.top + 130);
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.06f * alpha));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{box, 8, 8}, brush_.Get());
+    if (r.risky) {
+        brush_->SetColor(D2D1::ColorF(1.0f, 0.42f, 0.38f, 0.55f * alpha));
+        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{box, 8, 8}, brush_.Get(), 1.0f);
+    }
+    const std::wstring detail = r.detail.empty() ? r.tool : r.detail;
+    DrawText(dc, detail.c_str(), gfx_.Mono(11.0f), D2D1::RectF(box.left + 10, box.top + 3, box.right - 10, box.bottom - 3),
+             WithAlpha(kText, 0.92f * alpha));
+
+    // Buttons: Reject, Approve, and a quiet way to answer in the tool itself instead.
+    const auto buttons = PermissionButtons(base);
+    const float hr = permissionHover_[0], ha = permissionHover_[1], hd = permissionHover_[2];
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.10f + 0.06f * hr) * alpha));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{buttons[0], 14, 14}, brush_.Get());
+    brush_->SetColor(D2D1::ColorF(0.04f + 0.06f * ha, 0.47f + 0.06f * ha, 1.0f, alpha));   // accent blue
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{buttons[1], 14, 14}, brush_.Get());
+    IDWriteTextFormat* buttonFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    DrawText(dc, L"Reject", buttonFont, buttons[0], WithAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawText(dc, L"Approve", buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+    const std::wstring deferLabel = L"Answer in " + r.source;
+    DrawText(dc, deferLabel.c_str(), smallFont, buttons[2], WithAlpha(kTextDim, (1.0f + 0.6f * hd) * alpha));
+}
+
 // ---- mascot ----------------------------------------------------------------------------------
 
 void IslandWindow::DrawMascot(float opacity) {
@@ -745,7 +840,7 @@ void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc, float opacity) {
     constexpr float kTau = 6.2831853f;
 
     // Music: a few notes drift up and away from the head, each on its own phase.
-    if (mascot_->baseState() == State::Music) {
+    if (mascot_->state() == State::Music) {
         IDWriteTextFormat* fmt = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         const wchar_t* glyphs[3] = {L"♪", L"♫", L"♪"};
         const D2D1_POINT_2F from = MascotPoint(0.36f, 0.16f);

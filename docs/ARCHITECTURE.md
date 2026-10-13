@@ -92,7 +92,7 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | done |
 | 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | done |
 | 2 | Music: SMTC, artwork, progress, controls, mascot states | done |
-| 3 | Permission centre: pipe server, hook exe, Claude Code + Codex installers (`eflow-hook --install`) | |
+| 3 | Permission centre: pipe server, hook exe, Claude Code + Codex connect switches (tray) | done |
 | 4 | Notifications: sparse package identity, listener, history (SQLite), per-app/privacy | |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
@@ -109,7 +109,27 @@ commands back to the worker; the play/pause icon flips immediately and the servi
 The mascot's mood is layered so sources never fight: ambient (idle / music playing) < pending AI
 permission request < one-shot notification reaction.
 
-## 6. Mascot pipeline
+## 6. AI permission centre
+
+* `eflow-hook.exe` is the `PermissionRequest` command hook for Claude Code and Codex (both use the same
+  output schema). It forwards the hook's stdin JSON over `\.\pipe\Eflow.Permission.<user SID>`
+  and prints `allow` / `deny` decisions; for anything else it prints nothing, so the tool shows its own
+  prompt. That covers: Eflow not running (exits in ~20 ms), the pipe served by anything other than the
+  `eflow.exe` next to the hook (checked with `GetNamedPipeServerProcessId`), "Answer in <tool>",
+  and no answer within 290 s (we install the hook with a 300 s timeout).
+* `PermissionServer` creates the pipe with a protected DACL for the current user only,
+  `FILE_FLAG_FIRST_PIPE_INSTANCE` and `PIPE_REJECT_REMOTE_CLIENTS`; one thread per pending request.
+  If the tool stops waiting (answered elsewhere, cancelled, killed), the card disappears.
+* Requests are parsed with Windows.Data.Json; the card shows source, action, project and the exact
+  command / path / patched files, with a "Potentially destructive" warning for risky patterns (a hint
+  only: nothing is ever approved or blocked automatically).
+* The tray menu's "Approve AI requests from" switches add or remove only Eflow's entry in
+  `~/.claude/settings.json` or `~/.codex/hooks.json`, through an order-preserving JSON editor
+  (`core/Json`), with a one-time `.eflow-backup` and an atomic replace. Codex additionally requires
+  the user to trust the hook with `/hooks`.
+* Not possible: Copilot Chat and other VS Code AI extensions expose no external approval API.
+
+## 7. Mascot pipeline
 
 The character art was generated as five aligned images on a transparent background
 (`art/source/`: master + happy, surprised, wink, blink). `tools/build_mascot.ps1` turns them into
