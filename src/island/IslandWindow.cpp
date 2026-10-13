@@ -8,6 +8,7 @@
 #include <cmath>
 #include <string>
 
+#include "core/Log.h"
 #include "core/Messages.h"
 #include "mascot/MascotRenderer.h"
 
@@ -59,6 +60,11 @@ constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
+constexpr int kHitNotifClear = 30;                          // "Clear all"
+constexpr int kHitNotifClose = 100;                         // + notification index: its dismiss button
+constexpr float kNotifRowH = 44.0f;
+constexpr float kNotifListTop = 54.0f;                      // from the panel top
+constexpr float kNotifRows = 2.0f;                          // rows visible at once
 constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
@@ -70,6 +76,17 @@ const wchar_t* const kEmptyBody[3] = {
     L"New notifications will show up here",
     L"Claude Code and Codex approvals will appear here",
 };
+
+std::wstring RelativeTime(ULONGLONG fileTime) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const ULONGLONG now = (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    const ULONGLONG secs = now > fileTime ? (now - fileTime) / 10000000ULL : 0;
+    if (secs < 60) return L"now";
+    if (secs < 3600) return std::to_wstring(secs / 60) + L"m";
+    if (secs < 86400) return std::to_wstring(secs / 3600) + L"h";
+    return std::to_wstring(secs / 86400) + L"d";
+}
 
 D2D1_COLOR_F WithAlpha(D2D1_COLOR_F c, float a) { return {c.r, c.g, c.b, c.a * a}; }
 
@@ -294,16 +311,39 @@ void IslandWindow::SetMusicPlaying(bool playing) {
 }
 
 void IslandWindow::OnNotification() {
-    if (!mascot_) return;
     // Worth attention: open by itself on the Notifications tab, and close again after a moment unless
     // the user has the pointer on it (or it was already open).
-    mascot_->Notify();
+    if (mascot_) mascot_->Notify();
+    notifScrollTarget_ = 0;                      // newest first: show it
     const bool wasOpen = expanded_;
     OnClick(static_cast<int>(Section::Notifications));
     Expand();
     KillTimer(hwnd_, kAutoCloseTimer);
     autoClosePending_ = !wasOpen;
     if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, kAutoCloseMs, nullptr);
+    Animate();
+}
+
+void IslandWindow::SetNotifications(const NotificationSnapshot& snapshot) {
+    notifications_ = snapshot;
+    std::unordered_map<uint32_t, Com<ID2D1Bitmap1>> keep;      // drop icons/hover state of notifications that are gone
+    std::unordered_map<uint32_t, float> hover;
+    for (const auto& item : notifications_.items) {
+        if (auto it = notificationIcons_.find(item.id); it != notificationIcons_.end()) keep[item.id] = std::move(it->second);
+        if (auto it = notifCloseHover_.find(item.id); it != notifCloseHover_.end()) hover[item.id] = it->second;
+    }
+    notificationIcons_ = std::move(keep);
+    notifCloseHover_ = std::move(hover);
+    const float maxTop = std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows);
+    notifScrollTarget_ = std::clamp(notifScrollTarget_, 0.0f, maxTop);
+    hover_ = -1;
+    Animate();
+}
+
+void IslandWindow::OnWheel(int delta) {
+    if (!expanded_ || section_ != Section::Notifications) return;
+    const float maxTop = std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows);
+    notifScrollTarget_ = std::clamp(std::round(notifScrollTarget_) - (delta > 0 ? 1.0f : -1.0f), 0.0f, maxTop);
     Animate();
 }
 
@@ -333,6 +373,16 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
         for (int i = 0; i < 3; ++i)
             if (p.x >= buttons[i].left && p.x <= buttons[i].right && p.y >= buttons[i].top && p.y <= buttons[i].bottom)
                 return kHitReject + i;
+    }
+    if (section_ == Section::Notifications && !notifications_.items.empty()) {
+        if (const D2D1_RECT_F c = NotificationClear(island); p.x >= c.left && p.x <= c.right && p.y >= c.top && p.y <= c.bottom)
+            return kHitNotifClear;
+        const D2D1_RECT_F list = NotificationList(island);
+        for (size_t i = 0; i < notifications_.items.size(); ++i) {
+            const D2D1_RECT_F x = NotificationClose(NotificationRow(island, i));
+            if (p.x >= x.left && p.x <= x.right && p.y >= x.top && p.y <= x.bottom && p.y >= list.top && p.y <= list.bottom)
+                return kHitNotifClose + static_cast<int>(i);
+        }
     }
     if (section_ == Section::Music && media_.hasSession) {
         const auto centers = ControlCenters(island);
@@ -378,6 +428,23 @@ void IslandWindow::OnClick(int id) {
         permissions_.erase(permissions_.begin());     // the server confirms with a fresh list right away
         hover_ = -1;
         if (permissions_.empty()) SetPermissionPending(false);
+        Animate();
+        return;
+    }
+    if (id == kHitNotifClear || id >= kHitNotifClose) {
+        if (!dismissHandler_ || !clearAllHandler_) return;
+        if (id == kHitNotifClear) {
+            Log("notifications: clear all (button)");
+            clearAllHandler_();
+            notifications_.items.clear();
+        } else if (const size_t i = static_cast<size_t>(id - kHitNotifClose); i < notifications_.items.size()) {
+            Log("notifications: dismiss id=%u", notifications_.items[i].id);
+            dismissHandler_(notifications_.items[i].id);
+            notifications_.items.erase(notifications_.items.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        notifScrollTarget_ = std::clamp(notifScrollTarget_, 0.0f,
+                                        std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows));
+        hover_ = -1;
         Animate();
         return;
     }
@@ -454,6 +521,11 @@ bool IslandWindow::StepAnimation(float dt) {
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(sectionAlpha_[i], i == static_cast<int>(section_) ? 1.0f : 0.0f, dt, 16.0f);
     }
+    moving |= Approach(notifScroll_, notifScrollTarget_, dt, 16.0f);
+    moving |= Approach(notifClearHover_, hover_ == kHitNotifClear ? 1.0f : 0.0f, dt, 22.0f);
+    for (size_t i = 0; i < notifications_.items.size(); ++i)
+        moving |= Approach(notifCloseHover_[notifications_.items[i].id],
+                           hover_ == kHitNotifClose + static_cast<int>(i) ? 1.0f : 0.0f, dt, 22.0f);
     return moving;
 }
 
@@ -617,14 +689,37 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             DrawPermission(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
         }
+        if (i == static_cast<int>(Section::Notifications) && !notifications_.items.empty()) {
+            DrawNotifications(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Music) && media_.hasSession) {
             DrawMusic(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
         }
         const float right = base.right - (mascot_ ? kMascotLane : 24.0f);
-        DrawText(dc, kEmptyTitle[i], titleFont, D2D1::RectF(base.left + 24, mid - 26 + slide, right, mid + slide),
+        const wchar_t* emptyTitle = kEmptyTitle[i];
+        const wchar_t* emptyBody = kEmptyBody[i];
+        if (i == static_cast<int>(Section::Notifications)) {
+            switch (notifications_.access) {
+            case NotificationAccess::Denied:
+                emptyTitle = L"Notification access is off";
+                emptyBody = L"Allow it in Settings \u203A Privacy \u203A Notifications";
+                break;
+            case NotificationAccess::Unsupported:
+                emptyTitle = L"Notifications are unavailable";
+                emptyBody = L"Eflow needs to be installed to read them";
+                break;
+            case NotificationAccess::Unknown:
+                emptyTitle = L"Waiting for permission";
+                emptyBody = L"Choose Allow when Windows asks";
+                break;
+            default: break;
+            }
+        }
+        DrawText(dc, emptyTitle, titleFont, D2D1::RectF(base.left + 24, mid - 26 + slide, right, mid + slide),
                  WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawText(dc, kEmptyBody[i], bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
+        DrawText(dc, emptyBody, bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
                  WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
@@ -759,6 +854,98 @@ std::array<D2D1_RECT_F, 3> IslandWindow::PermissionButtons(const D2D1_RECT_F& is
     const D2D1_RECT_F reject = D2D1::RectF(approve.left - 8 - 84, top, approve.left - 8, bottom);
     const D2D1_RECT_F defer = D2D1::RectF(x0, top, reject.left - 8, bottom);
     return {reject, approve, defer};
+}
+
+D2D1_RECT_F IslandWindow::NotificationList(const D2D1_RECT_F& island) const {
+    return D2D1::RectF(island.left + 18, island.top + kNotifListTop,
+                       island.left + kExpandedW - (mascot_ ? kMascotLane : 18.0f), island.top + kNotifListTop + kNotifRows * kNotifRowH);
+}
+
+D2D1_RECT_F IslandWindow::NotificationRow(const D2D1_RECT_F& island, size_t index) const {
+    const D2D1_RECT_F list = NotificationList(island);
+    const float top = list.top + (static_cast<float>(index) - notifScroll_) * kNotifRowH;
+    return D2D1::RectF(list.left, top, list.right, top + kNotifRowH);
+}
+
+D2D1_RECT_F IslandWindow::NotificationClose(const D2D1_RECT_F& row) const {
+    const float cy = row.top + kNotifRowH / 2;
+    return D2D1::RectF(row.right - 28, cy - 11, row.right - 6, cy + 11);
+}
+
+D2D1_RECT_F IslandWindow::NotificationClear(const D2D1_RECT_F& island) const {
+    const D2D1_RECT_F list = NotificationList(island);
+    return D2D1::RectF(list.right - 80, list.bottom + 2, list.right, list.bottom + 18);
+}
+
+void IslandWindow::DrawNotifications(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    const D2D1_RECT_F list = NotificationList(base);
+    IDWriteTextFormat* titleFont = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* bodyFont = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* metaFont = gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
+
+    dc->PushAxisAlignedClip(D2D1::RectF(list.left, list.top, list.right, list.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    for (size_t i = 0; i < notifications_.items.size(); ++i) {
+        const D2D1_RECT_F row = NotificationRow(base, i);
+        if (row.bottom < list.top || row.top > list.bottom) continue;
+        const NotificationItem& n = notifications_.items[i];
+
+        // App logo, or an initial on a tinted tile when the app provides none.
+        const D2D1_RECT_F icon = D2D1::RectF(row.left + 4, row.top + 8, row.left + 32, row.top + 36);
+        auto& bitmap = notificationIcons_[n.id];
+        if (!bitmap && n.icon && !n.icon->empty()) {
+            const auto props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            dc_->CreateBitmap(D2D1::SizeU(n.icon->width, n.icon->height), n.icon->pixels.data(), n.icon->width * 4, &props, &bitmap);
+        }
+        if (bitmap) {
+            dc->DrawBitmap(bitmap.Get(), icon, alpha, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        } else {
+            // A stable tint per app (hash of its name) so the same app always looks the same.
+            uint32_t hash = 2166136261u;
+            for (wchar_t ch : n.app) hash = (hash ^ static_cast<uint32_t>(ch)) * 16777619u;
+            const float hue = static_cast<float>(hash % 360) / 60.0f;
+            const float x = 1.0f - std::fabs(std::fmod(hue, 2.0f) - 1.0f);
+            const float rgb[6][3] = {{1, x, 0}, {x, 1, 0}, {0, 1, x}, {0, x, 1}, {x, 0, 1}, {1, 0, x}};
+            const float* t = rgb[static_cast<int>(hue) % 6];
+            brush_->SetColor(D2D1::ColorF(0.18f + 0.30f * t[0], 0.18f + 0.30f * t[1], 0.18f + 0.30f * t[2], alpha));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{icon, 7, 7}, brush_.Get());
+            const wchar_t initial[2] = {n.app.empty() ? L'?' : n.app[0], 0};
+            DrawText(dc, initial, titleFont, icon, WithAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        const auto hoverIt = notifCloseHover_.find(n.id);
+        const float hover = hoverIt != notifCloseHover_.end() ? hoverIt->second : 0.0f;
+        const D2D1_RECT_F close = NotificationClose(row);
+        const std::wstring meta = (n.app.empty() ? std::wstring() : n.app + L"  \u00B7  ") + RelativeTime(n.time);
+        const float textLeft = icon.right + 12;
+        const float metaW = std::min(std::ceil(gfx_.MeasureWidth(meta.c_str(), metaFont)) + 2, 150.0f);
+        const float textRight = close.left - 4;
+        DrawText(dc, n.title.empty() ? n.app.c_str() : n.title.c_str(), titleFont,
+                 D2D1::RectF(textLeft, row.top + 6, std::max(textLeft, textRight - metaW - 8), row.top + 24), WithAlpha(kText, alpha));
+        DrawText(dc, meta.c_str(), metaFont, D2D1::RectF(textRight - metaW, row.top + 6, textRight, row.top + 24),
+                 WithAlpha(kTextDim, alpha), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        std::wstring body = n.body;
+        std::replace(body.begin(), body.end(), L'\n', L' ');
+        DrawText(dc, body.c_str(), bodyFont, D2D1::RectF(textLeft, row.top + 23, textRight, row.top + 40),
+                 WithAlpha(kTextDim, 1.15f * alpha));
+
+        // Dismiss: faint until the pointer is on it.
+        const D2D1_POINT_2F c = D2D1::Point2F((close.left + close.right) / 2, (close.top + close.bottom) / 2);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.12f * hover * alpha));
+        dc->FillEllipse(D2D1::Ellipse(c, 10, 10), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.32f + 0.5f * hover) * alpha));
+        dc->DrawLine(D2D1::Point2F(c.x - 3.5f, c.y - 3.5f), D2D1::Point2F(c.x + 3.5f, c.y + 3.5f), brush_.Get(), 1.4f);
+        dc->DrawLine(D2D1::Point2F(c.x - 3.5f, c.y + 3.5f), D2D1::Point2F(c.x + 3.5f, c.y - 3.5f), brush_.Get(), 1.4f);
+    }
+    dc->PopAxisAlignedClip();
+
+    // Footer: count on the left, "Clear all" on the right.
+    const size_t total = notifications_.items.size();
+    const std::wstring count = std::to_wstring(total) + (total == 1 ? L" notification" : L" notifications");
+    DrawText(dc, count.c_str(), metaFont, D2D1::RectF(list.left + 4, list.bottom + 2, list.left + 200, list.bottom + 18),
+             WithAlpha(kTextDim, 0.8f * alpha));
+    DrawText(dc, L"Clear all", metaFont, NotificationClear(base), WithAlpha(kText, (0.55f + 0.4f * notifClearHover_) * alpha),
+             DWRITE_TEXT_ALIGNMENT_TRAILING);
 }
 
 void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
@@ -913,6 +1100,9 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd_, kOpenTimer);
             openPending_ = false;
         }
+        return 0;
+    case WM_MOUSEWHEEL:
+        OnWheel(GET_WHEEL_DELTA_WPARAM(wp));
         return 0;
     case WM_LBUTTONDOWN:
         pressed_ = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));

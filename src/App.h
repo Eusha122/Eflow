@@ -10,6 +10,7 @@
 #include "mascot/MascotRenderer.h"
 #include "services/HookInstaller.h"
 #include "services/MediaService.h"
+#include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 
 namespace eflow {
@@ -31,6 +32,7 @@ private:
     void SetMascotState(Mascot::State state);
     void OnMediaChanged();
     void OnPermissionsChanged();
+    void OnNotificationsChanged();
     void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
@@ -53,6 +55,8 @@ private:
     bool mascotReady_ = false;
     std::unique_ptr<MediaService> media_;
     std::unique_ptr<PermissionServer> permissions_;
+    std::unique_ptr<NotificationService> notifications_;
+    uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
 };
 
 } // namespace eflow

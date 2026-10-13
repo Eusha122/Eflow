@@ -93,7 +93,8 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | done |
 | 2 | Music: SMTC, artwork, progress, controls, mascot states | done |
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex connect switches (tray) | done |
-| 4 | Notifications: sparse package identity, listener, history (SQLite), per-app/privacy | |
+| 4 | Notifications: sparse package identity, listener, list with dismiss / clear all | done |
+| 4b | Notifications: history (SQLite), per-app mute, privacy | |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
 
@@ -162,3 +163,20 @@ Runtime contract for the app's player:
 
 Running Blender operators through the live editor's MCP socket crashed Blender twice, so the
 pipeline only ever runs Blender headless.
+
+## Notifications
+
+`UserNotificationListener` refuses processes without package identity, so Eflow ships a **sparse package**
+(`package/AppxManifest.xml`: `runFullTrust` + `userNotificationListener`, `AllowExternalContent`). It is
+registered with `tools/register_package.ps1 [debug|release]` (needs Developer Mode; an installer will do the
+same with a signed package). The identity is only granted to a process *started through the package*, so
+`eflow.exe` relaunches itself once via `IApplicationActivationManager` (`core/PackageIdentity`) when a
+package registered for its own folder exists; otherwise it runs normally and the Notifications tab says the
+feature is unavailable.
+
+`services/NotificationService` mirrors the action center on a worker thread: event-driven
+(`NotificationChanged`, with a 20 s resync as a safety net), newest first, counts arrivals so the island
+opens on the Notifications tab (and the mascot reacts) only for notifications that appear after startup.
+Dismiss removes one notification from the action center by id; "Clear all" removes everything, so it is
+only ever called from the explicit button. Classic desktop apps (Chrome, ...) expose no logo, so rows get a
+tinted initial tile; packaged apps use their real logo. Notification text is never written to the log.

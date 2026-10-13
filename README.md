@@ -9,7 +9,7 @@ companion that reacts to what is happening.
 > **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
 > fullscreen auto-hide, tray icon), the animated mascot inside it and the Music tab (any app using
 > Windows media sessions: Spotify, YouTube and other sites in Chrome/Edge/Firefox, Media Player...) are
-> done, and so are AI permission requests from Claude Code and Codex. Windows notifications come next.
+> done, and so are AI permission requests from Claude Code and Codex and the Windows notification list.
 
 ### Approving AI requests in the island
 

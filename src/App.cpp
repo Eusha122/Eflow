@@ -73,6 +73,8 @@ int App::Run() {
     media_->Start();
     permissions_ = std::make_unique<PermissionServer>(msgWnd_);
     permissions_->Start();
+    notifications_ = std::make_unique<NotificationService>(msgWnd_);
+    notifications_->Start();
 
     // Fullscreen guard, event-driven: the shell's own fullscreen notification (sent to app bars, the
     // same signal the taskbar uses) plus foreground/minimize changes. No polling, no per-move events.
@@ -93,6 +95,7 @@ int App::Run() {
         DispatchMessageW(&msg);
     }
 
+    notifications_.reset();
     permissions_.reset();                    // pending requests fall back to each tool's own prompt
     media_.reset();                          // joins the media worker thread
     for (HWINEVENTHOOK h : hooks_) UnhookWinEvent(h);
@@ -160,6 +163,21 @@ void App::OnPermissionsChanged() {
     for (auto& island : islands_) island->SetPermissions(pending);
 }
 
+void App::OnNotificationsChanged() {
+    if (!notifications_) return;
+    const NotificationSnapshot snap = notifications_->Snapshot();
+#ifndef NDEBUG
+    Log("notifications: access=%d count=%zu arrivals=%llu", static_cast<int>(snap.access), snap.items.size(),
+        static_cast<unsigned long long>(snap.arrivals));
+#endif
+    const bool arrived = snap.arrivals > seenArrivals_;
+    seenArrivals_ = snap.arrivals;
+    for (auto& island : islands_) {
+        island->SetNotifications(snap);
+        if (arrived) island->OnNotification();
+    }
+}
+
 void App::ToggleAiTool(AiTool tool) {
     const wchar_t* name = tool == AiTool::ClaudeCode ? L"Claude Code" : L"Codex";
     const bool connected = HookInstaller::IsConnected(tool);
@@ -196,6 +214,13 @@ void App::BuildIslands() {
         island->SetMediaHandler([this](MediaCommand cmd) {
             if (media_) media_->Send(cmd);
         });
+        island->SetNotificationHandlers(
+            [this](uint32_t id) {
+                if (notifications_) notifications_->Dismiss(id);
+            },
+            [this] {
+                if (notifications_) notifications_->ClearAll();
+            });
         island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
             if (permissions_) permissions_->Resolve(id, decision);
         });
@@ -212,6 +237,7 @@ void App::RebuildGraphics() {
     BuildIslands();
     OnMediaChanged();                        // fresh islands start with the current track
     OnPermissionsChanged();
+    OnNotificationsChanged();
     UpdateFullscreenState();
 }
 
@@ -351,6 +377,9 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
     case WM_APP_MEDIA:
         OnMediaChanged();
+        return 0;
+    case WM_APP_NOTIFICATION:
+        OnNotificationsChanged();
         return 0;
     case WM_APP_PERMISSION:
         OnPermissionsChanged();

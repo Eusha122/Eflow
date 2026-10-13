@@ -4,12 +4,14 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "core/Gfx.h"
 #include "island/Spring.h"
 #include "mascot/Mascot.h"
 #include "services/MediaService.h"
+#include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 
 namespace eflow {
@@ -42,6 +44,11 @@ public:
     void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
     void SetMedia(const MediaInfo& media);
     void SetMediaHandler(std::function<void(MediaCommand)> handler) { mediaHandler_ = std::move(handler); }
+    void SetNotifications(const NotificationSnapshot& snapshot);
+    void SetNotificationHandlers(std::function<void(uint32_t)> dismiss, std::function<void()> clearAll) {
+        dismissHandler_ = std::move(dismiss);
+        clearAllHandler_ = std::move(clearAll);
+    }
     void SetPermissions(const std::vector<PermissionRequest>& pending);
     void SetPermissionHandler(std::function<void(uint64_t, PermissionDecision)> handler) {
         permissionHandler_ = std::move(handler);
@@ -83,6 +90,11 @@ private:
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
     void DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_POINT_2F, 3> ControlCenters(const D2D1_RECT_F& island) const;   // previous, play/pause, next
+    void DrawNotifications(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    D2D1_RECT_F NotificationList(const D2D1_RECT_F& island) const;                 // clip rect of the rows
+    D2D1_RECT_F NotificationRow(const D2D1_RECT_F& island, size_t index) const;    // row `index` at the current scroll
+    D2D1_RECT_F NotificationClose(const D2D1_RECT_F& row) const;
+    D2D1_RECT_F NotificationClear(const D2D1_RECT_F& island) const;
     void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;  // reject, approve, defer
     void UpdateArtwork();
@@ -136,6 +148,15 @@ private:
     Com<ID2D1Bitmap1> artwork_;
     uint64_t artworkId_ = 0;
     std::array<float, 3> controlHover_{};        // previous, play/pause, next
+
+    NotificationSnapshot notifications_;
+    std::function<void(uint32_t)> dismissHandler_;
+    std::function<void()> clearAllHandler_;
+    std::unordered_map<uint32_t, Com<ID2D1Bitmap1>> notificationIcons_;
+    float notifScroll_ = 0, notifScrollTarget_ = 0;   // first visible row (fractional while it glides)
+    std::unordered_map<uint32_t, float> notifCloseHover_;   // per notification id
+    float notifClearHover_ = 0;
+    void OnWheel(int delta);
 
     std::vector<PermissionRequest> permissions_;  // oldest first; the first one is on screen
     std::function<void(uint64_t, PermissionDecision)> permissionHandler_;

@@ -30,6 +30,7 @@ add_executable(eflow WIN32
     src/core/Image.cpp
     src/core/Json.cpp
     src/core/Log.cpp
+    src/core/PackageIdentity.cpp
     src/island/IslandWindow.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
@@ -37,6 +38,7 @@ add_executable(eflow WIN32
     src/mascot/cgltf_impl.cpp
     src/services/HookInstaller.cpp
     src/services/MediaService.cpp
+    src/services/NotificationService.cpp
     src/services/PermissionServer.cpp
     src/app.manifest
     ${SHADER_OUT}/mascot_vs.h
