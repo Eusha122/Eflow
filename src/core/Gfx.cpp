@@ -6,10 +6,10 @@ bool Gfx::Init() {
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, ARRAYSIZE(levels),
-                                   D3D11_SDK_VERSION, &d3d_, nullptr, nullptr);
+                                   D3D11_SDK_VERSION, &d3d_, nullptr, &d3dContext_);
     if (FAILED(hr)) // GPU-less sessions (RDP, VMs)
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, levels, ARRAYSIZE(levels),
-                               D3D11_SDK_VERSION, &d3d_, nullptr, nullptr);
+                               D3D11_SDK_VERSION, &d3d_, nullptr, &d3dContext_);
     if (FAILED(hr)) return false;
 
     if (FAILED(d3d_.As(&dxgi_))) return false;

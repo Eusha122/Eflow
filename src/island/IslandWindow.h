@@ -2,21 +2,28 @@
 #include <windows.h>
 
 #include <array>
+#include <memory>
+#include <vector>
 
 #include "core/Gfx.h"
 #include "island/Spring.h"
+#include "mascot/Mascot.h"
 
 namespace eflow {
 
+class MascotRenderer;
+
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
-// DirectComposition swap chain (true per-pixel alpha). The window is kept as small as the island's
-// current footprint so it never blocks clicks on the desktop beneath it.
+// DirectComposition swap chain (true per-pixel alpha). The window never moves or resizes while
+// animating; a window region keeps everything outside the idle bar (and mascot) click-through.
 class IslandWindow {
 public:
     enum class Section { Music, Notifications, Ai };
 
-    // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away.
-    IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner);
+    // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
+    // may be null, in which case the island runs without the mascot.
+    IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_ptr<const MascotAsset> mascotAsset,
+                 MascotRenderer* mascotRenderer);
     ~IslandWindow();
     IslandWindow(const IslandWindow&) = delete;
     IslandWindow& operator=(const IslandWindow&) = delete;
@@ -25,15 +32,17 @@ public:
     HMONITOR monitor() const { return monitor_; }
     HWND hwnd() const { return hwnd_; }
     void SetSuppressed(bool suppressed);   // hidden while a fullscreen app owns this monitor
-    bool deviceLost() const { return deviceLost_; }
+    void SetMascotState(Mascot::State state);
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(UINT msg, WPARAM wp, LPARAM lp);
 
     // geometry (DIPs unless noted)
+    float TopInset() const;
     D2D1_RECT_F IslandRect() const;              // island in window-client DIPs
     std::array<D2D1_RECT_F, 3> TabRects(const D2D1_RECT_F& island) const;
+    D2D1_POINT_2F MascotPoint(float x, float y) const;   // mascot model space -> window DIPs
     void Place();                                // size/position the HWND for the monitor + DPI
     void UpdateScale();
     D2D1_POINT_2F ToDip(POINT clientPx) const { return {clientPx.x / scale_, clientPx.y / scale_}; }
@@ -48,15 +57,17 @@ private:
     void OnClick(int id);
 
     // animation + rendering
-    void Animate();                              // starts the frame loop if idle
+    void Animate();                              // queue a frame now (vsync-paced while the panel moves)
     void Frame();
-    bool StepAnimation(float dt);                // true while anything is still moving
+    bool StepAnimation(float dt);                // true while the panel/tabs are still moving
     void OnSettled();
     void Render();
     bool CreateSurface();
     void DrawShadow(ID2D1DeviceContext* dc, D2D1_ROUNDED_RECT shape, float progress);
     void DrawIsland(ID2D1DeviceContext* dc, float progress);
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
+    void DrawMascot();
+    void DrawMascotEffects(ID2D1DeviceContext* dc);
     void DrawText(ID2D1DeviceContext* dc, const wchar_t* text, IDWriteTextFormat* fmt, D2D1_RECT_F r,
                   D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING);
 
@@ -74,11 +85,18 @@ private:
     Com<IDCompositionVisual> visual_;
     Com<ID2D1DeviceContext> dc_;
     Com<ID2D1Bitmap1> backbuffer_;
+    Com<ID3D11RenderTargetView> rtv_;
     Com<ID2D1SolidColorBrush> brush_;
     Com<ID2D1Effect> shadow_;
 
+    std::shared_ptr<const MascotAsset> mascotAsset_;
+    MascotRenderer* mascotRenderer_ = nullptr;
+    std::unique_ptr<Mascot> mascot_;
+    std::vector<DirectX::XMFLOAT4X4> skin_;
+
     bool expanded_ = false;
     bool frameQueued_ = false;
+    bool panelMoving_ = false;
     bool tracking_ = false;
     bool openPending_ = false;
     bool fullRegion_ = false;

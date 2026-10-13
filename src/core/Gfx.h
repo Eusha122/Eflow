@@ -18,6 +18,7 @@ public:
     bool Init();
 
     ID3D11Device* d3d() const { return d3d_.Get(); }
+    ID3D11DeviceContext* d3dContext() const { return d3dContext_.Get(); }
     IDXGIDevice* dxgi() const { return dxgi_.Get(); }
     ID2D1Factory1* d2dFactory() const { return d2dFactory_.Get(); }
     ID2D1Device* d2dDevice() const { return d2dDevice_.Get(); }
@@ -34,6 +35,7 @@ public:
 
 private:
     Com<ID3D11Device> d3d_;
+    Com<ID3D11DeviceContext> d3dContext_;
     Com<IDXGIDevice> dxgi_;
     Com<IDXGIFactory2> dxgiFactory_;
     Com<ID2D1Factory1> d2dFactory_;
