@@ -267,6 +267,7 @@ struct SystemMonitor::Sampler {
                          RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS) {
             cpuName = name;
             cpuName.erase(0, cpuName.find_first_not_of(L' '));
+            cpuName.erase(cpuName.find_last_not_of(L' ') + 1);                 // the registry value is space-padded
             for (const wchar_t* junk : {L" with Radeon Graphics", L" with Radeon Vega Graphics", L"(R)", L"(TM)", L" CPU"})
                 for (size_t at; (at = cpuName.find(junk)) != std::wstring::npos;) cpuName.erase(at, wcslen(junk));
         }

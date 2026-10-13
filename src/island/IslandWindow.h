@@ -19,7 +19,7 @@ namespace eflow {
 
 class MascotRenderer;
 
-inline constexpr int kSectionCount = 4;   // Music, Notifications, AI Requests, System
+inline constexpr int kSectionCount = 5;   // Music, Notifications, Messages, AI Requests, System
 inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
@@ -28,7 +28,7 @@ inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 // inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
-    enum class Section { Music, Notifications, Ai, System };
+    enum class Section { Music, Notifications, Messages, Ai, System };
 
     // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
     // may be null, in which case the island runs without the mascot.
@@ -59,6 +59,8 @@ public:
 #endif
     // Called with true while the System tab is on screen (so the monitor samples), false otherwise.
     void SetSystemWatchHandler(std::function<void(bool)> handler) { systemWatchHandler_ = std::move(handler); }
+    // Opens the app a chat message came from (by AppUserModelId).
+    void SetOpenAppHandler(std::function<void(const std::wstring&)> handler) { openAppHandler_ = std::move(handler); }
     void SetPermissions(const std::vector<PermissionRequest>& pending);
     void SetPermissionHandler(std::function<void(uint64_t, PermissionDecision)> handler) {
         permissionHandler_ = std::move(handler);
@@ -111,13 +113,20 @@ private:
     D2D1_RECT_F RingCell(const D2D1_RECT_F& panel, int index) const;
     void CyclePage(int metric, int direction);
     void UpdateSystemWatch();                    // start/stop sampling to match what is on screen
+    void DrawMessages(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    D2D1_RECT_F MessageViewport(const D2D1_RECT_F& panel) const;
+    D2D1_RECT_F MessageRow(const D2D1_RECT_F& panel, size_t index) const;
+    void LayoutMessages();                       // wrapped heights -> row sizes -> how tall the panel wants to be
+    float TargetHeight() const;                  // panel height the current tab wants
+    void ApplyHeightTarget();                    // spring to it (and resize the clickable area)
     void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;  // reject, approve, defer
     void UpdateArtwork();
     void DrawMascot(float opacity);
     void DrawMascotEffects(ID2D1DeviceContext* dc, float opacity);
     void DrawText(ID2D1DeviceContext* dc, const wchar_t* text, IDWriteTextFormat* fmt, D2D1_RECT_F r,
-                  D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING);
+                  D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
+                  DWRITE_PARAGRAPH_ALIGNMENT vertical = DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     Gfx& gfx_;
     HMONITOR monitor_;
@@ -156,7 +165,7 @@ private:
     Spring w_, h_;
     Spring tabX_, tabW_;                         // selection pill
     std::array<float, kSectionCount> tabHover_{};            // 0..1 hover highlight per tab
-    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0}; // cross-fade between sections
+    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0, 0}; // cross-fade between sections
     Section section_ = Section::Music;
 
     MediaInfo media_;
@@ -173,6 +182,16 @@ private:
     std::unordered_map<uint32_t, float> notifCloseHover_;   // per notification id
     float notifClearHover_ = 0;
     void OnWheel(int delta);
+
+    // Chat messages (WhatsApp...) are split off the notification list into their own tab.
+    std::vector<NotificationItem> messages_;
+    std::vector<float> msgRowHeight_, msgRowTop_;
+    std::vector<int> msgLines_;
+    float msgLineHeight_ = 16.0f, msgContentHeight_ = 0;
+    float msgScroll_ = 0, msgScrollTarget_ = 0;
+    std::unordered_map<uint32_t, float> msgHover_, msgCloseHover_;
+    std::function<void(const std::wstring&)> openAppHandler_;
+    bool latestIsMessage_ = false;               // the newest arrival was a chat message
 
     SystemSnapshot system_;
     std::function<void(bool)> systemWatchHandler_;

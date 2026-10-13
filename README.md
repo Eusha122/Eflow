@@ -9,7 +9,24 @@ companion that reacts to what is happening.
 > **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
 > fullscreen auto-hide, tray icon), the animated mascot inside it and the Music tab (any app using
 > Windows media sessions: Spotify, YouTube and other sites in Chrome/Edge/Firefox, Media Player...) are
-> done, and so are AI permission requests from Claude Code and Codex and the Windows notification list.
+> done, and so are AI permission requests from Claude Code and Codex, the Windows notification list and
+> the System tab (CPU, GPU, memory and network rings; click or scroll a ring for its next reading).
+
+### The Messages tab
+
+WhatsApp message notifications get their own tab (sender, text, time). It grows and shrinks to fit what
+is there. Windows does not allow one app to type into another app's notification, so there is no reply
+box; each message has **Open in WhatsApp** instead. To route another chat app there, add its name to
+`kChatApps` in `src/island/IslandWindow.cpp`.
+
+### The System tab
+
+CPU and GPU usage, memory and internet speed come straight from Windows; GPU temperature, fan and video
+memory from NVIDIA's driver library. Windows itself cannot report CPU temperature or CPU/case-fan speed
+to normal programs (that needs a hardware driver and administrator rights), so those two readings say
+"Needs sensor app" unless the free [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+is running as administrator, in which case Eflow reads them from it. Nothing is sampled unless the System
+tab is on screen.
 
 ### Approving AI requests in the island
 

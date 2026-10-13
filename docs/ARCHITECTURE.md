@@ -96,6 +96,7 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | 4 | Notifications: sparse package identity, listener, list with dismiss / clear all | done |
 | 4b | Notifications: history (SQLite), per-app mute, privacy | |
 | 4c | System tab: CPU / GPU / memory / network rings with flip-through readings | done |
+| 4d | Messages tab: chat-app (WhatsApp) notifications split out, panel resizes to fit, open-the-app action | done |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
 
@@ -153,7 +154,25 @@ Windows offers no supported way to read CPU temperature or motherboard fan speed
 program; that takes a hardware driver and administrator rights, which Eflow deliberately does not
 include. When no sensor tool is running, those two readings say "Needs sensor app" instead of guessing.
 
-## 8. Mascot pipeline
+## 8. Messages tab
+
+Notifications from chat apps (matched by AppUserModelId / display name against `kChatApps`, currently
+`whatsapp`) are removed from the Notifications list and shown in their own **Messages** tab: avatar with
+the sender's initial, sender, time, up to three lines of the message. A new message opens the island on
+that tab by itself (5 s, then it closes again unless the pointer is on it).
+
+* **The panel resizes to the content.** `LayoutMessages` measures each message with DirectWrite, which
+  gives `TargetHeight()` (176 DIP up to 300 DIP); the height spring follows it in both directions, the
+  mascot rides the panel's bottom edge, and beyond 300 DIP the list scrolls (wheel, thin scrollbar). The
+  window itself is sized for the tallest panel, but its click-through region is only as tall as the panel
+  is (or is heading to), so the transparent part never blocks the desktop beneath.
+* **Replying is deliberately not offered.** Windows only lets an app *read* another app's notifications;
+  it cannot press their buttons or use their inline reply box. The remaining routes (unofficial
+  WhatsApp libraries, or driving WhatsApp's window with simulated typing) risk account bans or sending to
+  the wrong chat, so the action is *Open in WhatsApp* (launches/activates the app through its
+  AppUserModelId, after validating the id) and the notification is dismissed, like clicking a toast.
+
+## 9. Mascot pipeline
 
 The character art was generated as five aligned images on a transparent background
 (`art/source/`: master + happy, surprised, wink, blink). `tools/build_mascot.ps1` turns them into

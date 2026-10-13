@@ -17,6 +17,7 @@ namespace eflow {
 struct NotificationItem {
     uint32_t id = 0;                            // Windows' notification id (stable while it is in the action center)
     std::wstring app;                           // display name of the sending app
+    std::wstring appId;                         // its AppUserModelId (used to recognise and open chat apps)
     std::wstring title, body;
     ULONGLONG time = 0;                         // creation time, FILETIME ticks (100 ns since 1601, UTC)
     std::shared_ptr<const ImageBGRA> icon;      // the app's logo; null if unavailable

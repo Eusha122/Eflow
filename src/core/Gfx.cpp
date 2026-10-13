@@ -70,6 +70,32 @@ IDWriteTextFormat* Gfx::Mono(float size) {
     return formats_.emplace(key, std::move(fmt)).first->second.Get();
 }
 
+IDWriteTextFormat* Gfx::Wrapped(float size, DWRITE_FONT_WEIGHT weight) {
+    const unsigned key = 0x40000000u | (static_cast<unsigned>(size * 10) << 12) | (static_cast<unsigned>(weight) << 1);
+    auto it = formats_.find(key);
+    if (it != formats_.end()) return it->second.Get();
+    Com<IDWriteTextFormat> fmt;
+    if (FAILED(dwrite_->CreateTextFormat(size >= 16.0f ? kDisplayFont : kUiFont, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                                         DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &fmt)) &&
+        FAILED(dwrite_->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                         size, L"en-us", &fmt)))
+        return nullptr;
+    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+    Com<IDWriteInlineObject> ellipsis;
+    if (SUCCEEDED(dwrite_->CreateEllipsisTrimmingSign(fmt.Get(), &ellipsis))) fmt->SetTrimming(&trim, ellipsis.Get());
+    return formats_.emplace(key, std::move(fmt)).first->second.Get();
+}
+
+float Gfx::MeasureHeight(const wchar_t* text, IDWriteTextFormat* fmt, float width) {
+    Com<IDWriteTextLayout> layout;
+    if (!fmt || FAILED(dwrite_->CreateTextLayout(text, static_cast<UINT32>(wcslen(text)), fmt, width, 100000.0f, &layout)))
+        return 0.0f;
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    return m.height;
+}
+
 float Gfx::MeasureWidth(const wchar_t* text, IDWriteTextFormat* fmt) {
     Com<IDWriteTextLayout> layout;
     if (!fmt || FAILED(dwrite_->CreateTextLayout(text, static_cast<UINT32>(wcslen(text)), fmt, 10000.0f, 1000.0f, &layout)))

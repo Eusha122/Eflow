@@ -220,6 +220,13 @@ void App::BuildIslands() {
         auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_, mascotReady_ ? mascotAsset_ : nullptr,
                                                      mascotReady_ ? &mascotRenderer_ : nullptr);
         if (!island->Create()) continue;
+        island->SetOpenAppHandler([](const std::wstring& appId) {
+            // Only plausible AppUserModelIds (letters, digits and . _ ! - ), so nothing odd reaches the shell.
+            if (appId.empty() || appId.size() > 200) return;
+            for (wchar_t c : appId)
+                if (!(iswalnum(c) || c == L'.' || c == L'_' || c == L'!' || c == L'-')) return;
+            ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + appId).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        });
         island->SetSystemWatchHandler([this](bool watching) {
             if (system_) system_->Watch(watching ? +1 : -1);
         });

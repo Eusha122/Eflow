@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <string>
 
 #include "core/Log.h"
@@ -41,6 +42,7 @@ constexpr UINT_PTR kAutoCloseTimer = 4;    // closes a panel that opened itself 
 constexpr UINT kMascotCalmMs = 33;         // ~30 fps for idle breathing/blinks
 constexpr UINT kMascotActiveMs = 16;       // ~60 fps while reacting
 constexpr UINT kAutoCloseMs = 3200;
+constexpr UINT kAutoCloseMessageMs = 5200;   // long enough to read a chat message
 
 // Mascot placement inside the open panel. Model space: 1 unit = 1000 px of the 1024-px art canvas,
 // y up, origin at its centre.
@@ -61,6 +63,11 @@ constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
 constexpr int kHitRing = 40;                                 // + metric index (System tab)
+constexpr int kHitMsgOpen = 200;                            // + message index: its row (opens the chat app)
+constexpr int kHitMsgClose = 400;                           // + message index: its dismiss button
+constexpr float kMaxPanelH = 300.0f;                        // tallest the panel grows (Messages tab)
+constexpr float kMsgTop = 54.0f, kMsgBottomPad = 12.0f, kMsgGap = 6.0f;
+constexpr int kMsgMaxLines = 3;
 constexpr int kHitNotifClear = 30;                          // "Clear all"
 constexpr int kHitNotifClose = 100;                         // + notification index: its dismiss button
 constexpr float kNotifRowH = 44.0f;
@@ -70,14 +77,31 @@ constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
 
-const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"AI Requests", L"System"};
-const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No pending requests", L""};
+const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Messages", L"AI Requests", L"System"};
+const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No new messages",
+                                                   L"No pending requests", L""};
 const wchar_t* const kEmptyBody[kSectionCount] = {
     L"Play something in Spotify, YouTube or your browser",
     L"New notifications will show up here",
+    L"WhatsApp messages will show up here",
     L"Claude Code and Codex approvals will appear here",
     L"",
 };
+
+// Messaging apps whose notifications get their own tab. Matched (case-insensitively) against the app's
+// AppUserModelId and display name; add more names to route more chat apps there.
+const wchar_t* const kChatApps[] = {L"whatsapp"};
+
+std::wstring LowerCase(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return s;
+}
+bool IsChatMessage(const NotificationItem& n) {
+    const std::wstring key = LowerCase(n.appId + L" " + n.app);
+    for (const wchar_t* app : kChatApps)
+        if (key.find(app) != std::wstring::npos) return true;
+    return false;
+}
 
 // ---- System tab: what each ring can show -----------------------------------------------------
 constexpr D2D1_COLOR_F kAccent = Rgba(0.42f, 0.70f, 1.0f, 1.0f);
@@ -299,7 +323,7 @@ void IslandWindow::Place() {
     GetMonitorInfoW(monitor_, &mi);
     const RECT& m = mi.rcMonitor;
     pxW_ = static_cast<UINT>(std::ceil((kExpandedW + 2 * kMargin) * scale_));
-    pxH_ = static_cast<UINT>(std::ceil((TopInset() + kExpandedH + kMargin) * scale_));
+    pxH_ = static_cast<UINT>(std::ceil((TopInset() + kMaxPanelH + kMargin) * scale_));
     const int x = m.left + ((m.right - m.left) - static_cast<int>(pxW_)) / 2;
     SetWindowPos(hwnd_, HWND_TOPMOST, x, m.top, static_cast<int>(pxW_), static_cast<int>(pxH_), SWP_NOACTIVATE);
 }
@@ -377,7 +401,10 @@ void IslandWindow::SetHitRegion(bool full) {
     fullRegion_ = full;
     HRGN rgn;
     if (full) {
-        rgn = CreateRectRgn(0, 0, static_cast<int>(pxW_), static_cast<int>(pxH_));
+        // Only as tall as the panel is (or is heading to): the transparent window below it must stay click-through.
+        const float panelH = std::max(h_.target, h_.x);
+        const int height = static_cast<int>(std::min<float>(static_cast<float>(pxH_), std::ceil((TopInset() + panelH + kMargin) * scale_)));
+        rgn = CreateRectRgn(0, 0, static_cast<int>(pxW_), height);
     } else {
         const float winW = pxW_ / scale_;
         const float x0 = (winW - kCollapsedW) / 2.0f - kHotSlackX;
@@ -395,11 +422,11 @@ void IslandWindow::Expand() {
     if (expanded_ || suppressed_) return;
     expanded_ = true;
     KillTimer(hwnd_, kCloseTimer);
-    SetHitRegion(true);
     UpdateSystemWatch();
     SetOpenSprings(w_, h_);
     w_.target = kExpandedW;
-    h_.target = kExpandedH;
+    h_.target = TargetHeight();
+    SetHitRegion(true);
     Animate();
 }
 
@@ -462,6 +489,9 @@ void IslandWindow::CyclePage(int metric, int direction) {
     const int pages = static_cast<int>(metrics[metric].pages.size());
     if (pages < 2) return;
     ringPage_[metric] = (ringPage_[metric] + direction + pages) % pages;
+#ifndef NDEBUG
+    Log("system: ring %d -> page %d of %d", metric, ringPage_[metric], pages);
+#endif
     Animate();
 }
 
@@ -491,17 +521,32 @@ void IslandWindow::OnNotification() {
     // the user has the pointer on it (or it was already open).
     if (mascot_) mascot_->Notify();
     notifScrollTarget_ = 0;                      // newest first: show it
+    msgScrollTarget_ = 0;
     const bool wasOpen = expanded_;
-    OnClick(static_cast<int>(Section::Notifications));
+    OnClick(static_cast<int>(latestIsMessage_ ? Section::Messages : Section::Notifications));
     Expand();
     KillTimer(hwnd_, kAutoCloseTimer);
     autoClosePending_ = !wasOpen;
-    if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, kAutoCloseMs, nullptr);
+    if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, latestIsMessage_ ? kAutoCloseMessageMs : kAutoCloseMs, nullptr);
     Animate();
 }
 
 void IslandWindow::SetNotifications(const NotificationSnapshot& snapshot) {
     notifications_ = snapshot;
+    latestIsMessage_ = !snapshot.items.empty() && IsChatMessage(snapshot.items.front());
+    messages_.clear();
+    std::erase_if(notifications_.items, [&](const NotificationItem& n) {
+        if (!IsChatMessage(n)) return false;
+        messages_.push_back(n);
+        return true;
+    });
+    std::unordered_map<uint32_t, float> keepHover, keepClose;
+    for (const auto& m : messages_) {
+        if (auto it = msgHover_.find(m.id); it != msgHover_.end()) keepHover[m.id] = it->second;
+        if (auto it = msgCloseHover_.find(m.id); it != msgCloseHover_.end()) keepClose[m.id] = it->second;
+    }
+    msgHover_ = std::move(keepHover);
+    msgCloseHover_ = std::move(keepClose);
     std::unordered_map<uint32_t, Com<ID2D1Bitmap1>> keep;      // drop icons/hover state of notifications that are gone
     std::unordered_map<uint32_t, float> hover;
     for (const auto& item : notifications_.items) {
@@ -513,12 +558,21 @@ void IslandWindow::SetNotifications(const NotificationSnapshot& snapshot) {
     const float maxTop = std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows);
     notifScrollTarget_ = std::clamp(notifScrollTarget_, 0.0f, maxTop);
     hover_ = -1;
+    LayoutMessages();
+    ApplyHeightTarget();
     Animate();
 }
 
 void IslandWindow::OnWheel(int delta) {
     if (expanded_ && section_ == Section::System && hover_ >= kHitRing && hover_ < kHitRing + kMetricCount) {
         CyclePage(hover_ - kHitRing, delta > 0 ? -1 : +1);          // wheel flips the ring under the pointer
+        return;
+    }
+    if (expanded_ && section_ == Section::Messages) {
+        const float view = TargetHeight() - kMsgTop - kMsgBottomPad;
+        const float maxScroll = std::max(0.0f, msgContentHeight_ - view);
+        msgScrollTarget_ = std::clamp(msgScrollTarget_ - (delta > 0 ? 1.0f : -1.0f) * 48.0f, 0.0f, maxScroll);
+        Animate();
         return;
     }
     if (!expanded_ || section_ != Section::Notifications) return;
@@ -559,6 +613,17 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
         for (int i = 0; i < 3; ++i)
             if (p.x >= buttons[i].left && p.x <= buttons[i].right && p.y >= buttons[i].top && p.y <= buttons[i].bottom)
                 return kHitReject + i;
+    }
+    if (section_ == Section::Messages && !messages_.empty()) {
+        const D2D1_RECT_F view = MessageViewport(island);
+        if (p.x >= view.left && p.x <= view.right && p.y >= view.top && p.y <= view.bottom) {
+            for (size_t i = 0; i < messages_.size(); ++i) {
+                const D2D1_RECT_F row = MessageRow(island, i);
+                if (p.y < row.top || p.y > row.bottom) continue;
+                const bool onClose = p.x >= row.right - 28 && p.y <= row.top + 28;
+                return (onClose ? kHitMsgClose : kHitMsgOpen) + static_cast<int>(i);
+            }
+        }
     }
     if (section_ == Section::Notifications && !notifications_.items.empty()) {
         if (const D2D1_RECT_F c = NotificationClear(island); p.x >= c.left && p.x <= c.right && p.y >= c.top && p.y <= c.bottom)
@@ -605,6 +670,21 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitMsgOpen && id < kHitMsgClose + 200) {      // before the notification ids: their range overlaps
+        const bool close = id >= kHitMsgClose;
+        const size_t i = static_cast<size_t>(id - (close ? kHitMsgClose : kHitMsgOpen));
+        if (i < messages_.size() && dismissHandler_) {
+            const NotificationItem item = messages_[i];
+            if (!close && openAppHandler_) openAppHandler_(item.appId);
+            dismissHandler_(item.id);                     // like clicking a toast: it leaves the action center
+            messages_.erase(messages_.begin() + static_cast<std::ptrdiff_t>(i));
+            LayoutMessages();
+            ApplyHeightTarget();
+        }
+        hover_ = -1;
+        Animate();
+        return;
+    }
     if (id >= kHitRing && id < kHitRing + kMetricCount) {
         CyclePage(id - kHitRing, +1);
         return;
@@ -654,6 +734,7 @@ void IslandWindow::OnClick(int id) {
     if (id < 0 || id >= kSectionCount) return;
     section_ = static_cast<Section>(id);
     UpdateSystemWatch();
+    ApplyHeightTarget();
     const auto tabs = TabRects(D2D1::RectF(0, 0, kExpandedW, kExpandedH));
     tabX_.target = tabs[id].left;
     tabW_.target = tabs[id].right - tabs[id].left;
@@ -731,6 +812,14 @@ bool IslandWindow::StepAnimation(float dt) {
         }
     }
     moving |= Approach(notifScroll_, notifScrollTarget_, dt, 16.0f);
+    if (expanded_ && section_ == Section::Messages) {
+        moving |= Approach(msgScroll_, msgScrollTarget_, dt, 16.0f);
+        for (size_t i = 0; i < messages_.size(); ++i) {
+            const int open = kHitMsgOpen + static_cast<int>(i), close = kHitMsgClose + static_cast<int>(i);
+            moving |= Approach(msgHover_[messages_[i].id], (hover_ == open || hover_ == close) ? 1.0f : 0.0f, dt, 22.0f);
+            moving |= Approach(msgCloseHover_[messages_[i].id], hover_ == close ? 1.0f : 0.0f, dt, 22.0f);
+        }
+    }
     moving |= Approach(notifClearHover_, hover_ == kHitNotifClear ? 1.0f : 0.0f, dt, 22.0f);
     for (size_t i = 0; i < notifications_.items.size(); ++i)
         moving |= Approach(notifCloseHover_[notifications_.items[i].id],
@@ -740,6 +829,7 @@ bool IslandWindow::StepAnimation(float dt) {
 
 void IslandWindow::OnSettled() {
     if (expanded_) {
+        SetHitRegion(true);                      // the panel may have changed height: fit the clickable area to it
         // Opened by hover but the pointer already left: start closing. (Self-opened panels have their own timer.)
         if (!CursorInIsland(kLeaveSlack) && !Pinned() && !autoClosePending_) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
     } else if (fullRegion_) {
@@ -852,10 +942,10 @@ void IslandWindow::DrawIsland(ID2D1DeviceContext* dc, float progress) {
 }
 
 void IslandWindow::DrawText(ID2D1DeviceContext* dc, const wchar_t* text, IDWriteTextFormat* fmt, D2D1_RECT_F r,
-                            D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align) {
+                            D2D1_COLOR_F color, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT vertical) {
     if (!fmt) return;
     fmt->SetTextAlignment(align);
-    fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmt->SetParagraphAlignment(vertical);
     brush_->SetColor(color);
     dc->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, r, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
@@ -902,6 +992,10 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             DrawPermission(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
         }
+        if (i == static_cast<int>(Section::Messages) && !messages_.empty()) {
+            DrawMessages(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Notifications) && !notifications_.items.empty()) {
             DrawNotifications(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
@@ -913,7 +1007,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         const float right = base.right - (mascot_ ? kMascotLane : 24.0f);
         const wchar_t* emptyTitle = kEmptyTitle[i];
         const wchar_t* emptyBody = kEmptyBody[i];
-        if (i == static_cast<int>(Section::Notifications)) {
+        if (i == static_cast<int>(Section::Notifications) || i == static_cast<int>(Section::Messages)) {
             switch (notifications_.access) {
             case NotificationAccess::Denied:
                 emptyTitle = L"Notification access is off";
@@ -1212,6 +1306,137 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
     DrawText(dc, L"Approve", buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     const std::wstring deferLabel = L"Answer in " + r.source;
     DrawText(dc, deferLabel.c_str(), smallFont, buttons[2], WithAlpha(kTextDim, (1.0f + 0.6f * hd) * alpha));
+}
+
+// ---- messages --------------------------------------------------------------------------------
+
+D2D1_RECT_F IslandWindow::MessageViewport(const D2D1_RECT_F& panel) const {
+    return D2D1::RectF(panel.left + 18, panel.top + kMsgTop,
+                       panel.left + kExpandedW - (mascot_ ? kMascotLane : 18.0f),
+                       panel.top + std::max(kMsgTop + 40.0f, h_.x - kMsgBottomPad));
+}
+
+D2D1_RECT_F IslandWindow::MessageRow(const D2D1_RECT_F& panel, size_t index) const {
+    const D2D1_RECT_F view = MessageViewport(panel);
+    const float top = view.top - msgScroll_ + (index < msgRowTop_.size() ? msgRowTop_[index] : 0.0f);
+    return D2D1::RectF(view.left, top, view.right, top + (index < msgRowHeight_.size() ? msgRowHeight_[index] : 0.0f));
+}
+
+void IslandWindow::LayoutMessages() {
+    msgRowHeight_.clear();
+    msgRowTop_.clear();
+    msgLines_.clear();
+    msgContentHeight_ = 0;
+    const float x1 = kExpandedW - (mascot_ ? kMascotLane : 18.0f);
+    const float textWidth = (x1 - 18) - 49 - 30;                      // minus avatar column and the dismiss button
+    IDWriteTextFormat* body = gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    msgLineHeight_ = std::max(12.0f, gfx_.MeasureHeight(L"Ag", body, textWidth));
+    for (const auto& m : messages_) {
+        std::wstring text = m.body.empty() ? L"New message" : m.body;
+        std::replace(text.begin(), text.end(), L'\n', L' ');
+        const int lines = std::clamp(static_cast<int>(std::lround(gfx_.MeasureHeight(text.c_str(), body, textWidth) / msgLineHeight_)),
+                                     1, kMsgMaxLines);
+        const float height = 7.0f + 18.0f + lines * msgLineHeight_ + 9.0f;
+        msgLines_.push_back(lines);
+        msgRowTop_.push_back(msgContentHeight_);
+        msgRowHeight_.push_back(height);
+        msgContentHeight_ += height + kMsgGap;
+    }
+    if (!messages_.empty()) msgContentHeight_ -= kMsgGap;
+    const float view = TargetHeight() - kMsgTop - kMsgBottomPad;
+    msgScrollTarget_ = std::clamp(msgScrollTarget_, 0.0f, std::max(0.0f, msgContentHeight_ - view));
+    msgScroll_ = std::clamp(msgScroll_, 0.0f, std::max(0.0f, msgContentHeight_ - view));
+}
+
+float IslandWindow::TargetHeight() const {
+    if (section_ == Section::Messages && !messages_.empty())
+        return std::clamp(kMsgTop + msgContentHeight_ + kMsgBottomPad, kExpandedH, kMaxPanelH);
+    return kExpandedH;
+}
+
+void IslandWindow::ApplyHeightTarget() {
+    if (!expanded_) return;
+    const float target = TargetHeight();
+    if (target != h_.target) {
+        SetOpenSprings(w_, h_);
+        h_.target = target;
+        SetHitRegion(true);                       // cover the new height before the panel gets there
+        Animate();
+    }
+}
+
+void IslandWindow::DrawMessages(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    const D2D1_RECT_F view = MessageViewport(base);
+    IDWriteTextFormat* nameFont = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* bodyFont = gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* metaFont = gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
+
+    dc->PushAxisAlignedClip(view, D2D1_ANTIALIAS_MODE_ALIASED);
+    for (size_t i = 0; i < messages_.size(); ++i) {
+        const D2D1_RECT_F row = MessageRow(base, i);
+        if (row.bottom < view.top || row.top > view.bottom) continue;
+        const NotificationItem& m = messages_[i];
+        const float hover = msgHover_.count(m.id) ? msgHover_.at(m.id) : 0.0f;
+        const float closeHover = msgCloseHover_.count(m.id) ? msgCloseHover_.at(m.id) : 0.0f;
+
+        if (hover > 0.01f) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.055f * hover * alpha));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{row, 10, 10}, brush_.Get());
+        }
+
+        // Avatar: the sender's initial on a stable tint.
+        const D2D1_POINT_2F c = D2D1::Point2F(row.left + 23, row.top + 24);
+        uint32_t hash = 2166136261u;
+        for (wchar_t ch : m.title) hash = (hash ^ static_cast<uint32_t>(ch)) * 16777619u;
+        const float hue = static_cast<float>(hash % 360) / 60.0f;
+        const float x = 1.0f - std::fabs(std::fmod(hue, 2.0f) - 1.0f);
+        const float rgb[6][3] = {{1, x, 0}, {x, 1, 0}, {0, 1, x}, {0, x, 1}, {x, 0, 1}, {1, 0, x}};
+        const float* t = rgb[static_cast<int>(hue) % 6];
+        brush_->SetColor(D2D1::ColorF(0.20f + 0.32f * t[0], 0.20f + 0.32f * t[1], 0.20f + 0.32f * t[2], alpha));
+        dc->FillEllipse(D2D1::Ellipse(c, 15, 15), brush_.Get());
+        const wchar_t initial[2] = {!m.title.empty() && std::iswalnum(m.title[0]) ? static_cast<wchar_t>(std::towupper(m.title[0])) : L'#', 0};
+        DrawText(dc, initial, nameFont, D2D1::RectF(c.x - 15, c.y - 15, c.x + 15, c.y + 15), WithAlpha(kText, alpha),
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Sender, time (or the open hint while hovered) and the message itself.
+        const float textLeft = row.left + 49;
+        const D2D1_RECT_F close = D2D1::RectF(row.right - 28, row.top + 6, row.right - 6, row.top + 28);
+        const float textRight = close.left - 2;
+        const std::wstring time = RelativeTime(m.time);
+        const float timeW = std::ceil(gfx_.MeasureWidth(time.c_str(), metaFont)) + 2;
+        DrawText(dc, m.title.empty() ? m.app.c_str() : m.title.c_str(), nameFont,
+                 D2D1::RectF(textLeft, row.top + 7, std::max(textLeft, textRight - 108), row.top + 25), WithAlpha(kText, alpha));
+        DrawText(dc, time.c_str(), metaFont, D2D1::RectF(textRight - timeW, row.top + 7, textRight, row.top + 25),
+                 WithAlpha(kTextDim, (1.0f - hover) * alpha), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        const std::wstring hint = L"Open in " + (m.app.empty() ? std::wstring(L"app") : m.app) + L" \u203A";
+        DrawText(dc, hint.c_str(), metaFont, D2D1::RectF(textLeft, row.top + 7, textRight, row.top + 25),
+                 WithAlpha(D2D1::ColorF(0.42f, 0.70f, 1.0f, 1.0f), hover * alpha), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        std::wstring text = m.body.empty() ? L"New message" : m.body;
+        std::replace(text.begin(), text.end(), L'\n', L' ');
+        const int lines = i < msgLines_.size() ? msgLines_[i] : 1;
+        DrawText(dc, text.c_str(), bodyFont, D2D1::RectF(textLeft, row.top + 26, textRight + 24, row.top + 27 + lines * msgLineHeight_),
+                 WithAlpha(kTextDim, 1.25f * alpha), DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+
+        // Dismiss: faint until the pointer is on it.
+        const D2D1_POINT_2F x0 = D2D1::Point2F((close.left + close.right) / 2, (close.top + close.bottom) / 2);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.12f * closeHover * alpha));
+        dc->FillEllipse(D2D1::Ellipse(x0, 10, 10), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.30f * hover + 0.5f * closeHover) * alpha));
+        dc->DrawLine(D2D1::Point2F(x0.x - 3.5f, x0.y - 3.5f), D2D1::Point2F(x0.x + 3.5f, x0.y + 3.5f), brush_.Get(), 1.4f);
+        dc->DrawLine(D2D1::Point2F(x0.x - 3.5f, x0.y + 3.5f), D2D1::Point2F(x0.x + 3.5f, x0.y - 3.5f), brush_.Get(), 1.4f);
+    }
+    dc->PopAxisAlignedClip();
+
+    // Thin scrollbar when there is more than fits.
+    const float viewH = view.bottom - view.top;
+    if (msgContentHeight_ > viewH + 1.0f) {
+        const float thumbH = std::max(16.0f, viewH * viewH / msgContentHeight_);
+        const float maxScroll = msgContentHeight_ - viewH;
+        const float thumbTop = view.top + (viewH - thumbH) * (maxScroll > 0 ? msgScroll_ / maxScroll : 0.0f);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.22f * alpha));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(view.right + 5, thumbTop, view.right + 7.5f, thumbTop + thumbH), 1.2f, 1.2f},
+                                 brush_.Get());
+    }
 }
 
 // ---- system ----------------------------------------------------------------------------------

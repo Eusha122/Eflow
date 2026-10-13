@@ -165,6 +165,7 @@ void NotificationService::Run() {
                 item.time = ToFileTime(n.CreationTime());
                 try {
                     item.app = std::wstring(n.AppInfo().DisplayInfo().DisplayName());
+                    item.appId = std::wstring(n.AppInfo().AppUserModelId());
                 } catch (const winrt::hresult_error&) {}
                 try {
                     const auto binding = n.Notification().Visual().GetBinding(wun::KnownNotificationBindings::ToastGeneric());

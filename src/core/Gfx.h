@@ -28,6 +28,9 @@ public:
     // Cached text formats: Segoe UI Variable (Display for >= 16 DIP), or the icon font.
     IDWriteTextFormat* Text(float size, DWRITE_FONT_WEIGHT weight, bool icons = false);
     float MeasureWidth(const wchar_t* text, IDWriteTextFormat* fmt);
+    // Word-wrapping format (ellipsis where text overflows the box) and the height `text` needs at `width`.
+    IDWriteTextFormat* Wrapped(float size, DWRITE_FONT_WEIGHT weight);
+    float MeasureHeight(const wchar_t* text, IDWriteTextFormat* fmt, float width);
     // Wrapping monospace format (Cascadia Mono, else Consolas) for commands and paths.
     IDWriteTextFormat* Mono(float size);
 
