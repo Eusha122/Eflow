@@ -6,8 +6,9 @@ companion that reacts to what is happening.
 
 <p align="center"><img src="docs/media/mascot.webp" width="360" alt="Eflow mascot reacting to music"></p>
 
-> **Status: early development.** The mascot asset is finished. The island app itself is being
-> built next, and `CMakeLists.txt` does not produce a working executable yet.
+> **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
+> fullscreen auto-hide, tray icon) and the mascot asset are done. Music, notifications, AI requests and
+> the in-app mascot player come next.
 
 ## Planned features
 
@@ -38,6 +39,19 @@ docs/              architecture and design notes
 src/               the island app (C++)
 tools/             mascot build pipeline (Python + headless Blender)
 ```
+
+## Building the app
+
+Requires Windows 10/11 and Visual Studio 2022 or newer with the "Desktop development with C++"
+workload (it provides the compiler, CMake and Ninja).
+
+```powershell
+tools\build_app.ps1            # debug build   -> build\debug\eflow.exe
+tools\build_app.ps1 release    # release build -> build\release\eflow.exe
+```
+
+Eflow lives in the tray: right-click its icon for "Start with Windows" and "Quit Eflow". Release
+builds turn on "Start with Windows" the first time they run; debug builds never change it.
 
 ## Rebuilding the mascot
 

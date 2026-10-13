@@ -66,10 +66,13 @@ eflow-hook.exe  (tiny, launched by Claude Code / Codex per request)
 
 ### Rendering/animation
 
-* Layered popup, `WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`.
+* Popup with `WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`.
 * Swap chain for composition, premultiplied alpha, so real per-pixel transparency.
-* Window is sized to the island's *current* bounds when idle (collapsed bar + small hot zone), so it never
-  blocks clicks on windows beneath. Expanded size only while open.
+* The window has a fixed size (the expanded footprint) and never moves or resizes while animating.
+  A window region limits its clickable area to the idle bar plus a small hover zone, so everything
+  else passes clicks through to the windows beneath; the region opens up only while the panel is out.
+* Fullscreen guard is event-driven: the shell's `ABN_FULLSCREENAPP` app-bar notification (an app bar
+  registered without a position reserves no space) plus foreground/minimize WinEvents.
 * Frames render **only while something is animating** (spring not at rest). Idle CPU ≈ 0.
 * One critically-damped / under-damped spring per animated scalar (width, height, corner radius,
   content opacity), integrated analytically for stability at any frame time.
@@ -86,7 +89,7 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | # | Phase | Status |
 |---|---|---|
 | 0 | Mascot asset: art, rig, expressions, clips, export pipeline | done |
-| 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | next |
+| 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | done |
 | 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | |
 | 2 | Music: SMTC, artwork, progress, controls, mascot states | |
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex installers (`eflow-hook --install`) | |

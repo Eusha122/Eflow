@@ -15,4 +15,4 @@ add_executable(eflow WIN32
 target_include_directories(eflow PRIVATE src)
 target_compile_definitions(eflow PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc)
-target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp shell32 user32 advapi32 shcore ole32)
+target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid shell32 user32 advapi32 shcore ole32)

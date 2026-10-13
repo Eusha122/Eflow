@@ -1,0 +1,44 @@
+#pragma once
+#include <windows.h>
+#include <shellapi.h>
+
+#include <memory>
+#include <vector>
+
+#include "core/Gfx.h"
+#include "island/IslandWindow.h"
+
+namespace eflow {
+
+// Process-level shell: owns the GPU resources, one island per monitor, the tray icon, autostart and
+// the fullscreen guard. Everything runs on the UI thread.
+class App {
+public:
+    int Run();
+
+private:
+    static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
+    LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+    static void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD);
+
+    bool CreateMessageWindow();
+    void BuildIslands();
+    void RebuildGraphics();
+    void UpdateFullscreenState();
+    void AddTrayIcon();
+    void ShowTrayMenu();
+
+    static bool AutostartEnabled();
+    static void SetAutostart(bool enable);
+    static void ApplyFirstRunDefaults();
+
+    Gfx gfx_;
+    HWND msgWnd_ = nullptr;
+    UINT taskbarCreated_ = 0;
+    bool appBar_ = false;
+    NOTIFYICONDATAW tray_{};
+    std::vector<HWINEVENTHOOK> hooks_;
+    std::vector<std::unique_ptr<IslandWindow>> islands_;
+};
+
+} // namespace eflow
