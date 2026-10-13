@@ -60,6 +60,7 @@ constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
+constexpr int kHitRing = 40;                                 // + metric index (System tab)
 constexpr int kHitNotifClear = 30;                          // "Clear all"
 constexpr int kHitNotifClose = 100;                         // + notification index: its dismiss button
 constexpr float kNotifRowH = 44.0f;
@@ -69,13 +70,146 @@ constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
 
-const wchar_t* const kTabLabels[3] = {L"Music", L"Notifications", L"AI Requests"};
-const wchar_t* const kEmptyTitle[3] = {L"Nothing playing", L"You're all caught up", L"No pending requests"};
-const wchar_t* const kEmptyBody[3] = {
+const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"AI Requests", L"System"};
+const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No pending requests", L""};
+const wchar_t* const kEmptyBody[kSectionCount] = {
     L"Play something in Spotify, YouTube or your browser",
     L"New notifications will show up here",
     L"Claude Code and Codex approvals will appear here",
+    L"",
 };
+
+// ---- System tab: what each ring can show -----------------------------------------------------
+constexpr D2D1_COLOR_F kAccent = Rgba(0.42f, 0.70f, 1.0f, 1.0f);
+constexpr D2D1_COLOR_F kAmber = Rgba(1.0f, 0.73f, 0.30f, 1.0f);
+constexpr D2D1_COLOR_F kRed = Rgba(1.0f, 0.42f, 0.38f, 1.0f);
+constexpr float kRingRadius = 27.0f;
+constexpr float kRingThickness = 6.0f;
+
+struct SystemPage {
+    std::wstring value, unit, caption;     // centre text (unit sits under the value), line under the label
+    float fraction = 0;                    // ring fill, 0..1
+    int severity = 0;                      // 0 calm, 1 warm, 2 hot
+};
+struct Metric {
+    const wchar_t* label;
+    std::vector<SystemPage> pages;
+};
+
+std::wstring Fmt(const wchar_t* format, double a) {
+    wchar_t buffer[48];
+    swprintf_s(buffer, format, a);
+    return buffer;
+}
+std::wstring Fmt2(const wchar_t* format, double a, double b) {
+    wchar_t buffer[64];
+    swprintf_s(buffer, format, a, b);
+    return buffer;
+}
+int PercentSeverity(float p) { return p >= 90 ? 2 : p >= 70 ? 1 : 0; }
+int TempSeverity(float t) { return t >= 85 ? 2 : t >= 70 ? 1 : 0; }
+constexpr double kGiB = 1073741824.0;
+
+// Bits per second -> "12.4" + "Mb/s".
+void Rate(double bps, std::wstring& value, std::wstring& unit) {
+    if (bps < 1e3) { value = Fmt(L"%.0f", bps); unit = L"b/s"; }
+    else if (bps < 1e6) { value = Fmt(L"%.0f", bps / 1e3); unit = L"Kb/s"; }
+    else if (bps < 1e9) { value = Fmt(bps < 1e8 ? L"%.1f" : L"%.0f", bps / 1e6); unit = L"Mb/s"; }
+    else { value = Fmt(L"%.2f", bps / 1e9); unit = L"Gb/s"; }
+}
+std::wstring RateText(double bps) {
+    std::wstring v, u;
+    Rate(bps, v, u);
+    return v + L" " + u;
+}
+double NiceCeil(double v) {                // 1, 2, 5 x 10^n: keeps the network ring's scale steady
+    const double e = std::pow(10.0, std::floor(std::log10(v)));
+    const double m = v / e;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * e;
+}
+
+std::vector<Metric> BuildMetrics(const SystemSnapshot& s) {
+    const bool ok = s.valid;
+    const SystemPage dash{L"\u2014", L"", L"", 0, 0};
+    std::vector<Metric> m;
+
+    // CPU: usage -> temperature -> fan
+    Metric cpu{L"CPU", {}};
+    SystemPage u = ok ? SystemPage{Fmt(L"%.0f%%", s.cpuUsage), L"", Has(s.cpuClockGHz) ? Fmt(L"%.1f GHz", s.cpuClockGHz)
+                                                                                         : Fmt(L"%.0f threads", s.cpuThreads),
+                                   s.cpuUsage / 100.0f, PercentSeverity(s.cpuUsage)}
+                        : dash;
+    cpu.pages.push_back(u);
+    SystemPage t = dash;
+    t.caption = L"Needs sensor app";
+    if (ok && Has(s.cpuTempC)) t = {Fmt(L"%.0f", s.cpuTempC), L"\u00B0C", L"Temperature", s.cpuTempC / 100.0f, TempSeverity(s.cpuTempC)};
+    else if (ok && s.sensorBridge) t.caption = L"Not reported";
+    cpu.pages.push_back(t);
+    SystemPage f = dash;
+    f.caption = L"Needs sensor app";
+    if (ok && !s.fans.empty()) {
+        const FanReading* best = &s.fans[0];
+        for (const auto& fan : s.fans)
+            if (fan.rpm > best->rpm) best = &fan;
+        f = {Fmt(L"%.0f", best->rpm), L"RPM", s.fans.size() > 1 ? Fmt(L"Fastest of %.0f", static_cast<double>(s.fans.size())) : L"Fan",
+             std::min(1.0f, best->rpm / 3000.0f), 0};
+    } else if (ok && s.sensorBridge) {
+        f.caption = L"No fans found";
+    }
+    cpu.pages.push_back(f);
+    m.push_back(std::move(cpu));
+
+    // GPU: usage -> temperature -> fan -> memory
+    Metric gpu{L"GPU", {}};
+    if (ok && s.gpuAvailable) {
+        gpu.pages.push_back({Fmt(L"%.0f%%", s.gpuUsage), L"", Has(s.gpuTempC) ? Fmt(L"%.0f\u00B0C", s.gpuTempC) : L"Graphics",
+                             s.gpuUsage / 100.0f, PercentSeverity(s.gpuUsage)});
+        gpu.pages.push_back(Has(s.gpuTempC) ? SystemPage{Fmt(L"%.0f", s.gpuTempC), L"\u00B0C", L"Temperature", s.gpuTempC / 100.0f,
+                                                        TempSeverity(s.gpuTempC)}
+                                            : SystemPage{L"\u2014", L"", L"Not reported", 0, 0});
+        gpu.pages.push_back(Has(s.gpuFanPercent) ? SystemPage{Fmt(L"%.0f%%", s.gpuFanPercent), L"", L"Fan speed", s.gpuFanPercent / 100.0f, 0}
+                                                 : SystemPage{L"\u2014", L"", L"Not reported", 0, 0});
+        if (s.vramTotal) {
+            const float used = static_cast<float>(static_cast<double>(s.vramUsed) / static_cast<double>(s.vramTotal));
+            gpu.pages.push_back({Fmt(L"%.1f", s.vramUsed / kGiB), L"GB", Fmt(L"of %.0f GB", s.vramTotal / kGiB), used,
+                                 PercentSeverity(used * 100.0f)});
+        } else {
+            gpu.pages.push_back({L"\u2014", L"", L"Memory", 0, 0});
+        }
+    } else {
+        SystemPage none = dash;
+        none.caption = ok ? L"No GPU data" : L"";
+        gpu.pages = {none, none, none, none};
+    }
+    m.push_back(std::move(gpu));
+
+    // Memory: in use -> available
+    Metric ram{L"Memory", {}};
+    if (ok && s.ramTotal) {
+        ram.pages.push_back({Fmt(L"%.0f%%", s.ramUsage), L"", Fmt2(L"%.1f / %.1f GB", s.ramUsed / kGiB, s.ramTotal / kGiB),
+                             s.ramUsage / 100.0f, PercentSeverity(s.ramUsage)});
+        const double free = static_cast<double>(s.ramTotal - s.ramUsed);
+        ram.pages.push_back({Fmt(L"%.1f", free / kGiB), L"GB", L"Available", static_cast<float>(free / static_cast<double>(s.ramTotal)), 0});
+    } else {
+        ram.pages = {dash, dash};
+    }
+    m.push_back(std::move(ram));
+
+    // Network: download -> upload (the ring scales to the busiest recent second)
+    Metric net{L"Network", {}};
+    if (ok) {
+        const double scale = NiceCeil(std::max({10e6, static_cast<double>(s.downHistory.Max()), static_cast<double>(s.upHistory.Max())}));
+        std::wstring dv, du, uv, uu;
+        Rate(s.downBps, dv, du);
+        Rate(s.upBps, uv, uu);
+        net.pages.push_back({dv, du, L"\u2191 " + RateText(s.upBps), static_cast<float>(std::min(1.0, s.downBps / scale)), 0});
+        net.pages.push_back({uv, uu, L"\u2193 " + RateText(s.downBps), static_cast<float>(std::min(1.0, s.upBps / scale)), 0});
+    } else {
+        net.pages = {dash, dash};
+    }
+    m.push_back(std::move(net));
+    return m;
+}
 
 std::wstring RelativeTime(ULONGLONG fileTime) {
     FILETIME ft;
@@ -114,6 +248,7 @@ IslandWindow::IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_p
 }
 
 IslandWindow::~IslandWindow() {
+    if (watching_ && systemWatchHandler_) systemWatchHandler_(false);
     if (hwnd_) {
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);
@@ -191,23 +326,36 @@ D2D1_POINT_2F IslandWindow::MascotPoint(float x, float y) const {
     return {cx + x * kMascotK, cy - y * kMascotK};
 }
 
+#ifndef NDEBUG
+void IslandWindow::DebugOpenTab(int section) {
+    debugPinned_ = section >= 0;
+    if (section >= 0) {
+        OnClick(section);
+        Expand();
+    } else if (expanded_) {
+        Collapse();
+    }
+    Animate();
+}
+#endif
+
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
-    return pressed_ >= 0 || (mascot_ && mascot_->permissionPending());
+    return debugPinned_ || pressed_ >= 0 || (mascot_ && mascot_->permissionPending());
 }
 
-std::array<D2D1_RECT_F, 3> IslandWindow::TabRects(const D2D1_RECT_F& island) const {
+std::array<D2D1_RECT_F, kSectionCount> IslandWindow::TabRects(const D2D1_RECT_F& island) const {
     IDWriteTextFormat* fmt = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    std::array<float, 3> widths{};
+    std::array<float, kSectionCount> widths{};
     float total = 0;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kSectionCount; ++i) {
         widths[i] = std::ceil(gfx_.MeasureWidth(kTabLabels[i], fmt)) + 2 * kTabPadX;
         total += widths[i];
     }
-    total += 2 * kTabGap;
+    total += (kSectionCount - 1) * kTabGap;
     float x = island.left + ((island.right - island.left) - total) / 2.0f;
-    std::array<D2D1_RECT_F, 3> out{};
-    for (int i = 0; i < 3; ++i) {
+    std::array<D2D1_RECT_F, kSectionCount> out{};
+    for (int i = 0; i < kSectionCount; ++i) {
         out[i] = D2D1::RectF(x, island.top + kTabTop, x + widths[i], island.top + kTabTop + kTabH);
         x += widths[i] + kTabGap;
     }
@@ -248,6 +396,7 @@ void IslandWindow::Expand() {
     expanded_ = true;
     KillTimer(hwnd_, kCloseTimer);
     SetHitRegion(true);
+    UpdateSystemWatch();
     SetOpenSprings(w_, h_);
     w_.target = kExpandedW;
     h_.target = kExpandedH;
@@ -258,6 +407,7 @@ void IslandWindow::Collapse() {
     if (!expanded_) return;
     expanded_ = false;
     hover_ = pressed_ = -1;
+    UpdateSystemWatch();
     KillTimer(hwnd_, kAutoCloseTimer);
     autoClosePending_ = false;
     if (mascot_) mascot_->ClearBadge();        // the panel was open: the user has seen it
@@ -281,12 +431,38 @@ void IslandWindow::SetSuppressed(bool suppressed) {
         w_.Snap(kCollapsedW);
         h_.Snap(kCollapsedH);
         SetHitRegion(false);
+        UpdateSystemWatch();
         ShowWindow(hwnd_, SW_HIDE);
     } else {
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         Animate();
     }
+}
+
+void IslandWindow::UpdateSystemWatch() {
+    const bool want = expanded_ && !suppressed_ && section_ == Section::System;
+    if (want == watching_) return;
+    watching_ = want;
+    if (want) {
+        ringFrac_.fill(0);                       // rings sweep in from empty each time the tab opens
+        ringFade_.fill(1);
+    }
+    if (systemWatchHandler_) systemWatchHandler_(want);
+}
+
+void IslandWindow::SetSystem(const SystemSnapshot& snapshot) {
+    system_ = snapshot;
+    Animate();
+}
+
+void IslandWindow::CyclePage(int metric, int direction) {
+    if (metric < 0 || metric >= kMetricCount) return;
+    const auto metrics = BuildMetrics(system_);
+    const int pages = static_cast<int>(metrics[metric].pages.size());
+    if (pages < 2) return;
+    ringPage_[metric] = (ringPage_[metric] + direction + pages) % pages;
+    Animate();
 }
 
 void IslandWindow::SetMascotState(Mascot::State state) {
@@ -341,6 +517,10 @@ void IslandWindow::SetNotifications(const NotificationSnapshot& snapshot) {
 }
 
 void IslandWindow::OnWheel(int delta) {
+    if (expanded_ && section_ == Section::System && hover_ >= kHitRing && hover_ < kHitRing + kMetricCount) {
+        CyclePage(hover_ - kHitRing, delta > 0 ? -1 : +1);          // wheel flips the ring under the pointer
+        return;
+    }
     if (!expanded_ || section_ != Section::Notifications) return;
     const float maxTop = std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows);
     notifScrollTarget_ = std::clamp(std::round(notifScrollTarget_) - (delta > 0 ? 1.0f : -1.0f), 0.0f, maxTop);
@@ -366,8 +546,14 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     if (!expanded_ || h_.x < kExpandedH * 0.85f) return -1;
     const D2D1_RECT_F island = IslandRect();
     const auto tabs = TabRects(island);
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < kSectionCount; ++i)
         if (p.x >= tabs[i].left && p.x <= tabs[i].right && p.y >= tabs[i].top && p.y <= tabs[i].bottom) return i;
+    if (section_ == Section::System) {
+        for (int i = 0; i < kMetricCount; ++i) {
+            const D2D1_RECT_F cell = RingCell(island, i);
+            if (p.x >= cell.left && p.x <= cell.right && p.y >= cell.top && p.y <= cell.bottom) return kHitRing + i;
+        }
+    }
     if (section_ == Section::Ai && !permissions_.empty()) {
         const auto buttons = PermissionButtons(island);
         for (int i = 0; i < 3; ++i)
@@ -419,6 +605,10 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitRing && id < kHitRing + kMetricCount) {
+        CyclePage(id - kHitRing, +1);
+        return;
+    }
     if (id >= kHitReject && id <= kHitDefer) {
         if (permissions_.empty() || !permissionHandler_) return;
         const PermissionDecision d = id == kHitApprove ? PermissionDecision::Allow
@@ -461,8 +651,9 @@ void IslandWindow::OnClick(int id) {
         Animate();
         return;
     }
-    if (id < 0 || id > 2) return;
+    if (id < 0 || id >= kSectionCount) return;
     section_ = static_cast<Section>(id);
+    UpdateSystemWatch();
     const auto tabs = TabRects(D2D1::RectF(0, 0, kExpandedW, kExpandedH));
     tabX_.target = tabs[id].left;
     tabW_.target = tabs[id].right - tabs[id].left;
@@ -518,8 +709,26 @@ bool IslandWindow::StepAnimation(float dt) {
     for (int i = 0; i < 3; ++i) {
         moving |= Approach(controlHover_[i], hover_ == kHitPrev + i ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(permissionHover_[i], hover_ == kHitReject + i ? 1.0f : 0.0f, dt, 22.0f);
+    }
+    for (int i = 0; i < kSectionCount; ++i) {
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(sectionAlpha_[i], i == static_cast<int>(section_) ? 1.0f : 0.0f, dt, 16.0f);
+    }
+    if (expanded_ && section_ == Section::System) {
+        const auto metrics = BuildMetrics(system_);
+        for (int i = 0; i < kMetricCount; ++i) {
+            moving |= Approach(ringHover_[i], hover_ == kHitRing + i ? 1.0f : 0.0f, dt, 20.0f);
+            moving |= Approach(ringPress_[i], pressed_ == kHitRing + i ? 1.0f : 0.0f, dt, 30.0f);
+            if (ringPage_[i] != ringShown_[i]) {            // fade the centre out, swap, fade the new page in
+                Approach(ringFade_[i], 0.0f, dt, 28.0f);
+                if (ringFade_[i] < 0.08f) ringShown_[i] = ringPage_[i];
+                moving = true;
+            } else {
+                moving |= Approach(ringFade_[i], 1.0f, dt, 18.0f);
+            }
+            const auto& pages = metrics[i].pages;
+            moving |= Approach(ringFrac_[i], pages[ringPage_[i] % pages.size()].fraction, dt, 6.5f);
+        }
     }
     moving |= Approach(notifScroll_, notifScrollTarget_, dt, 16.0f);
     moving |= Approach(notifClearHover_, hover_ == kHitNotifClear ? 1.0f : 0.0f, dt, 22.0f);
@@ -665,7 +874,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
     dc->FillRoundedRectangle(pill, brush_.Get());
 
     IDWriteTextFormat* tabFont = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kSectionCount; ++i) {
         if (tabHover_[i] > 0.0f) {
             brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.055f * tabHover_[i] * alpha));
             dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{tabs[i], kTabH / 2, kTabH / 2}, brush_.Get());
@@ -681,10 +890,14 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
     const float bodyTop = base.top + kTabTop + kTabH + 18.0f;
     const float bodyBottom = base.bottom - 18.0f;
     const float mid = (bodyTop + bodyBottom) / 2.0f;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kSectionCount; ++i) {
         const float a = sectionAlpha_[i] * alpha;
         if (a < 0.003f) continue;
         const float slide = (1.0f - sectionAlpha_[i]) * 8.0f;
+        if (i == static_cast<int>(Section::System)) {
+            DrawSystem(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Ai) && !permissions_.empty()) {
             DrawPermission(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
@@ -999,6 +1212,105 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
     DrawText(dc, L"Approve", buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     const std::wstring deferLabel = L"Answer in " + r.source;
     DrawText(dc, deferLabel.c_str(), smallFont, buttons[2], WithAlpha(kTextDim, (1.0f + 0.6f * hd) * alpha));
+}
+
+// ---- system ----------------------------------------------------------------------------------
+
+D2D1_RECT_F IslandWindow::RingCell(const D2D1_RECT_F& panel, int index) const {
+    const float x0 = panel.left + 24;
+    const float x1 = panel.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+    const float w = (x1 - x0) / kMetricCount;
+    return D2D1::RectF(x0 + w * index, panel.top + 54, x0 + w * (index + 1), panel.bottom - 8);
+}
+
+void IslandWindow::DrawRing(ID2D1DeviceContext* dc, D2D1_POINT_2F c, float r, float thickness, float fraction,
+                            D2D1_COLOR_F color, float alpha, float trackAlpha) {
+    if (!roundStroke_) {
+        const D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                               D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+        gfx_.d2dFactory()->CreateStrokeStyle(props, nullptr, 0, &roundStroke_);
+    }
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, trackAlpha * alpha));
+    dc->DrawEllipse(D2D1::Ellipse(c, r, r), brush_.Get(), thickness);
+
+    fraction = Clamp01(fraction);
+    if (fraction <= 0.004f) return;
+    auto stroke = [&](float width, float a) {
+        brush_->SetColor(D2D1::ColorF(color.r, color.g, color.b, a * alpha));
+        if (fraction >= 0.996f) {
+            dc->DrawEllipse(D2D1::Ellipse(c, r, r), brush_.Get(), width);
+            return;
+        }
+        Com<ID2D1PathGeometry> geometry;
+        Com<ID2D1GeometrySink> sink;
+        if (FAILED(gfx_.d2dFactory()->CreatePathGeometry(&geometry)) || FAILED(geometry->Open(&sink))) return;
+        const float end = -1.5707963f + fraction * 6.2831853f;           // clockwise from 12 o'clock
+        sink->BeginFigure(D2D1::Point2F(c.x, c.y - r), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(c.x + r * std::cos(end), c.y + r * std::sin(end)), D2D1::SizeF(r, r), 0,
+                                      D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                      fraction > 0.5f ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        dc->DrawGeometry(geometry.Get(), brush_.Get(), width, roundStroke_.Get());
+    };
+    stroke(thickness + 6.0f, 0.13f);                                     // soft glow
+    stroke(thickness, 1.0f);
+}
+
+void IslandWindow::DrawSystem(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    const auto metrics = BuildMetrics(system_);
+    IDWriteTextFormat* bigFont = gfx_.Text(17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* unitFont = gfx_.Text(9.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* labelFont = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* captionFont = gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL);
+
+    for (int i = 0; i < kMetricCount; ++i) {
+        const Metric& metric = metrics[i];
+        const SystemPage& page = metric.pages[ringShown_[i] % metric.pages.size()];
+        const D2D1_RECT_F cell = RingCell(base, i);
+        const float hover = ringHover_[i], press = ringPress_[i];
+        const float scale = 1.0f + 0.07f * hover - 0.06f * press;
+        const D2D1_POINT_2F c{(cell.left + cell.right) / 2, cell.top + kRingRadius + 4};
+        const D2D1_COLOR_F color = page.severity >= 2 ? kRed : page.severity == 1 ? kAmber : kAccent;
+
+        // A faint disc lifts the ring under the pointer.
+        if (hover > 0.01f) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.05f * hover * alpha));
+            dc->FillEllipse(D2D1::Ellipse(c, (kRingRadius + 7) * scale, (kRingRadius + 7) * scale), brush_.Get());
+        }
+        DrawRing(dc, c, kRingRadius * scale, kRingThickness * scale, ringFrac_[i], color, alpha, 0.085f + 0.04f * hover);
+
+        // Centre: value (and its unit under it), cross-faded when the page changes.
+        const float a = alpha * ringFade_[i];
+        const D2D1_COLOR_F valueColor = page.severity >= 2 ? kRed : page.severity == 1 ? kAmber : kText;
+        const float box = kRingRadius * 1.5f;
+        if (page.unit.empty()) {
+            DrawText(dc, page.value.c_str(), bigFont, D2D1::RectF(c.x - box, c.y - 12, c.x + box, c.y + 12),
+                     WithAlpha(valueColor, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            DrawText(dc, page.value.c_str(), bigFont, D2D1::RectF(c.x - box, c.y - 15, c.x + box, c.y + 5),
+                     WithAlpha(valueColor, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+            DrawText(dc, page.unit.c_str(), unitFont, D2D1::RectF(c.x - box, c.y + 3, c.x + box, c.y + 15),
+                     WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        // Page dots, then the label and a caption for the page shown.
+        const int pages = static_cast<int>(metric.pages.size());
+        const float dotsY = cell.top + 2 * kRingRadius + 12;
+        if (pages > 1) {
+            const float startX = c.x - (pages - 1) * 4.0f;
+            for (int d = 0; d < pages; ++d) {
+                const bool active = d == ringPage_[i] % pages;
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, (active ? 0.75f : 0.22f) * alpha));
+                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(startX + d * 8.0f, dotsY), active ? 1.8f : 1.4f, active ? 1.8f : 1.4f),
+                                brush_.Get());
+            }
+        }
+        DrawText(dc, metric.label, labelFont, D2D1::RectF(cell.left, dotsY + 5, cell.right, dotsY + 19),
+                 WithAlpha(kText, (0.82f + 0.16f * hover) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(dc, page.caption.c_str(), captionFont, D2D1::RectF(cell.left - 2, dotsY + 19, cell.right + 2, dotsY + 33),
+                 WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
 }
 
 // ---- mascot ----------------------------------------------------------------------------------

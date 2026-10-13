@@ -12,6 +12,7 @@
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
+#include "services/SystemMonitor.h"
 
 namespace eflow {
 
@@ -33,6 +34,7 @@ private:
     void OnMediaChanged();
     void OnPermissionsChanged();
     void OnNotificationsChanged();
+    void OnSystemChanged();
     void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
@@ -56,6 +58,7 @@ private:
     std::unique_ptr<MediaService> media_;
     std::unique_ptr<PermissionServer> permissions_;
     std::unique_ptr<NotificationService> notifications_;
+    std::unique_ptr<SystemMonitor> system_;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
 };
 

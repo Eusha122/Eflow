@@ -12,5 +12,7 @@ constexpr UINT WM_APP_DEBUG_MASCOT = WM_APP + 5; // debug builds only: wParam = 
 constexpr UINT WM_APP_MEDIA = WM_APP + 6;        // media service -> app: a new snapshot is available
 constexpr UINT WM_APP_PERMISSION = WM_APP + 7;   // permission server -> app: the pending list changed
 constexpr UINT WM_APP_NOTIFICATION = WM_APP + 8; // notification service -> app: a new snapshot is available
+constexpr UINT WM_APP_SYSTEM = WM_APP + 9;       // system monitor -> app: a new sample is available
+constexpr UINT WM_APP_DEBUG_TAB = WM_APP + 10;   // debug builds only: wParam = section to open and pin (-1 = release)
 
 } // namespace eflow

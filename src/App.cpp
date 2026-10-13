@@ -68,6 +68,8 @@ int App::Run() {
 #endif
     AddTrayIcon();
     LoadMascot();
+    system_ = std::make_unique<SystemMonitor>(msgWnd_, WM_APP_SYSTEM);   // idle until a System tab is on screen
+    system_->Start();
     BuildIslands();
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
@@ -95,6 +97,7 @@ int App::Run() {
         DispatchMessageW(&msg);
     }
 
+    system_.reset();
     notifications_.reset();
     permissions_.reset();                    // pending requests fall back to each tool's own prompt
     media_.reset();                          // joins the media worker thread
@@ -163,6 +166,12 @@ void App::OnPermissionsChanged() {
     for (auto& island : islands_) island->SetPermissions(pending);
 }
 
+void App::OnSystemChanged() {
+    if (!system_) return;
+    const SystemSnapshot snapshot = system_->Snapshot();
+    for (auto& island : islands_) island->SetSystem(snapshot);
+}
+
 void App::OnNotificationsChanged() {
     if (!notifications_) return;
     const NotificationSnapshot snap = notifications_->Snapshot();
@@ -211,6 +220,9 @@ void App::BuildIslands() {
         auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_, mascotReady_ ? mascotAsset_ : nullptr,
                                                      mascotReady_ ? &mascotRenderer_ : nullptr);
         if (!island->Create()) continue;
+        island->SetSystemWatchHandler([this](bool watching) {
+            if (system_) system_->Watch(watching ? +1 : -1);
+        });
         island->SetMediaHandler([this](MediaCommand cmd) {
             if (media_) media_->Send(cmd);
         });
@@ -381,9 +393,17 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_NOTIFICATION:
         OnNotificationsChanged();
         return 0;
+    case WM_APP_SYSTEM:
+        OnSystemChanged();
+        return 0;
     case WM_APP_PERMISSION:
         OnPermissionsChanged();
         return 0;
+#ifndef NDEBUG
+    case WM_APP_DEBUG_TAB:
+        for (auto& island : islands_) island->DebugOpenTab(static_cast<int>(static_cast<INT_PTR>(wp)));
+        return 0;
+#endif
     case WM_APP_APPBAR:
         if (wp == ABN_FULLSCREENAPP) UpdateFullscreenState();
         return 0;

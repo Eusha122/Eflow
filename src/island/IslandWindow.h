@@ -13,10 +13,14 @@
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
+#include "services/SystemMonitor.h"
 
 namespace eflow {
 
 class MascotRenderer;
+
+inline constexpr int kSectionCount = 4;   // Music, Notifications, AI Requests, System
+inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
 // DirectComposition swap chain (true per-pixel alpha). The window never moves or resizes while
@@ -24,7 +28,7 @@ class MascotRenderer;
 // inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
-    enum class Section { Music, Notifications, Ai };
+    enum class Section { Music, Notifications, Ai, System };
 
     // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
     // may be null, in which case the island runs without the mascot.
@@ -49,6 +53,12 @@ public:
         dismissHandler_ = std::move(dismiss);
         clearAllHandler_ = std::move(clearAll);
     }
+    void SetSystem(const SystemSnapshot& snapshot);
+#ifndef NDEBUG
+    void DebugOpenTab(int section);              // scripted tests: open on a tab and keep it open (-1 releases)
+#endif
+    // Called with true while the System tab is on screen (so the monitor samples), false otherwise.
+    void SetSystemWatchHandler(std::function<void(bool)> handler) { systemWatchHandler_ = std::move(handler); }
     void SetPermissions(const std::vector<PermissionRequest>& pending);
     void SetPermissionHandler(std::function<void(uint64_t, PermissionDecision)> handler) {
         permissionHandler_ = std::move(handler);
@@ -63,7 +73,7 @@ private:
     float ContentAlpha() const;                  // 0 (closed) .. 1 (open): panel content and mascot opacity
     bool Pinned() const;                         // something needs the panel to stay open
     D2D1_RECT_F IslandRect() const;              // island in window-client DIPs
-    std::array<D2D1_RECT_F, 3> TabRects(const D2D1_RECT_F& island) const;
+    std::array<D2D1_RECT_F, kSectionCount> TabRects(const D2D1_RECT_F& island) const;
     D2D1_POINT_2F MascotPoint(float x, float y) const;   // mascot model space -> window DIPs (inside the panel)
     void Place();                                // size/position the HWND for the monitor + DPI
     void UpdateScale();
@@ -95,6 +105,12 @@ private:
     D2D1_RECT_F NotificationRow(const D2D1_RECT_F& island, size_t index) const;    // row `index` at the current scroll
     D2D1_RECT_F NotificationClose(const D2D1_RECT_F& row) const;
     D2D1_RECT_F NotificationClear(const D2D1_RECT_F& island) const;
+    void DrawSystem(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    void DrawRing(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float radius, float thickness, float fraction,
+                  D2D1_COLOR_F color, float alpha, float trackAlpha);
+    D2D1_RECT_F RingCell(const D2D1_RECT_F& panel, int index) const;
+    void CyclePage(int metric, int direction);
+    void UpdateSystemWatch();                    // start/stop sampling to match what is on screen
     void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;  // reject, approve, defer
     void UpdateArtwork();
@@ -139,8 +155,8 @@ private:
 
     Spring w_, h_;
     Spring tabX_, tabW_;                         // selection pill
-    std::array<float, 3> tabHover_{};            // 0..1 hover highlight per tab
-    std::array<float, 3> sectionAlpha_{1, 0, 0}; // cross-fade between sections
+    std::array<float, kSectionCount> tabHover_{};            // 0..1 hover highlight per tab
+    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0}; // cross-fade between sections
     Section section_ = Section::Music;
 
     MediaInfo media_;
@@ -157,6 +173,15 @@ private:
     std::unordered_map<uint32_t, float> notifCloseHover_;   // per notification id
     float notifClearHover_ = 0;
     void OnWheel(int delta);
+
+    SystemSnapshot system_;
+    std::function<void(bool)> systemWatchHandler_;
+    bool watching_ = false;
+    bool debugPinned_ = false;
+    Com<ID2D1StrokeStyle> roundStroke_;
+    std::array<int, kMetricCount> ringPage_{};       // page the user chose
+    std::array<int, kMetricCount> ringShown_{};      // page currently drawn (lags during the cross-fade)
+    std::array<float, kMetricCount> ringFade_{1, 1, 1, 1}, ringHover_{}, ringPress_{}, ringFrac_{};
 
     std::vector<PermissionRequest> permissions_;  // oldest first; the first one is on screen
     std::function<void(uint64_t, PermissionDecision)> permissionHandler_;

@@ -95,6 +95,7 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex connect switches (tray) | done |
 | 4 | Notifications: sparse package identity, listener, list with dismiss / clear all | done |
 | 4b | Notifications: history (SQLite), per-app mute, privacy | |
+| 4c | System tab: CPU / GPU / memory / network rings with flip-through readings | done |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
 
@@ -130,7 +131,29 @@ permission request < one-shot notification reaction.
   the user to trust the hook with `/hooks`.
 * Not possible: Copilot Chat and other VS Code AI extensions expose no external approval API.
 
-## 7. Mascot pipeline
+## 7. System tab
+
+Four rings (CPU, GPU, Memory, Network). Clicking a ring, or scrolling the wheel over it, flips it to its
+next reading with a cross-fade and the ring animating to the new value (CPU: usage, temperature, fan;
+GPU: usage, temperature, fan, video memory; Memory: in use, available; Network: download, upload).
+Colour stays accent-blue until a reading gets warm (amber) or hot (red).
+
+`SystemMonitor` samples once a second on its own thread, **only while a System tab is on screen**
+(reference-counted `Watch(+1/-1)` from the islands); with the tab closed nothing is sampled.
+
+| Reading | Source | Needs |
+|---|---|---|
+| CPU usage, clock | PDH `Processor Information` (Task Manager's "utility" figure), kernel times as fallback | nothing |
+| Memory | `GlobalMemoryStatusEx` | nothing |
+| Network | `GetIfTable2` byte counters, hardware adapters only (no double counting of VPN/virtual adapters) | nothing |
+| GPU usage, temperature, fan, VRAM | NVML (`nvml.dll`, loaded from System32 only); other GPUs: PDH `GPU Engine` counters (usage only) | NVIDIA driver |
+| CPU temperature, CPU/case fans | optional bridge: WMI namespace `ROOT\LibreHardwareMonitor` (or OpenHardwareMonitor) | that tool running as administrator |
+
+Windows offers no supported way to read CPU temperature or motherboard fan speed from a normal
+program; that takes a hardware driver and administrator rights, which Eflow deliberately does not
+include. When no sensor tool is running, those two readings say "Needs sensor app" instead of guessing.
+
+## 8. Mascot pipeline
 
 The character art was generated as five aligned images on a transparent background
 (`art/source/`: master + happy, surprised, wink, blink). `tools/build_mascot.ps1` turns them into
