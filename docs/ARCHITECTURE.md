@@ -17,8 +17,8 @@ expands into a control centre (music, AI permission centre, notifications).
 | Windows notifications feed | **Feasible with a workaround** | `UserNotificationListener` is the only supported API. It needs **package identity** (sparse MSIX package) and user consent. Unpackaged exe → access denied. |
 | Quick actions / reply on notifications | **Limited** | The listener can read and dismiss; it cannot invoke the toast's buttons. Per-app "open app" is feasible. |
 | Per-app notification mute | **Feasible** | Filter in our own UI; we cannot suppress the system toast itself (only the user can, in Settings). |
-| Mascot | **Feasible** | Vector drawn in D2D (no assets) with a state machine; swappable for sprite sheets later. |
-| Audio-reactive mascot | **Feasible** | WASAPI loopback peak meter (`IAudioMeterInformation`, cheap, no capture). Phase 4. |
+| Mascot | **Done (asset)** | 2.5D puppet rig built from generated art: one skinned image mesh (8 bones) plus swappable face patches, exported as glTF (`assets/mascot/eflow.glb`). The app plays it live; see §5. |
+| Audio-reactive mascot | **Feasible** | WASAPI loopback peak meter (`IAudioMeterInformation`, cheap, no capture). Phase 5. |
 
 ## 2. Why not WinUI 3 for the island itself
 
@@ -85,9 +85,39 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 
 | # | Phase | Status |
 |---|---|---|
-| 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | this repo |
+| 0 | Mascot asset: art, rig, expressions, clips, export pipeline | done |
+| 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | next |
+| 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | |
 | 2 | Music: SMTC, artwork, progress, controls, mascot states | |
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex installers (`eflow-hook --install`) | |
 | 4 | Notifications: sparse package identity, listener, history (SQLite), per-app/privacy | |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
+
+## 5. Mascot pipeline
+
+The character art was generated as five aligned images on a transparent background
+(`art/source/`: master + happy, surprised, wink, blink). `tools/build_mascot.ps1` turns them into
+the runtime asset:
+
+1. `tools/matte.py`: normalise alpha, bring everything to a 2048 px canvas.
+2. `tools/face_patches.py`: cut feathered eye/brow and mouth patches from each expression.
+3. Blender 5.2.2, headless (`tools/blender/pipeline.py`):
+   - `build_rig.py`: grid mesh over the master (empty cells dropped), 8 bones
+     (root, head, earL, earR, antenna, pawL, pawR, tail) with procedurally computed weights, and
+     the face patches as quads skinned 100% to `head`.
+   - `build_anim.py`: clips `idle` (3 s loop), `music` (1 s loop), `notify` (0.9 s one-shot),
+     `permission` (2.4 s loop), keyed from small motion functions.
+   - `export_glb.py`: `assets/mascot/eflow.glb`.
+4. Preview renders (EEVEE, unlit) and `build/mascot/render/preview.html`.
+
+Runtime contract for the app's player:
+
+* Draw `eflow_base`, then the face patch nodes for the current expression
+  (`face_<expression>_{eyeL,eyeR,mouth}`); neutral = no patches. All materials are alpha-blended.
+* Clip → default expression: idle → neutral (with periodic `blink`), music → happy,
+  notify → surprised, permission → wink.
+* Notes, "?" and badge effects are drawn by the app, not baked into the asset.
+
+Running Blender operators through the live editor's MCP socket crashed Blender twice, so the
+pipeline only ever runs Blender headless.

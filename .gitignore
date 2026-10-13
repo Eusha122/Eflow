@@ -1,0 +1,25 @@
+# Build output (CMake + regenerated mascot intermediates and previews)
+/build/
+/out/
+CMakeUserPresets.json
+
+# Local tooling (recreated by tools/setup.ps1)
+/.venv/
+/.deps/
+
+# Superseded art kept locally only
+/art/archive/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Blender backups
+*.blend1
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
