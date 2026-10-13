@@ -8,6 +8,7 @@
 #include "core/Gfx.h"
 #include "island/IslandWindow.h"
 #include "mascot/MascotRenderer.h"
+#include "services/MediaService.h"
 
 namespace eflow {
 
@@ -26,6 +27,7 @@ private:
     void LoadMascot();
     void BuildIslands();
     void SetMascotState(Mascot::State state);
+    void OnMediaChanged();
     void RebuildGraphics();
     void UpdateFullscreenState();
     void AddTrayIcon();
@@ -45,6 +47,7 @@ private:
     std::shared_ptr<const MascotAsset> mascotAsset_;   // null if the asset is missing or invalid
     MascotRenderer mascotRenderer_;
     bool mascotReady_ = false;
+    std::unique_ptr<MediaService> media_;
 };
 
 } // namespace eflow

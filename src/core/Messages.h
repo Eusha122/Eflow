@@ -9,5 +9,6 @@ constexpr UINT WM_APP_DEVICE_LOST = WM_APP + 2;  // island -> app: GPU device re
 constexpr UINT WM_APP_TRAY = WM_APP + 3;         // tray icon callback
 constexpr UINT WM_APP_APPBAR = WM_APP + 4;       // shell app-bar notifications (fullscreen app opened/closed)
 constexpr UINT WM_APP_DEBUG_MASCOT = WM_APP + 5; // debug builds only: wParam = Mascot::State, for scripted tests
+constexpr UINT WM_APP_MEDIA = WM_APP + 6;        // media service -> app: a new snapshot is available
 
 } // namespace eflow

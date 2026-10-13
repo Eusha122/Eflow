@@ -1,56 +1,19 @@
 #include "mascot/MascotAsset.h"
 
 #include <cgltf.h>
-#include <wincodec.h>
-#include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
 #include <memory>
 
+#include "core/Image.h"
+
 namespace eflow {
 namespace {
-
-using Microsoft::WRL::ComPtr;
 
 struct DataDeleter {
     void operator()(cgltf_data* d) const { cgltf_free(d); }
 };
-
-// Decodes an embedded PNG/JPEG with WIC, scaled, into premultiplied BGRA.
-bool DecodeImage(const uint8_t* bytes, size_t size, float scale, MascotAsset::Texture& out) {
-    ComPtr<IWICImagingFactory> wic;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return false;
-    ComPtr<IWICStream> stream;
-    if (FAILED(wic->CreateStream(&stream)) ||
-        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(bytes), static_cast<DWORD>(size))))
-        return false;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
-        FAILED(decoder->GetFrame(0, &frame)))
-        return false;
-
-    // Convert to premultiplied first so the scaler filters colour correctly at transparent edges.
-    ComPtr<IWICFormatConverter> premul;
-    if (FAILED(wic->CreateFormatConverter(&premul)) ||
-        FAILED(premul->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                                  WICBitmapPaletteTypeCustom)))
-        return false;
-    UINT w = 0, h = 0;
-    premul->GetSize(&w, &h);
-    const UINT sw = std::max(1u, static_cast<UINT>(std::lround(w * scale)));
-    const UINT sh = std::max(1u, static_cast<UINT>(std::lround(h * scale)));
-    ComPtr<IWICBitmapScaler> scaler;
-    if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
-        FAILED(scaler->Initialize(premul.Get(), sw, sh, WICBitmapInterpolationModeHighQualityCubic)))
-        return false;
-
-    out.width = sw;
-    out.height = sh;
-    out.bgra.resize(static_cast<size_t>(sw) * sh * 4);
-    return SUCCEEDED(scaler->CopyPixels(nullptr, sw * 4, static_cast<UINT>(out.bgra.size()), out.bgra.data()));
-}
 
 std::vector<float> Unpack(const cgltf_accessor* a) {
     std::vector<float> v(cgltf_accessor_unpack_floats(a, nullptr, 0));
@@ -106,11 +69,13 @@ bool MascotAsset::Load(const std::filesystem::path& file, float textureScale, st
     textures.assign(data->images_count, {});
     for (size_t i = 0; i < data->images_count; ++i) {
         const cgltf_image& img = data->images[i];
+        ImageBGRA decoded;
         if (!img.buffer_view || !DecodeImage(static_cast<const uint8_t*>(cgltf_buffer_view_data(img.buffer_view)),
-                                             img.buffer_view->size, textureScale, textures[i])) {
+                                             img.buffer_view->size, textureScale, 0, decoded)) {
             error = "cannot decode image " + std::to_string(i);
             return false;
         }
+        textures[i] = {decoded.width, decoded.height, std::move(decoded.pixels)};
     }
 
     // Meshes: one primitive each (as exported).

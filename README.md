@@ -7,9 +7,10 @@ companion that reacts to what is happening.
 <p align="center"><img src="docs/media/mascot.webp" width="360" alt="Eflow mascot reacting to music"></p>
 
 > **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
-> fullscreen auto-hide, tray icon) and the animated mascot inside it are done; the mascot's reactions
-> can be previewed from the tray menu ("Mascot test"). Real music, notification and AI-request sources
-> come next.
+> fullscreen auto-hide, tray icon), the animated mascot inside it and the Music tab (any app using
+> Windows media sessions: Spotify, YouTube and other sites in Chrome/Edge/Firefox, Media Player...) are
+> done. AI permission requests and notifications come next; their mascot reactions can already be
+> previewed from the tray menu ("Mascot test").
 
 ## Planned features
 

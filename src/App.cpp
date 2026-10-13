@@ -67,6 +67,8 @@ int App::Run() {
     AddTrayIcon();
     LoadMascot();
     BuildIslands();
+    media_ = std::make_unique<MediaService>(msgWnd_);
+    media_->Start();
 
     // Fullscreen guard, event-driven: the shell's own fullscreen notification (sent to app bars, the
     // same signal the taskbar uses) plus foreground/minimize changes. No polling, no per-move events.
@@ -87,6 +89,7 @@ int App::Run() {
         DispatchMessageW(&msg);
     }
 
+    media_.reset();                          // joins the media worker thread
     for (HWINEVENTHOOK h : hooks_) UnhookWinEvent(h);
     if (appBar_) {
         APPBARDATA remove{sizeof(remove)};
@@ -131,6 +134,21 @@ void App::SetMascotState(Mascot::State state) {
     for (auto& island : islands_) island->SetMascotState(state);
 }
 
+void App::OnMediaChanged() {
+    if (!media_) return;
+    const MediaInfo info = media_->Snapshot();
+#ifndef NDEBUG   // track titles are personal: only debug builds log them
+    Log("media: session=%d playing=%d app=%ls title=\"%ls\" artist=\"%ls\" pos=%.0f/%.0fs art=%ux%u controls=%d%d%d",
+        info.hasSession, info.playing, info.sourceApp.c_str(), info.title.c_str(), info.artist.c_str(),
+        info.PositionNow(), info.duration, info.artwork ? info.artwork->width : 0, info.artwork ? info.artwork->height : 0,
+        info.canPrevious, info.canToggle, info.canNext);
+#endif
+    for (auto& island : islands_) {
+        island->SetMedia(info);
+        island->SetMusicPlaying(info.playing);
+    }
+}
+
 void App::BuildIslands() {
     islands_.clear();
     std::vector<HMONITOR> monitors;
@@ -145,7 +163,11 @@ void App::BuildIslands() {
     for (HMONITOR m : monitors) {
         auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_, mascotReady_ ? mascotAsset_ : nullptr,
                                                      mascotReady_ ? &mascotRenderer_ : nullptr);
-        if (island->Create()) islands_.push_back(std::move(island));
+        if (!island->Create()) continue;
+        island->SetMediaHandler([this](MediaCommand cmd) {
+            if (media_) media_->Send(cmd);
+        });
+        islands_.push_back(std::move(island));
     }
 }
 
@@ -156,6 +178,7 @@ void App::RebuildGraphics() {
         return;
     }
     BuildIslands();
+    OnMediaChanged();                        // fresh islands start with the current track
     UpdateFullscreenState();
 }
 
@@ -286,6 +309,9 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp <= static_cast<WPARAM>(Mascot::State::Permission)) SetMascotState(static_cast<Mascot::State>(wp));
         return 0;
 #endif
+    case WM_APP_MEDIA:
+        OnMediaChanged();
+        return 0;
     case WM_APP_APPBAR:
         if (wp == ABN_FULLSCREENAPP) UpdateFullscreenState();
         return 0;

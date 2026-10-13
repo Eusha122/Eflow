@@ -67,14 +67,19 @@ int Mascot::ClipFor(State s) const {
     }
 }
 
-void Mascot::SetState(State s) {
-    if (s == State::Notify) {
-        ++badge_;
-        Enter(State::Notify);                  // restarts the reaction even if already playing
-        return;
-    }
-    base_ = s;
-    if (state_ != State::Notify && state_ != s) Enter(s);   // a running reaction returns to base_ itself
+void Mascot::SetAmbient(State ambient) {
+    base_ = ambient == State::Music ? State::Music : State::Idle;
+    if (state_ != State::Notify && state_ != Resting()) Enter(Resting());   // a running reaction settles itself
+}
+
+void Mascot::Notify() {
+    ++badge_;
+    Enter(State::Notify);                      // restarts the reaction even if already playing
+}
+
+void Mascot::SetPermissionPending(bool pending) {
+    permission_ = pending;
+    if (state_ != State::Notify && state_ != Resting()) Enter(Resting());
 }
 
 void Mascot::Enter(State s) {
@@ -100,7 +105,7 @@ void Mascot::Update(float dt) {
     advance(previous_, true);
 
     if (state_ == State::Notify && current_.clip >= 0 && current_.t >= asset_->clips[current_.clip].duration)
-        Enter(base_);
+        Enter(Resting());
 
     // Blinks (shown only with the neutral face): every few seconds, sometimes a quick double blink.
     if (blinkLeft_ > 0) {

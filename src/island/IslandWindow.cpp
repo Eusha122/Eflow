@@ -57,6 +57,11 @@ constexpr D2D1_COLOR_F kIslandFill = Rgba(0.051f, 0.051f, 0.063f, 1.0f);
 constexpr D2D1_COLOR_F kText = Rgba(0.96f, 0.96f, 0.98f, 1.0f);
 constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
+constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
+constexpr float kArtSize = 92.0f;
+constexpr float kArtTop = 62.0f;
+constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
+
 const wchar_t* const kTabLabels[3] = {L"Music", L"Notifications", L"AI Requests"};
 const wchar_t* const kEmptyTitle[3] = {L"Nothing playing", L"You're all caught up", L"No pending requests"};
 const wchar_t* const kEmptyBody[3] = {
@@ -170,7 +175,7 @@ D2D1_POINT_2F IslandWindow::MascotPoint(float x, float y) const {
 
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
-    return pressed_ >= 0 || (mascot_ && mascot_->state() == Mascot::State::Permission);
+    return pressed_ >= 0 || (mascot_ && mascot_->permissionPending());
 }
 
 std::array<D2D1_RECT_F, 3> IslandWindow::TabRects(const D2D1_RECT_F& island) const {
@@ -267,29 +272,68 @@ void IslandWindow::SetSuppressed(bool suppressed) {
 }
 
 void IslandWindow::SetMascotState(Mascot::State state) {
+    // Used by the tray's "Mascot test" menu and scripted tests; real events call the specific setters.
     if (!mascot_) return;
-    mascot_->SetState(state);
     using State = Mascot::State;
-    if (state == State::Notify || state == State::Permission) {
-        // Events worth attention open the island by themselves. A notification closes again on its own
-        // (unless the pointer is on it); a permission request stays until it is answered.
-        const bool wasOpen = expanded_;
-        OnClick(state == State::Notify ? 1 : 2);   // open on the tab the event belongs to
+    switch (state) {
+    case State::Notify: OnNotification(); break;
+    case State::Permission: SetPermissionPending(true); break;
+    case State::Music: SetMusicPlaying(true); break;
+    default:
+        SetPermissionPending(false);
+        SetMusicPlaying(false);
+        break;
+    }
+}
+
+void IslandWindow::SetMusicPlaying(bool playing) {
+    if (!mascot_) return;
+    mascot_->SetAmbient(playing ? Mascot::State::Music : Mascot::State::Idle);
+    Animate();
+}
+
+void IslandWindow::OnNotification() {
+    if (!mascot_) return;
+    // Worth attention: open by itself on the Notifications tab, and close again after a moment unless
+    // the user has the pointer on it (or it was already open).
+    mascot_->Notify();
+    const bool wasOpen = expanded_;
+    OnClick(static_cast<int>(Section::Notifications));
+    Expand();
+    KillTimer(hwnd_, kAutoCloseTimer);
+    autoClosePending_ = !wasOpen;
+    if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, kAutoCloseMs, nullptr);
+    Animate();
+}
+
+void IslandWindow::SetPermissionPending(bool pending) {
+    if (!mascot_) return;
+    const bool was = mascot_->permissionPending();
+    mascot_->SetPermissionPending(pending);
+    if (pending && !was) {                       // open on the AI tab and stay until it is answered
+        OnClick(static_cast<int>(Section::Ai));
         Expand();
         KillTimer(hwnd_, kAutoCloseTimer);
-        autoClosePending_ = state == State::Notify && !wasOpen;
-        if (autoClosePending_) SetTimer(hwnd_, kAutoCloseTimer, kAutoCloseMs, nullptr);
-    } else if (expanded_ && !CursorInIsland(kLeaveSlack)) {
-        SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);   // a request was resolved: let it close
+        autoClosePending_ = false;
+    } else if (!pending && was && expanded_ && !CursorInIsland(kLeaveSlack)) {
+        SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);   // answered: let it close
     }
     Animate();
 }
 
 int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     if (!expanded_ || h_.x < kExpandedH * 0.85f) return -1;
-    const auto tabs = TabRects(IslandRect());
+    const D2D1_RECT_F island = IslandRect();
+    const auto tabs = TabRects(island);
     for (int i = 0; i < 3; ++i)
         if (p.x >= tabs[i].left && p.x <= tabs[i].right && p.y >= tabs[i].top && p.y <= tabs[i].bottom) return i;
+    if (section_ == Section::Music && media_.hasSession) {
+        const auto centers = ControlCenters(island);
+        for (int i = 0; i < 3; ++i) {
+            const float dx = p.x - centers[i].x, dy = p.y - centers[i].y;
+            if (dx * dx + dy * dy <= 19.0f * 19.0f) return kHitPrev + i;
+        }
+    }
     return -1;
 }
 
@@ -318,6 +362,19 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitPrev && id <= kHitNext) {
+        const bool enabled = id == kHitPlay ? media_.canToggle : id == kHitNext ? media_.canNext : media_.canPrevious;
+        if (!enabled || !mediaHandler_) return;
+        if (id == kHitPlay) {                    // flip immediately; the service confirms a moment later
+            media_.position = media_.PositionNow();
+            media_.positionStamp = GetTickCount64();
+            media_.playing = !media_.playing;
+        }
+        mediaHandler_(id == kHitPlay ? MediaCommand::TogglePlayPause : id == kHitNext ? MediaCommand::Next
+                                                                                      : MediaCommand::Previous);
+        Animate();
+        return;
+    }
     if (id < 0 || id > 2) return;
     section_ = static_cast<Section>(id);
     const auto tabs = TabRects(D2D1::RectF(0, 0, kExpandedW, kExpandedH));
@@ -373,6 +430,7 @@ bool IslandWindow::StepAnimation(float dt) {
         else moving = true;
     }
     for (int i = 0; i < 3; ++i) {
+        moving |= Approach(controlHover_[i], hover_ == kHitPrev + i ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(sectionAlpha_[i], i == static_cast<int>(section_) ? 1.0f : 0.0f, dt, 16.0f);
     }
@@ -535,11 +593,129 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         const float a = sectionAlpha_[i] * alpha;
         if (a < 0.003f) continue;
         const float slide = (1.0f - sectionAlpha_[i]) * 8.0f;
+        if (i == static_cast<int>(Section::Music) && media_.hasSession) {
+            DrawMusic(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
+            continue;
+        }
         const float right = base.right - (mascot_ ? kMascotLane : 24.0f);
         DrawText(dc, kEmptyTitle[i], titleFont, D2D1::RectF(base.left + 24, mid - 26 + slide, right, mid + slide),
                  WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawText(dc, kEmptyBody[i], bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
                  WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+}
+
+// ---- music -----------------------------------------------------------------------------------
+
+void IslandWindow::SetMedia(const MediaInfo& media) {
+    media_ = media;
+    Animate();
+}
+
+std::array<D2D1_POINT_2F, 3> IslandWindow::ControlCenters(const D2D1_RECT_F& island) const {
+    const float x0 = island.left + 24 + kArtSize + 18;
+    const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+    const float cx = (x0 + x1) / 2.0f, cy = island.top + kControlsY;
+    return {D2D1::Point2F(cx - 46, cy), D2D1::Point2F(cx, cy), D2D1::Point2F(cx + 46, cy)};
+}
+
+void IslandWindow::UpdateArtwork() {
+    if (artworkId_ == media_.artworkId) return;
+    artworkId_ = media_.artworkId;
+    artwork_.Reset();
+    const auto& img = media_.artwork;
+    if (!img || img->empty()) return;
+    const auto props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    dc_->CreateBitmap(D2D1::SizeU(img->width, img->height), img->pixels.data(), img->width * 4, &props, &artwork_);
+}
+
+namespace {
+std::wstring FormatTime(double seconds) {
+    const int s = static_cast<int>(seconds + 0.5);
+    wchar_t buf[16];
+    if (s >= 3600) swprintf_s(buf, L"%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+    else swprintf_s(buf, L"%d:%02d", s / 60, s % 60);
+    return buf;
+}
+} // namespace
+
+void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    UpdateArtwork();
+
+    // Artwork, cover-fitted into a rounded square.
+    const D2D1_RECT_F art = D2D1::RectF(base.left + 24, base.top + kArtTop, base.left + 24 + kArtSize,
+                                        base.top + kArtTop + kArtSize);
+    const D2D1_ROUNDED_RECT artShape{art, 12, 12};
+    if (artwork_) {
+        const D2D1_SIZE_F sz = artwork_->GetSize();
+        const float s = std::max(kArtSize / sz.width, kArtSize / sz.height);
+        Com<ID2D1BitmapBrush1> fill;
+        const auto brushProps = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        if (SUCCEEDED(dc->CreateBitmapBrush(artwork_.Get(), &brushProps, nullptr, &fill))) {
+            fill->SetTransform(D2D1::Matrix3x2F::Scale(s, s) *
+                               D2D1::Matrix3x2F::Translation(art.left + (kArtSize - sz.width * s) / 2,
+                                                             art.top + (kArtSize - sz.height * s) / 2));
+            fill->SetOpacity(alpha);
+            dc->FillRoundedRectangle(artShape, fill.Get());
+        }
+    } else {
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.07f * alpha));
+        dc->FillRoundedRectangle(artShape, brush_.Get());
+        DrawText(dc, L"\u266A", gfx_.Text(30.0f, DWRITE_FONT_WEIGHT_NORMAL), art, WithAlpha(kTextDim, alpha),
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.08f * alpha));          // hairline keeps dark covers crisp
+    dc->DrawRoundedRectangle(artShape, brush_.Get(), 1.0f);
+
+    // Text column.
+    const float x0 = art.right + 18;
+    const float x1 = base.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+    const std::wstring title = media_.title.empty() ? L"Unknown title" : media_.title;
+    std::wstring subtitle = media_.artist;
+    if (!media_.sourceApp.empty()) subtitle += (subtitle.empty() ? L"" : L"  \u00B7  ") + media_.sourceApp;
+    DrawText(dc, title.c_str(), gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+             D2D1::RectF(x0, base.top + 64, x1, base.top + 84), WithAlpha(kText, alpha));
+    DrawText(dc, subtitle.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_NORMAL),
+             D2D1::RectF(x0, base.top + 84, x1, base.top + 102), WithAlpha(kTextDim, alpha));
+
+    // Progress.
+    const float barY = base.top + 113;
+    const D2D1_ROUNDED_RECT track{D2D1::RectF(x0, barY, x1, barY + 3), 1.5f, 1.5f};
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.14f * alpha));
+    dc->FillRoundedRectangle(track, brush_.Get());
+    const double pos = media_.PositionNow();
+    if (media_.duration > 0) {
+        const float f = static_cast<float>(std::clamp(pos / media_.duration, 0.0, 1.0));
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.88f * alpha));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x0, barY, x0 + (x1 - x0) * f, barY + 3), 1.5f, 1.5f},
+                                 brush_.Get());
+        IDWriteTextFormat* timeFont = gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL);
+        DrawText(dc, FormatTime(pos).c_str(), timeFont, D2D1::RectF(x0, barY + 5, x0 + 60, barY + 19),
+                 WithAlpha(kTextDim, alpha));
+        DrawText(dc, FormatTime(media_.duration).c_str(), timeFont, D2D1::RectF(x1 - 60, barY + 5, x1, barY + 19),
+                 WithAlpha(kTextDim, alpha), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // Transport controls (Segoe Fluent Icons): previous, play/pause, next.
+    const auto centers = ControlCenters(D2D1::RectF(base.left, base.top, base.right, base.bottom));
+    const wchar_t* glyphs[3] = {L"\uE892", media_.playing ? L"\uE769" : L"\uE768", L"\uE893"};
+    const bool enabled[3] = {media_.canPrevious, media_.canToggle, media_.canNext};
+    IDWriteTextFormat* iconFont = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_NORMAL, true);
+    for (int i = 0; i < 3; ++i) {
+        const D2D1_POINT_2F c = centers[i];
+        const float r = i == 1 ? 17.0f : 15.0f;
+        const float hoverA = enabled[i] ? controlHover_[i] : 0.0f;
+        if (i == 1) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.10f + 0.08f * hoverA) * alpha));
+            dc->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
+        } else if (hoverA > 0) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.08f * hoverA * alpha));
+            dc->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
+        }
+        DrawText(dc, glyphs[i], iconFont, D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r),
+                 WithAlpha(kText, (enabled[i] ? 0.95f : 0.28f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
 

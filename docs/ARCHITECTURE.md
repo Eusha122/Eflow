@@ -91,13 +91,25 @@ Spotify Web API tokens, etc.) go through DPAPI/Credential Manager, never SQLite.
 | 0 | Mascot asset: art, rig, expressions, clips, export pipeline | done |
 | 1 | Island window: collapsed bar, hover expand/collapse, springs, multi-monitor, DPI, fullscreen guard, tray exit | done |
 | 1b | Mascot player: glTF loader, GPU skinning, clip/face state machine, blink, overlay effects | done |
-| 2 | Music: SMTC, artwork, progress, controls, mascot states | |
+| 2 | Music: SMTC, artwork, progress, controls, mascot states | done |
 | 3 | Permission centre: pipe server, hook exe, Claude Code + Codex installers (`eflow-hook --install`) | |
 | 4 | Notifications: sparse package identity, listener, history (SQLite), per-app/privacy | |
 | 5 | Audio-reactive mascot, light theme, autostart, polish | |
 | 6 | WinUI 3 settings app (optional), installer | |
 
-## 5. Mascot pipeline
+## 5. Music
+
+`services/MediaService` watches the system media sessions on its own MTA worker thread. It is
+event-driven (session, media-properties, playback and timeline events, plus a 30 s safety resync);
+the UI never blocks on WinRT. It prefers the system's current session unless another one is actually
+playing, extrapolates the position locally between the app's sparse timeline updates, decodes artwork
+with WIC (max 192 px), and posts `WM_APP_MEDIA` with an immutable snapshot. Transport buttons send
+commands back to the worker; the play/pause icon flips immediately and the service confirms.
+
+The mascot's mood is layered so sources never fight: ambient (idle / music playing) < pending AI
+permission request < one-shot notification reaction.
+
+## 6. Mascot pipeline
 
 The character art was generated as five aligned images on a transparent background
 (`art/source/`: master + happy, surprised, wink, blink). `tools/build_mascot.ps1` turns them into

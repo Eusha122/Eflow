@@ -2,12 +2,14 @@
 #include <windows.h>
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "core/Gfx.h"
 #include "island/Spring.h"
 #include "mascot/Mascot.h"
+#include "services/MediaService.h"
 
 namespace eflow {
 
@@ -33,7 +35,12 @@ public:
     HMONITOR monitor() const { return monitor_; }
     HWND hwnd() const { return hwnd_; }
     void SetSuppressed(bool suppressed);   // hidden while a fullscreen app owns this monitor
-    void SetMascotState(Mascot::State state);
+    void SetMascotState(Mascot::State state);    // test/debug entry point mapping onto the setters below
+    void SetMusicPlaying(bool playing);          // ambient mood; never opens or closes the panel
+    void OnNotification();                       // opens briefly on the Notifications tab
+    void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
+    void SetMedia(const MediaInfo& media);
+    void SetMediaHandler(std::function<void(MediaCommand)> handler) { mediaHandler_ = std::move(handler); }
 
 private:
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -56,7 +63,7 @@ private:
     void Expand();
     void Collapse();
     void OnMouseMove(D2D1_POINT_2F p);
-    int HitTest(D2D1_POINT_2F p) const;          // -1 = none, 0..2 = tabs
+    int HitTest(D2D1_POINT_2F p) const;          // -1 = none, 0..2 = tabs, kHitPrev.. = media controls
     void OnClick(int id);
 
     // animation + rendering
@@ -69,6 +76,9 @@ private:
     void DrawShadow(ID2D1DeviceContext* dc, D2D1_ROUNDED_RECT shape, float progress);
     void DrawIsland(ID2D1DeviceContext* dc, float progress);
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
+    void DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    std::array<D2D1_POINT_2F, 3> ControlCenters(const D2D1_RECT_F& island) const;   // previous, play/pause, next
+    void UpdateArtwork();
     void DrawMascot(float opacity);
     void DrawMascotEffects(ID2D1DeviceContext* dc, float opacity);
     void DrawText(ID2D1DeviceContext* dc, const wchar_t* text, IDWriteTextFormat* fmt, D2D1_RECT_F r,
@@ -113,6 +123,12 @@ private:
     std::array<float, 3> tabHover_{};            // 0..1 hover highlight per tab
     std::array<float, 3> sectionAlpha_{1, 0, 0}; // cross-fade between sections
     Section section_ = Section::Music;
+
+    MediaInfo media_;
+    std::function<void(MediaCommand)> mediaHandler_;
+    Com<ID2D1Bitmap1> artwork_;
+    uint64_t artworkId_ = 0;
+    std::array<float, 3> controlHover_{};        // previous, play/pause, next
 };
 
 } // namespace eflow
