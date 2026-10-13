@@ -24,8 +24,9 @@ public:
     IDCompositionDevice* dcomp() const { return dcomp_.Get(); }
     IDXGIFactory2* dxgiFactory() const { return dxgiFactory_.Get(); }
 
-    // Cached text formats. family empty -> UI font.
+    // Cached text formats: Segoe UI Variable (Display for >= 16 DIP), or the icon font.
     IDWriteTextFormat* Text(float size, DWRITE_FONT_WEIGHT weight, bool icons = false);
+    float MeasureWidth(const wchar_t* text, IDWriteTextFormat* fmt);
 
     static constexpr const wchar_t* kUiFont = L"Segoe UI Variable Text";
     static constexpr const wchar_t* kDisplayFont = L"Segoe UI Variable Display";

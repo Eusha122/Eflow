@@ -48,4 +48,13 @@ IDWriteTextFormat* Gfx::Text(float size, DWRITE_FONT_WEIGHT weight, bool icons) 
     return formats_.emplace(key, std::move(fmt)).first->second.Get();
 }
 
+float Gfx::MeasureWidth(const wchar_t* text, IDWriteTextFormat* fmt) {
+    Com<IDWriteTextLayout> layout;
+    if (!fmt || FAILED(dwrite_->CreateTextLayout(text, static_cast<UINT32>(wcslen(text)), fmt, 10000.0f, 1000.0f, &layout)))
+        return 0.0f;
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    return m.widthIncludingTrailingWhitespace;
+}
+
 } // namespace eflow

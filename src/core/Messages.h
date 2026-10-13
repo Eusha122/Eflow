@@ -1,0 +1,11 @@
+#pragma once
+#include <windows.h>
+
+namespace eflow {
+
+// Private window messages.
+constexpr UINT WM_APP_FRAME = WM_APP + 1;        // island: render the next animation frame
+constexpr UINT WM_APP_DEVICE_LOST = WM_APP + 2;  // island -> app: GPU device removed, rebuild
+constexpr UINT WM_APP_TRAY = WM_APP + 3;         // tray icon callback
+
+} // namespace eflow
