@@ -33,9 +33,13 @@ from kokoro_onnx import Kokoro  # noqa: E402
 
 from voice_presets import PRESETS, speak  # noqa: E402
 import screen as screen_mod  # noqa: E402
+import actions  # noqa: E402
+import memory as memory_mod  # noqa: E402
+import research as research_mod  # noqa: E402
 
 OLLAMA = "http://127.0.0.1:11434/api/chat"
 BRAIN = "qwen3:8b"
+CTX = 8192                                      # one context size for every brain call: a change makes Ollama reload the model
 VISION = "qwen3-vl:4b"                          # only used for questions about pictures; it is swapped in and out of the GPU
 SCREEN_NOTE = (
     " The user is asking about what is on their screen, which you can see through the text (and picture) given with their question. "
@@ -53,6 +57,34 @@ SYSTEM = (
     "Be natural and a little playful. If you do not know something, say so plainly instead of guessing. "
     "Never describe actions in asterisks."
 )
+AGENT_NOTE = (
+    " You can also use the user's Windows PC for them with your tools: open apps and websites, search the web, control music and volume, "
+    "set timers, read and click things on the screen, type, press shortcuts, manage windows, find, open, read and write files, "
+    "use the clipboard and run PowerShell commands. When they ask you to do something on the PC, use a tool instead of explaining how; "
+    "for plain chat, just talk. Every action that needs it is shown to the user on an approval card, which they answer, so you don't "
+    "need to ask in words. Prefer the simplest tool (open_app for apps, web_search to search, media_control for music) and use "
+    "run_command only when nothing else fits. If a step needs what is on the screen, use look_at_screen first. Check each tool result. "
+    "Finish the whole task: to ask a website something (for example ChatGPT), open_website, then type_text the message, then press_keys "
+    "'enter'; to find something, use find_files with the user's own words. For a bigger task, such as researching a topic and then "
+    "emailing someone about it, work through the steps in order: use research to learn about the topic, write the email, then call "
+    "send_email, which shows the user the full email on an approval card so they decide whether it is sent. If the recipient's address "
+    "is missing or unclear (speech often garbles addresses), don't refuse: still research and write it, and call send_email with an "
+    "empty 'to'; it then opens as a Gmail draft where the user adds the address. "
+    "Answer only what the user just said: don't bring up old topics or look at the screen unless they ask. "
+    "Don't create or change files unless the user asked for a file. "
+    "For a quick question about a topic, use research and answer out loud. When they want deep or in-depth research, a report or a "
+    "document, call deep_research once: it works in the background and opens the report in Chrome, so just tell them you're on it. "
+    "Don't talk while calling tools; when everything is done, say in one short sentence what you did, or what went wrong. "
+    "Only report facts that a tool result actually contains: never invent numbers, names or results, and never claim something "
+    "worked if the tool said error or returned nothing; then try another way or say you couldn't. "
+    f"The user's home folder is {actions.HOME}."
+)
+YES = re.compile(r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|allow|approve|approved|please do|of course|fine|go on|alright)\b")
+NO = re.compile(r"\b(no|nope|don't|dont|do not|cancel|stop|never ?mind|wait|not now|deny|reject)\b")
+EMOJI = re.compile(r"\s*[\U0001F000-\U0001FAFF☀-➿️]+")
+ALL = re.compile(r"\b(yes to (all|everything)|(do|allow) (it )?all|all of (it|them)|everything|the whole thing|all (the )?steps|go ahead with (it )?all)\b")
+PROMISE = re.compile(r"\b(let me(?! know)|i'll(?! be)|i will|i'm going to|i am going to|checking|one moment|one sec|give me a (sec|second)|next,? i)\b")
+ALWAYS = re.compile(r"\b(always|every time|don't ask( me)? again|dont ask)\b")
 UNFINISHED = {"and", "but", "so", "because", "or", "the", "a", "an", "to", "of", "um", "uh", "like", "then",
               "if", "when", "that", "with", "for", "my", "is", "are", "i", "its", "it's", "also", "well"}
 JUNK = {"thank you", "thanks for watching", "you", "bye", "thanks", "okay"}   # typical Whisper inventions on noise
@@ -116,6 +148,15 @@ class Solu:
         self.cfg_mtime = None
         self.half_duplex = not args.headphones                               # speakers: never listen while talking
         self.screen_enabled = not getattr(args, 'no_screen', False)              # "Solu, look" works
+        self.hands = actions.Hands(self)                                     # what Solu can do on the PC
+        self.memory = memory_mod.Memory()                                    # lasting facts about the user
+        self.conversation_from = 0                                           # where the current conversation starts in the history
+        self.jobs = []                                                       # research running in the background
+        self.approvals = {}                                                  # approval id -> {"event", "answer"}
+        self.pending_approval = None                                         # an approval card is waiting for the user
+        self._approval_seq = 0
+        self._told_about_card = False
+        actions.preload()                                                    # the list of installed apps, in the background
         self.event = lambda _event, **kw: None                                 # the service replaces this: state/heard/said/level events
         self.in_conversation = True                                          # talking with Solu right now (the CLI is always in one)
         self.wake_mode = False                                               # True in the island: wait for its name before a conversation
@@ -134,6 +175,7 @@ class Solu:
         self.tts = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
         speak(self.tts, args.voice, "Hi.")                                   # warm up
         list(self.stt.transcribe(np.zeros(16000, np.float32), language="en")[0])
+        threading.Thread(target=self._load_brain, daemon=True).start()     # the brain is ready before the first question
         self.history = []
         self.cancel = threading.Event()
         self.speaking = threading.Event()                                    # Solu is producing/playing sound
@@ -272,7 +314,11 @@ class Solu:
             if announce:
                 self.spoken = (self.spoken + [text])[-3:]
                 self.event("said", text=text)
-            self.say(text)
+            parts = re.split(r"(?<=[.!?])\s+", text) if len(text) > 220 else [text]   # a long reading starts at once, sentence by sentence
+            for part in parts:
+                if self.cancel.is_set():
+                    break
+                self.say(part)
             self._wait_for_playback()
         finally:
             self._after_speaking()
@@ -301,37 +347,55 @@ class Solu:
         self._speaking_reported = False
         self.speaking.set()
         if screen is None:
-            self.history.append({"role": "user", "content": user_text})
-            body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
-                    "options": {"num_ctx": 4096, "temperature": 0.8},
-                    "messages": [{"role": "system", "content": SYSTEM}] + self.history[-12:]}
+            return self._agent(user_text)
         else:                                                                # a question about the screen
             where = f"window \u201c{screen['title']}\u201d ({screen['app']})" if screen["scope"] == "window" else "the whole screen"
             seen = screen["text"][:3000]
             asked = f"{user_text}\n\n[What is on the user's screen: {where}. Text read from it, it may contain mistakes:]\n{seen}"
+            before = self.recent(14, plain=True)                              # the conversation so far, words only
             self.history.append({"role": "user", "content": f"{user_text}\n[Screen: {where}: {screen['text'][:1200]}]"})   # kept short for follow-ups
             if screen["vlm"]:
                 message = {"role": "user", "content": asked, "images": [screen["image"]]}
                 body = {"model": VISION, "stream": True, "think": False, "keep_alive": 0,          # free the GPU for the brain right after
                         "options": {"num_ctx": 4096, "temperature": 0.4},
-                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + self.history[-5:-1] + [message]}
+                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + before[-4:] + [message]}
             else:
                 body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
-                        "options": {"num_ctx": 4096, "temperature": 0.4},
-                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + self.history[-12:-1] + [{"role": "user", "content": asked}]}
+                        "options": {"num_ctx": CTX, "temperature": 0.4},
+                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + before + [{"role": "user", "content": asked}]}
+        reply, _, first_token = self._stream(body)
+        print(f"   solu: {reply.strip()}   (brain first token {1000 * (first_token or 0):.0f} ms)")
+        self.history.append({"role": "assistant", "content": reply.strip()})
+        self.spoken = (self.spoken + [reply.strip()])[-3:]
+        self.event("said", text=reply.strip())
+        self._wait_for_playback()
+        if screen["vlm"]:
+            threading.Thread(target=self._load_brain, daemon=True).start()     # the vision model left: bring the brain back
+
+    def _stream(self, body):
+        """Ask the model, speaking its words as they arrive. Returns (text, tool calls, seconds to the first token)."""
         req = urllib.request.Request(OLLAMA, json.dumps(body).encode(), {"Content-Type": "application/json"})
-        reply, buf, first_chunk, t0 = "", "", True, time.perf_counter()
+        reply, buf, first_chunk, t0, calls, mute = "", "", True, time.perf_counter(), [], False
         sentence_end = re.compile(r"(?<=[.!?…])\s+")
         first_token = None
         with urllib.request.urlopen(req) as resp:
             for line in resp:
                 if self.cancel.is_set():
                     break
-                piece = json.loads(line).get("message", {}).get("content", "")
+                message = json.loads(line).get("message", {})
+                calls += message.get("tool_calls") or []
+                piece = message.get("content", "")
                 if piece and first_token is None:
                     first_token = time.perf_counter() - t0
                 reply += piece
                 buf += piece
+                if mute or "<tool" in buf or "<|" in buf:                    # the model wrote a tool call as text: never say it
+                    if not mute:
+                        before = buf[:buf.find("<")]
+                        if before.strip():
+                            self.say(before)
+                    mute, buf = True, ""
+                    continue
                 while True:                                                   # speak as soon as a chunk is complete
                     m = sentence_end.search(buf)
                     cut = m.end() if m else None
@@ -344,19 +408,284 @@ class Solu:
                     chunk, buf = buf[:cut], buf[cut:]
                     first_chunk = False
                     self.say(chunk)
-        if buf.strip() and not self.cancel.is_set():
+        if buf.strip() and not self.cancel.is_set() and not mute:
             self.say(buf)
-        print(f"   solu: {reply.strip()}   (brain first token {1000 * (first_token or 0):.0f} ms)")
-        self.history.append({"role": "assistant", "content": reply.strip()})
-        self.spoken = (self.spoken + [reply.strip()])[-3:]
-        self.event("said", text=reply.strip())
+        return reply, calls, first_token
+
+    @staticmethod
+    def text_tool_calls(reply):
+        """Pull '<tool_call>{json}</tool_call>' (written as text instead of a real call) out of a reply: (clean text, calls)."""
+        calls = []
+        for block in re.findall(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", reply, re.S):
+            try:
+                data = json.loads(block)
+                calls.append({"function": {"name": data.get("name", ""), "arguments": data.get("arguments") or {}}})
+            except ValueError:
+                pass
+        clean = re.sub(r"<tool_call>.*?(</tool_call>|$)|<\|[^>]*\|>", "", reply, flags=re.S).strip()
+        return clean, calls
+
+    def recent(self, n, plain=False):
+        """The last messages of the conversation, starting at something the user said. plain: only the words (no tool calls)."""
+        msgs = self.history[-n:]
+        while msgs and msgs[0]["role"] != "user":
+            msgs = msgs[1:]
+        if plain:
+            msgs = [{"role": m["role"], "content": m["content"]} for m in msgs if m["role"] in ("user", "assistant") and m["content"].strip()]
+        return msgs
+
+    # ---- doing things on the PC ------------------------------------------------------------------------------
+    def _agent(self, user_text):
+        """Talk, or act: the brain may call tools (approved by the user where needed), see the results and carry on."""
+        turn = [{"role": "user", "content": user_text}]                       # this request, with its real tool calls and results
+        self.request_text = user_text
+        said, did, t0, nudges, done, repeats = [], [], time.perf_counter(), 0, {}, 0
+        self.allow_all = False                                                # "yes to all": the rest of this request needs no cards
+        follow_up = len(user_text.split()) <= 8 and re.search(r"\b(it|that|this|them|again|do it|send|go ahead|now|too|also)\b", user_text.lower())
+        tools = actions.pick_tools(user_text, getattr(self, "last_tools", ()) if follow_up else ())
+        self.last_tools = [t["function"]["name"] for t in tools]
+        name = re.search(r"\b(?:my name is|call me)\s+([A-Za-z][\w'-]{1,30})", user_text, re.I)
+        if name:                                                              # the one fact worth saving the moment it is said
+            self.memory.add(f"The user's name is {name.group(1).capitalize()}.", "name")
+        facts = self.memory.relevant(user_text)                               # only what relates to this request (+ name, preferences)
+        known = ("\nWhat you remember about the user (use it naturally when it helps; don't recite it unprompted):\n" +
+                 "\n".join(f"- {f}" for f in facts)) if facts else ""
+        math_result = actions.spoken_math(user_text)
+        if math_result:                                                       # sums are computed, never guessed
+            known += f"\nExact calculation (use this result): {math_result[0]} = {math_result[1]}"
+        if any(t["function"]["name"] == "system_info" for t in tools):        # time, date, battery, disks: fetched, never guessed
+            known += f"\nRight now (real, use these exact values): {self.hands.run('system_info', {})}"
+            tools = [t for t in tools if t["function"]["name"] != "system_info"]
+        for _ in range(14):                                                   # enough steps for a longer task
+            if repeats >= 2:
+                break
+            past = self.recent(14) if tools else self.recent(14, plain=True)   # no tools: no old tool calls in sight to imitate
+            messages = [{"role": "system", "content": SYSTEM + (AGENT_NOTE if tools else "") + known}] + past + turn
+            body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
+                    "options": {"num_ctx": CTX, "temperature": 0.5}, "messages": messages}
+            if tools:
+                body["tools"] = tools                                         # only what this request asks for; plain chat gets none
+            reply, calls, first_token = self._stream(body)
+            if "<tool" in reply or "<|" in reply:                             # a call written as text: keep it only if this request may use it
+                reply, written = self.text_tool_calls(reply)
+                allowed = {t["function"]["name"] for t in tools}
+                calls = calls + [c for c in written if c["function"]["name"] in allowed]
+            if not re.search(r"\w", reply):                                   # a lone "?" or "." between tool calls
+                reply = ""
+            if reply.strip():
+                said.append(reply.strip())
+                print(f"   solu: {reply.strip()}   (brain first token {1000 * (first_token or 0):.0f} ms)")
+            if self.cancel.is_set():
+                break
+            if not calls:
+                # "I'll check that for you..." and then nothing: words don't do anything, so push it to act once.
+                if nudges < 3 and PROMISE.search(reply.lower()):
+                    nudges += 1
+                    turn += [{"role": "assistant", "content": reply},
+                             {"role": "user", "content": "(Eflow: nothing has happened yet. Call the tool now, without commenting on this note.)"}]
+                    continue
+                if reply.strip():
+                    turn.append({"role": "assistant", "content": reply.strip()})
+                break
+            looks = all(c.get("function", {}).get("name") in ("look_at_screen", "system_info") for c in calls)
+            if reply.strip() and not PROMISE.search(reply.lower()) and (did or looks):
+                # It has answered. A look it was not asked for (or one more round after acting) would only make it talk twice.
+                turn.append({"role": "assistant", "content": reply.strip()})   # it already acted and has answered: extra calls are noise
+                break
+            turn.append({"role": "assistant", "content": reply, "tool_calls": calls})
+            fresh, refused = 0, False
+            for call in calls:
+                name = call.get("function", {}).get("name", "")
+                args = call.get("function", {}).get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                key = name + json.dumps(args, sort_keys=True)
+                if key in done:                                               # small models like to repeat a call that already worked
+                    repeats += 1
+                    result = f"already done a moment ago ({done[key][:200]}). Do not do it again; just answer the user."
+                else:
+                    result = done[key] = self.use_tool(name, args)
+                    did.append(name)
+                    fresh += 1
+                print(f"   [tool] {name}({json.dumps(args, ensure_ascii=False)[:200]}) -> {result[:200]!r}")
+                turn.append({"role": "tool", "content": result[:2000], "tool_name": name})
+                if result.startswith(("the user said no", "the user did not answer")):
+                    refused = True
+                    break
+                if self.cancel.is_set():
+                    break
+            if refused:                                                       # "no" ends the request: nothing else is tried
+                text = "Okay, I won't." if result.startswith("the user said no") else "Okay, I'll leave it for now."
+                said.append(text)
+                self.say(text)
+                turn.append({"role": "assistant", "content": text})
+                break
+            if not fresh and reply.strip():                                   # it answered and only repeated itself: the answer stands
+                break
+        text = re.sub(r"(\s+[?.!,]+)+$", "", " ".join(said).strip())
+        if said and said[-1] in ("Okay, I won't.", "Okay, I'll leave it for now.") and len(said) > 1:
+            text = said[-1]                                                   # don't show half-plans for something that was refused
+        if not text and did:                                                  # it acted but said nothing: still answer
+            text = "Done."
+            self.say(text)
+        print(f"   (request handled in {time.perf_counter() - t0:.1f} s, {len(did)} action(s))")
+        for m in turn:                                                        # remember it, but keep old tool output short
+            if m["content"].startswith("(Eflow:"):
+                continue
+            self.history.append(dict(m, content=m["content"][:300]) if m["role"] == "tool" else m)
+        text = EMOJI.sub("", text).strip()
+        self.spoken = (self.spoken + [text])[-3:]
+        self.event("said", text=text)
         self._wait_for_playback()
-        if screen is not None and screen["vlm"]:
-            threading.Thread(target=self._load_brain, daemon=True).start()     # the vision model left: bring the brain back
+
+    def use_tool(self, name, args):
+        if name not in actions.LEVEL:
+            return f"error: there is no tool called {name}"
+        if name == "write_file" and not re.search(r"\b(file|save|note|notes|document|doc|txt|write (it|that|this) down|folder)\b",
+                                                   getattr(self, "request_text", "").lower()):
+            return "skipped: the user did not ask for a file. Don't make files; carry on with what they asked."   # small models love extra files
+        if actions.needs_approval(name, args) and not (getattr(self, "allow_all", False) and not actions.describe(name, args)[2]):
+            answer = self.ask_permission(name, args)
+            if answer == "deny":
+                return "the user said no. Do not do it and do not try another way; just say okay."
+            if answer == "timeout":
+                return "the user did not answer, so it was not done."
+            if answer == "always":
+                actions.trust(name)
+            if answer == "all":
+                self.allow_all = True                                         # the remaining safe steps of this request go ahead
+        self.event("action", tool=name)
+        return self.hands.run(name, args)
+
+    def ask_permission(self, name, args):
+        """Show the approval card and wait for a tap (or a spoken yes / no). Returns allow, always, deny or timeout."""
+        action, detail, risky, can_always = actions.describe(name, args)
+        self._wait_for_playback()                                             # let Solu finish its sentence first
+        self._approval_seq += 1
+        aid = self._approval_seq
+        waiter = threading.Event()
+        self.approvals[aid] = {"event": waiter, "answer": None}
+        self.event("approve", id=aid, action=action, detail=detail, risky=risky, always=can_always)
+        question = f"Can I {action}?" if self._told_about_card else f"Can I {action}? Tap Approve on the island, or just say yes."
+        self._told_about_card = True
+        self.say(question)
+        self._wait_for_playback()
+        print(f"   [approval {aid}] {action}: {detail[:120]}{'  (RISKY)' if risky else ''} -- waiting for the user")
+        self.pending_approval = aid
+        if self.half_duplex:
+            self.quiet_until = max(self.quiet_until, time.perf_counter() + 0.8)
+        self.speaking.clear()                                                 # the microphone listens for "yes" / "no"
+        self.event("state", state="listening")
+        deadline = time.monotonic() + 120
+        while not waiter.wait(0.2) and not self.cancel.is_set() and time.monotonic() < deadline:
+            pass
+        self.pending_approval = None
+        answer = self.approvals.pop(aid, {}).get("answer") or ("deny" if self.cancel.is_set() else "timeout")
+        self.event("resolved", id=aid)
+        self._speaking_reported = False
+        self.speaking.set()
+        self.event("state", state="thinking")
+        print(f"   [approval {aid}] {answer}")
+        return answer
+
+    def resolve_approval(self, aid, answer):
+        entry = self.approvals.get(aid)
+        if entry and not entry["event"].is_set():
+            entry["answer"] = answer
+            entry["event"].set()
+
+    @staticmethod
+    def spoken_approval(text):
+        """allow / always / deny for a sentence said while an approval card is up."""
+        t = " ".join(re.findall(r"[a-z0-9']+", text.lower()))
+        if ALWAYS.search(t):
+            return "always"
+        if NO.search(t):
+            return "deny"
+        if ALL.search(t):
+            return "all"
+        if YES.search(t):
+            return "allow"
+        return None                                                           # not an answer (a video, someone else talking): ignore it
+
+    def _ask_json(self, prompt):
+        """One quick, non-streamed JSON answer from the brain (memory upkeep). Same context size: no model reload."""
+        return self._ask(prompt, True)
+
+    def _ask(self, prompt, as_json=False):
+        """One non-streamed answer from the brain (background work: memory, research)."""
+        body = {"model": BRAIN, "stream": False, "think": False, "keep_alive": "30m",
+                "options": {"num_ctx": CTX, "temperature": 0.1 if as_json else 0.4, "num_predict": 2500},
+                "messages": [{"role": "user", "content": prompt}]}
+        if as_json:
+            body["format"] = "json"
+        req = urllib.request.Request(OLLAMA, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return json.loads(resp.read())["message"]["content"]
+
+    # ---- research in the background ---------------------------------------------------------------------------------------
+    def start_research(self, topic, depth="deep"):
+        running = [j for j in self.jobs if j.is_alive()]
+        if running:
+            return f"error: research on '{running[0].topic}' is still running ({running[0].status}); wait for it to finish"
+        job = research_mod.Job(topic, depth, self._ask, self._wait_idle, self._research_done)
+        self.jobs = (self.jobs + [job])[-5:]
+        job.start()
+        minutes = "3 to 6" if job.depth == "deep" else "1 to 3"
+        return (f"started {job.depth} research on '{job.topic}' in the background (about {minutes} minutes). Tell the user you're on it, "
+                f"that they can keep talking to you, and that the report will open in Chrome when it's ready.")
+
+    def _wait_idle(self):
+        while self.speaking.is_set():                                         # the conversation always goes first
+            time.sleep(0.3)
+
+    def _research_done(self, job):
+        if job.error:
+            text = f"Sorry, the research on {job.topic} didn't work out. {job.error[:80]}"
+        else:
+            text = f"Your research on {job.title} is ready. I've opened it in Chrome. Want me to read you the summary?"
+        self._wait_idle()
+        self.respond_text(text)
+
+    def latest_job(self):
+        done = [j for j in self.jobs if j.status == "done"]
+        if done:
+            return done[-1].title, done[-1].markdown, done[-1].path
+        path, text = research_mod.latest_report()
+        if not path:
+            return None, "", None
+        title = text.splitlines()[0].lstrip("# ").strip() if text else "your last research"
+        return title, text, path
+
+    @staticmethod
+    def report_section(markdown, name):
+        m = re.search(rf"##\s*{name}\s*\n(.+?)(?=\n##\s|\Z)", markdown, re.S | re.I)
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def for_reading(markdown):
+        """Report text as it should be read aloud: no markup, no source numbers, no source list."""
+        text = re.split(r"\n##\s*Sources", markdown)[0]
+        text = re.sub(r"\s*\[\d+(?:[,\-–\s]*\d+)*\]", "", text)
+        text = re.sub(r"^#+\s*(.+)$", r"\1.", text, flags=re.M)
+        text = re.sub(r"^[-*•]\s+", "", text, flags=re.M)
+        lines, out = [ln.strip() for ln in re.sub(r"[*_`]", "", text).splitlines()], []
+        for ln in lines:
+            if ln and (not out or ln != out[-1]):                             # a repeated title is read once
+                out.append(ln)
+        return "\n".join(out)
+
+    def _learn(self, transcript):
+        saved = self.memory.learn_from(transcript, self._ask_json)
+        for fact in saved:
+            print(f"   [memory] learned: {fact}")
 
     def _load_brain(self):
         try:
-            req = urllib.request.Request(OLLAMA.replace("/chat", "/generate"), json.dumps({"model": BRAIN, "prompt": "", "keep_alive": "30m"}).encode(),
+            req = urllib.request.Request(OLLAMA.replace("/chat", "/generate"), json.dumps({"model": BRAIN, "prompt": "", "keep_alive": "30m", "options": {"num_ctx": CTX}}).encode(),
                                          {"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=120).read()
         except Exception:                                                     # noqa: BLE001
@@ -460,11 +789,18 @@ class Solu:
     def start_conversation(self):
         if not self.in_conversation:
             self.in_conversation = True
+            self.conversation_from = len(self.history)
             self.event("state", state="listening")
 
     def end_conversation(self):
         if self.in_conversation:
             self.in_conversation = False
+            transcript = [(m["role"], m["content"]) for m in self.history[self.conversation_from:]
+                          if m["role"] in ("user", "assistant") and m["content"].strip()]
+            if transcript:                                                    # look back once, quietly, for anything worth keeping
+                threading.Thread(target=self._learn, args=(transcript,), daemon=True).start()
+            self.history = self.recent(10, plain=True)[-4:]                   # a fresh start next time, with a little continuity
+            self.conversation_from = len(self.history)
             if not self.speaking.is_set():
                 self.event("state", state="ready")
 
@@ -518,6 +854,55 @@ class Solu:
                 self.screen_enabled = not off
                 self.event("setting", name="screen", value=self.screen_enabled)
                 return f"Screen help is {'on' if self.screen_enabled else 'off'}."
+        if re.search(r"\b(forget|reset|clear)\b.*\b(allowed|permissions?|trust(ed)?|always)\b", t):
+            actions.forget_trust()
+            return "Okay, I'll ask before everything again."
+        # ---- research reports ----
+        if re.search(r"\bhow('s| is) (the |my |that )?(research|report)( going)?\b|\b(is|are) (the |my )?(research|report) (done|ready|finished)\b", t):
+            running = [j for j in self.jobs if j.is_alive()]
+            if running:
+                j = running[0]
+                return f"Still working on {j.title}. I'm {j.status} right now, about {int(100 * j.progress)} percent done."
+            title, _, _ = self.latest_job()
+            return f"Nothing is running. Your last report was {title}." if title else "There's no research going on right now."
+        recent_report = any(j.status == "done" and time.time() - j.started < 3600 for j in self.jobs)
+        whole = re.search(r"\bread (me )?(the |that )?(whole|full|entire|complete) (report|research|doc|document|thing)\b", t)
+        summary = re.search(r"\bread (me )?(the |that )?(summary|report|research)\b|\bwhat did (you|the research|the report) (find|say)\b", t) or \
+            (recent_report and re.fullmatch(r"(yes|yeah|sure|ok|okay|please)?\s*(please )?(read it|read that|read it to me|yes read it|go ahead)( please)?", t))
+        if whole or summary:
+            title, markdown, _ = self.latest_job()
+            if not markdown:
+                return "I don't have a research report yet. Ask me to do deep research on something."
+            if whole:
+                return self.for_reading(markdown)
+            part = self.report_section(markdown, "Summary") or self.for_reading(markdown)[:900]
+            return f"Here's the summary of {title}. " + self.for_reading(part)
+        if re.search(r"\bopen (the |my |that )?(last |latest |previous )?(report|research)\b", t):
+            _, _, path = self.latest_job()
+            if not path:
+                return "I don't have a research report yet."
+            research_mod.open_report(path)
+            return "Opened it in Chrome."
+        # ---- memory ----
+        if re.search(r"\b(forget|erase|delete|clear|wipe)\b.*\b(everything|all of it|all about me|your memory|all memories|all your memories)\b", t):
+            self.memory.clear()
+            return "Okay, I've forgotten everything about you. It's a fresh start."
+        if re.search(r"\bwhat (do|did) you (remember|know) about me\b|\bwhat do you remember\b|\bwhat('s| is) in your memory\b", t):
+            facts, total = self.memory.summary(5)
+            if not facts:
+                return "I don't remember anything about you yet. Tell me something, or say remember that, and I'll keep it."
+            return "Here's what I remember: " + " ".join(memory_mod.spoken(f) for f in facts) + (f" And {total - 5} more things." if total > 5 else "")
+        m = re.match(r"^(?:please |can you |could you )?forget (?:that |about |the fact that )?(.+)$", t)
+        if m and not re.search(r"\b(allowed|permission)", t):
+            gone = self.memory.forget(m.group(1))
+            return f"Okay, I've forgotten that {memory_mod.spoken(gone)[0].lower()}{memory_mod.spoken(gone)[1:]}" if gone else \
+                "I don't have anything like that in my memory."
+        m = re.search(r"(?:^|\b(?:please|can you|could you|and)\s+)(?:remember|don't forget|keep in mind|note)\s+(?:that\s+)?(.{6,})$", t)
+        if m and not re.search(r"\b(do|did|can't|cant|don't|dont) (you|i) remember\b|\bremember when\b", t):
+            said = re.search(r"(?:remember|don't forget|keep in mind|note)\s+(?:that\s+)?(.{6,})$", text.strip(), re.I)
+            fact = (said.group(1) if said else m.group(1)).strip().rstrip(".!")
+            self.memory.add(f"The user told Solu: {fact}.", "fact", "told")
+            return "Got it, I'll remember that."
         if t in {"stop", "be quiet", "quiet", "shush", "enough", "stop talking", "okay stop", "hush"}:
             self.cancel.set()
             while not self.audio_out.empty():
@@ -624,7 +1009,7 @@ class Solu:
                 if silence_ms >= 300 and spec is None:                         # a pause began: transcribe speculatively
                     spec = {"audio": np.concatenate(speech), "text": None}
                     threading.Thread(target=lambda s=spec: s.update(text=self.transcribe(s["audio"])), daemon=True).start()
-                if silence_ms >= limit and spec is not None and (worker is None or not worker.is_alive()):
+                if silence_ms >= limit and spec is not None and (worker is None or not worker.is_alive() or self.pending_approval):
                     self.t_stop = time.perf_counter() - limit / 1000            # the moment the voice actually stopped
                     t = time.perf_counter()
                     while spec["text"] is None:                                # usually already finished
@@ -652,6 +1037,13 @@ class Solu:
                     last_activity = time.monotonic()
                     if target is None:
                         print(f"   (not for me, ignored: {text})")
+                        continue
+                    if self.pending_approval:                                 # an approval card is up: this is the answer
+                        answer = self.spoken_approval(target) if target else None
+                        print(f"you: {target}   -> approval: {answer or 'not an answer, ignored'}")
+                        if answer:
+                            self.event("heard", text=target)
+                            self.resolve_approval(self.pending_approval, answer)
                         continue
                     self.first_sound = None
                     if not target:                                            # only its name: answer, then wait for the request

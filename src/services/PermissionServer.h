@@ -21,6 +21,7 @@ struct PermissionRequest {
     std::wstring project;     // last component of the working directory
     std::wstring cwd;
     bool risky = false;       // matches a destructive-command pattern
+    bool canAlways = false;   // Solu: the card may offer "Always allow" for this kind of action
 };
 
 enum class PermissionDecision { Allow, Deny, Defer };

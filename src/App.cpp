@@ -174,8 +174,10 @@ void App::OnMediaChanged() {
 }
 
 void App::OnPermissionsChanged() {
-    if (!permissions_) return;
-    const auto pending = permissions_->Pending();
+    std::vector<PermissionRequest> pending;
+    if (permissions_) pending = permissions_->Pending();
+    if (solu_)                                                       // Solu's requests share the same card
+        for (const PermissionRequest& r : solu_->Approvals()) pending.push_back(r);
     for (auto& island : islands_) island->SetPermissions(pending);
 }
 
@@ -189,6 +191,10 @@ void App::OnSoluChanged() {
     if (!solu_) return;
     const SoluSnapshot snapshot = solu_->Snapshot();
     for (auto& island : islands_) island->SetSolu(snapshot);
+    if (snapshot.approvalsVersion != soluApprovalsVersion_) {
+        soluApprovalsVersion_ = snapshot.approvalsVersion;
+        OnPermissionsChanged();
+    }
     if (snapshot.sleepRequested) solu_->Enable(false);               // "Solu, go to sleep"
 }
 
@@ -307,6 +313,10 @@ void App::BuildIslands() {
                 if (notifications_) notifications_->ClearAll();
             });
         island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
+            if (id >= kSoluApprovalBase) {
+                if (solu_) solu_->Answer(id, decision);
+                return;
+            }
             if (permissions_) permissions_->Resolve(id, decision);
         });
         islands_.push_back(std::move(island));
@@ -496,6 +506,9 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == 6) solu_->Ask(L"Turn on the live captions");
             else if (wp == 7) solu_->Ask(L"Use the tiny voice");
             else if (wp == 8) solu_->Ask(L"Solu, what does this error mean?");
+            else if (wp == 9) solu_->Ask(L"Open the calculator");
+            else if (wp == 10) solu_->Ask(L"Close the calculator window");
+            else if (wp == 11) solu_->Ask(L"Research the benefits of drinking water, then email a short summary to test@example.com");
         }
         return 0;
 #endif

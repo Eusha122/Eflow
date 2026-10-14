@@ -10,6 +10,17 @@ Eflow starts and stops Solu for you: switch **Solu AI** on in Settings (the gear
 **"Solu"** ("Solu, what's up?", "Hey Solu, turn on live captions"). **Ctrl+Alt+Space** also starts and ends a
 conversation.
 
+**Using the PC.** Solu has tools (`actions.py`): apps, websites, search, music, volume, timers, screen reading and clicking,
+typing, shortcuts, windows, files, clipboard and PowerShell. Anything beyond the harmless ones asks first on the island's
+approval card (or say "yes" / "no" / "always"). "Solu, forget what I allowed" resets the Always-allow list.
+
+**Deep research.** "Solu, do a deep research on ..." works in the background and opens a full report (summary,
+findings, sections, sources) in Chrome when it's done; reports are kept in Documents\Solu Research. "Read it" reads the summary.
+
+**Memory.** Solu remembers lasting things about you (your name, people and how you reach them, preferences, plans),
+not every sentence. Say "remember that ...", ask "what do you remember about me?", or "forget ..." / "forget everything".
+It is all in `%LOCALAPPDATA%\Eflow\solu_memory.json`.
+
 **Screen help.** "Solu, what does this error mean?" / "Solu, look at this" / "explain this code": Solu captures the window you are
 in (only then), reads its text with Windows OCR and answers; picture questions use the `qwen3-vl:4b` vision model (pull it with
 `ollama pull qwen3-vl:4b`; it takes 15-30 s because it swaps with the brain on an 8 GB GPU). Nothing is saved; password-manager windows are

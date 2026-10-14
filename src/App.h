@@ -69,6 +69,7 @@ private:
     std::unique_ptr<AudioDevices> audio_;
     std::unique_ptr<CameraService> camera_;
     std::unique_ptr<SoluService> solu_;
+    uint32_t soluApprovalsVersion_ = 0;            // last list of Solu's approval requests the islands were given
     bool hotkey_ = false;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
 };

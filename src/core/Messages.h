@@ -17,6 +17,7 @@ constexpr UINT WM_APP_DEBUG_TAB = WM_APP + 10;   // debug builds only: wParam = 
 constexpr UINT WM_APP_AUDIO = WM_APP + 11;       // audio devices -> app: the device list or a level changed
 constexpr UINT WM_APP_SOLU = WM_APP + 13;        // Solu helper -> app: its state, a new line or its voice level changed
 constexpr UINT WM_APP_DEBUG_SOLU = WM_APP + 14;  // debug builds only: wParam 1 switch on, 0 off, 2 talk, 3 ask a test question
+constexpr UINT WM_APP_CLICKAWAY = WM_APP + 15;   // island: the mouse was pressed somewhere (global hook, live view only)
 constexpr UINT WM_APP_CAMERA = WM_APP + 12;      // camera service -> app: cameras, who uses them, or the privacy switch changed
 
 } // namespace eflow

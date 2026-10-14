@@ -95,7 +95,7 @@ const wchar_t* const kEmptyBody[kSectionCount] = {
     L"Play something in Spotify, YouTube or your browser",
     L"New notifications will show up here",
     L"WhatsApp messages will show up here",
-    L"Claude Code and Codex approvals will appear here",
+    L"Requests from Solu, Claude Code and Codex appear here",
     L"",
 };
 
@@ -315,6 +315,8 @@ IslandWindow::IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_p
 }
 
 IslandWindow::~IslandWindow() {
+    captionsYielded_ = true;
+    UpdateClickAway();
     if (watching_ && systemWatchHandler_) systemWatchHandler_(false);
     if (audioWatching_ && audioWatchHandler_) audioWatchHandler_(false);
     if (hwnd_) {
@@ -407,6 +409,33 @@ void IslandWindow::DebugOpenTab(int section) {
 }
 #endif
 
+namespace {
+std::vector<IslandWindow*> g_clickAway;
+HHOOK g_clickHook = nullptr;
+LRESULT CALLBACK ClickAwayProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN))
+        for (IslandWindow* w : g_clickAway) w->PostClickAway();
+    return CallNextHookEx(g_clickHook, code, wp, lp);
+}
+} // namespace
+
+void IslandWindow::PostClickAway() {
+    if (hwnd_) PostMessageW(hwnd_, WM_APP_CLICKAWAY, 0, 0);
+}
+
+void IslandWindow::UpdateClickAway() {
+    const bool want = CaptionsShown() && expanded_;
+    if (want == clickAwayOn_) return;
+    clickAwayOn_ = want;
+    if (want) {
+        g_clickAway.push_back(this);
+        if (!g_clickHook) g_clickHook = SetWindowsHookExW(WH_MOUSE_LL, ClickAwayProc, GetModuleHandleW(nullptr), 0);
+    } else {
+        g_clickAway.erase(std::remove(g_clickAway.begin(), g_clickAway.end(), this), g_clickAway.end());
+        if (g_clickAway.empty() && g_clickHook) UnhookWindowsHookEx(g_clickHook), g_clickHook = nullptr;
+    }
+}
+
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
     return debugPinned_ || pressed_ >= 0 || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
@@ -479,6 +508,7 @@ void IslandWindow::SetHitRegion(bool full) {
 void IslandWindow::Expand() {
     if (expanded_ || suppressed_) return;
     expanded_ = true;
+    captionsYielded_ = false;                    // opening again during a conversation shows the live view again
     KillTimer(hwnd_, kCloseTimer);
     UpdateSystemWatch();
     UpdateAudioWatch();
@@ -486,6 +516,7 @@ void IslandWindow::Expand() {
     w_.target = kExpandedW;
     h_.target = TargetHeight();
     SetHitRegion(true);
+    UpdateClickAway();
     Animate();
 }
 
@@ -504,6 +535,7 @@ void IslandWindow::Collapse() {
     SetCloseSprings(w_, h_);
     w_.target = kCollapsedW;
     h_.target = kCollapsedH;
+    UpdateClickAway();
     Animate();
 }
 
@@ -564,6 +596,7 @@ void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     const bool wasActive = SoluActive();
     const SoluState before = solu_.state;
     solu_ = snapshot;
+    if (!SoluActive()) captionsYielded_ = false;                       // the next conversation shows the live view again
     if (mascot_) {
         using Talk = Mascot::Talk;
         mascot_->SetTalk(solu_.state == SoluState::Listening ? Talk::Listening : solu_.state == SoluState::Thinking ? Talk::Thinking
@@ -578,9 +611,12 @@ void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     }
     if (CaptionsShown()) {
         KillTimer(hwnd_, kCloseTimer);
-    } else if ((wasActive || before == SoluState::Loading) && expanded_ && !Pinned() && !CursorInIsland(kLeaveSlack)) {
+    } else if (((wasActive && !SoluActive()) || (before == SoluState::Loading && solu_.state != SoluState::Loading)) && expanded_ &&
+               !Pinned() && !CursorInIsland(kLeaveSlack)) {          // (only on that change: a level update must not re-arm the close timer)
         SetTimer(hwnd_, kCloseTimer, 1800, nullptr);                   // the conversation is over: tuck away after a moment
     }
+    ApplyHeightTarget();                                               // the live view grows with the answer
+    UpdateClickAway();
     Animate();
 }
 
@@ -766,7 +802,9 @@ void IslandWindow::SetPermissionPending(bool pending) {
     const bool was = mascot_->permissionPending();
     mascot_->SetPermissionPending(pending);
     if (pending && !was) {                       // open on the AI tab and stay until it is answered
+        const bool yielded = captionsYielded_;
         OnClick(static_cast<int>(Section::Ai));
+        captionsYielded_ = yielded;              // not the user's choice: the live view comes back after the card
         Expand();
         KillTimer(hwnd_, kAutoCloseTimer);
         autoClosePending_ = false;
@@ -809,7 +847,7 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     }
     if (captionT_ > 0.5f && CaptionsShown()) {                        // the conversation view: a click ends the conversation
         const D2D1_RECT_F c = SoluCaptionRect(island);
-        if (p.x >= c.left && p.x <= c.right && p.y >= c.top && p.y <= c.bottom) return kHitCaption;
+        if (p.x >= c.right - 50 && p.x <= c.right + 4 && p.y >= c.top - 5 && p.y <= c.top + 21) return kHitCaption;
     }
     if (section_ == Section::System) {
         for (int i = 0; i < kMetricCount; ++i) {
@@ -820,7 +858,8 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     if (section_ == Section::Ai && !permissions_.empty()) {
         const auto buttons = PermissionButtons(island);
         for (int i = 0; i < 3; ++i)
-            if (p.x >= buttons[i].left && p.x <= buttons[i].right && p.y >= buttons[i].top && p.y <= buttons[i].bottom)
+            if (p.x >= buttons[i].left && p.x <= buttons[i].right && p.y >= buttons[i].top && p.y <= buttons[i].bottom &&
+                !(i == 2 && permissions_.front().id >= kSoluApprovalBase && !permissions_.front().canAlways))   // no third choice
                 return kHitReject + i;
     }
     if (section_ == Section::Notifications && !notifications_.items.empty()) {
@@ -881,6 +920,12 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if ((id >= 0 && id < kSectionCount) || (id >= kHitAudioButton && id < kHitAudioButton + 4)) {
+        captionsYielded_ = true;                                  // tabs and the round buttons always work, even mid-conversation
+        Log("island: live view yielded (click id %d)", id);
+        UpdateClickAway();
+        ApplyHeightTarget();
+    }
     if (id == kHitPopAway) {
         OpenPopover(-1);
         return;
@@ -970,6 +1015,12 @@ void IslandWindow::OnClick(int id) {
     }
     if (id >= kHitReject && id <= kHitDefer) {
         if (permissions_.empty() || !permissionHandler_) return;
+        if (GetTickCount64() - cardShownAt_ < 700) {               // it just appeared: a click meant for the last one must not answer it
+            Log("island: click on a card that just appeared, ignored");
+            return;
+        }
+        Log("island: approval card '%ls %ls' -> %s", permissions_.front().source.c_str(), permissions_.front().action.c_str(),
+            id == kHitApprove ? "Approve" : id == kHitReject ? "Reject" : "third button");
         const PermissionDecision d = id == kHitApprove ? PermissionDecision::Allow
                                    : id == kHitReject  ? PermissionDecision::Deny
                                                        : PermissionDecision::Defer;
@@ -1078,6 +1129,17 @@ void IslandWindow::Frame() {
     }                                           // closed and still: no frames at all
     if (panelMoving_ && !moving) OnSettled();
     panelMoving_ = moving;
+    // Windows serves posted messages (our next frame) before mouse input, and makes WM_TIMER only when the queue is
+    // empty. A frame loop that never stops (Solu talking or listening) would starve both: hover, clicks and
+    // close-on-leave would wait until the voice stops. So deliver pending input and due timers between frames.
+    if (moving) {
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE | PM_QS_INPUT)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) DispatchMessageW(&m);
+    }
 }
 
 bool IslandWindow::StepAnimation(float dt) {
@@ -1118,6 +1180,7 @@ bool IslandWindow::StepAnimation(float dt) {
         moving |= Approach(muteAnim_[side], SideMuted(side) ? 0.0f : 1.0f, dt, 18.0f);
     }
     moving |= Approach(popoverT_, popover_ >= 0 ? 1.0f : 0.0f, dt, 16.0f);
+    moving |= Approach(captionEndHover_, hover_ == kHitCaption ? 1.0f : 0.0f, dt, 22.0f);
     moving |= Approach(captionT_, expanded_ && CaptionsShown() && popover_ < 0 ? 1.0f : 0.0f, dt, 14.0f);
     moving |= Approach(micImpulse_, 0.0f, dt, 6.0f);
     {                                                                                // the thin bar's voice meter
@@ -1356,7 +1419,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         DrawText(dc, emptyBody, bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
                  WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
-    DrawSoluCaption(dc, base, alpha);
+    DrawSoluCaption(dc, D2D1::RectF(base.left, base.top, base.right, std::max(base.bottom, island.bottom + drift)), alpha);   // the live view may be taller than a normal tab
     DrawAudioPopover(dc, base, alpha);
 }
 
@@ -1563,14 +1626,26 @@ void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alp
 
 void IslandWindow::SetPermissions(const std::vector<PermissionRequest>& pending) {
     permissions_ = pending;
+    if (!permissions_.empty() && permissions_.front().id != cardId_) {   // a different card is now in front
+        cardId_ = permissions_.front().id;
+        cardShownAt_ = GetTickCount64();
+    }
     SetPermissionPending(!permissions_.empty());   // opens on the AI tab for a new request; closes when done
+    ApplyHeightTarget();
     Animate();
+}
+
+float IslandWindow::PermissionDetailH() const {
+    if (permissions_.empty() || permissions_.front().id < kSoluApprovalBase) return 34.0f;
+    const float width = kExpandedW - 24.0f - (mascot_ ? kMascotLane : 24.0f) - 20.0f;
+    const float text = gfx_.MeasureHeight(permissions_.front().detail.c_str(), gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL), width);
+    return std::clamp(text + 10.0f, 34.0f, kMaxPanelH - 96.0f - 6.0f - 28.0f - 14.0f);
 }
 
 std::array<D2D1_RECT_F, 3> IslandWindow::PermissionButtons(const D2D1_RECT_F& island) const {
     const float x0 = island.left + 24;
     const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
-    const float top = island.top + 136, bottom = top + 28;
+    const float top = island.top + 96 + PermissionDetailH() + 6, bottom = top + 28;
     const D2D1_RECT_F approve = D2D1::RectF(x1 - 96, top, x1, bottom);
     const D2D1_RECT_F reject = D2D1::RectF(approve.left - 8 - 84, top, approve.left - 8, bottom);
     const D2D1_RECT_F defer = D2D1::RectF(x0, top, reject.left - 8, bottom);
@@ -1697,7 +1772,8 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
                  D2D1::RectF(x0 + metaW, base.top + 76, x1, base.top + 92), warn);
 
     // The exact command / path, verbatim, in a monospace box (two lines, then an ellipsis).
-    const D2D1_RECT_F box = D2D1::RectF(x0, base.top + 96, x1, base.top + 130);
+    const bool solu = r.id >= kSoluApprovalBase;
+    const D2D1_RECT_F box = D2D1::RectF(x0, base.top + 96, x1, base.top + 96 + PermissionDetailH());
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.06f * alpha));
     dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{box, 8, 8}, brush_.Get());
     if (r.risky) {
@@ -1705,8 +1781,9 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
         dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{box, 8, 8}, brush_.Get(), 1.0f);
     }
     const std::wstring detail = r.detail.empty() ? r.tool : r.detail;
-    DrawText(dc, detail.c_str(), gfx_.Mono(11.0f), D2D1::RectF(box.left + 10, box.top + 3, box.right - 10, box.bottom - 3),
-             WithAlpha(kText, 0.92f * alpha));
+    DrawText(dc, detail.c_str(), solu ? gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL) : gfx_.Mono(11.0f),   // an email reads better wrapped
+             D2D1::RectF(box.left + 10, box.top + (solu ? 5.0f : 3.0f), box.right - 10, box.bottom - 3), WithAlpha(kText, 0.92f * alpha),
+             DWRITE_TEXT_ALIGNMENT_LEADING, solu ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     // Buttons: Reject, Approve, and a quiet way to answer in the tool itself instead.
     const auto buttons = PermissionButtons(base);
@@ -1718,7 +1795,7 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
     IDWriteTextFormat* buttonFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     DrawText(dc, L"Reject", buttonFont, buttons[0], WithAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     DrawText(dc, L"Approve", buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
-    const std::wstring deferLabel = L"Answer in " + r.source;
+    const std::wstring deferLabel = solu ? (r.canAlways ? L"Always allow" : L"") : L"Answer in " + r.source;
     DrawText(dc, deferLabel.c_str(), smallFont, buttons[2], WithAlpha(kTextDim, (1.0f + 0.6f * hd) * alpha));
 }
 
@@ -1726,6 +1803,15 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
 
 float IslandWindow::TargetHeight() const {
     if (popover_ >= 0) return std::clamp(MenuHeight(popover_), kExpandedH, kMaxPanelH);
+    if (section_ == Section::Ai && !permissions_.empty())         // a long approval card (an email) makes the island taller
+        return std::clamp(96.0f + PermissionDetailH() + 6.0f + 28.0f + 14.0f, kExpandedH, kMaxPanelH);
+    if (CaptionsShown() && !solu_.said.empty()) {                // the live view grows so the whole answer fits
+        const float width = kExpandedW - 22.0f - (mascot_ ? kMascotLane : 22.0f);
+        float top = kTabTop + kTabH + 8.0f + 24.0f;
+        if (!solu_.heard.empty()) top += solu_.lookImage ? 46.0f : 40.0f;
+        const float text = gfx_.MeasureHeight(solu_.said.c_str(), gfx_.Wrapped(15.0f, DWRITE_FONT_WEIGHT_NORMAL), width);
+        return std::clamp(top + text + 16.0f, kExpandedH, kMaxPanelH);
+    }
     return kExpandedH;
 }
 
@@ -2174,7 +2260,7 @@ void IslandWindow::DrawAudioPopover(ID2D1DeviceContext* dc, D2D1_RECT_F base, fl
 
 D2D1_RECT_F IslandWindow::SoluCaptionRect(const D2D1_RECT_F& base) const {
     return D2D1::RectF(base.left + 22, base.top + kTabTop + kTabH + 8.0f, base.left + kExpandedW - (mascot_ ? kMascotLane : 22.0f),
-                       base.top + kExpandedH - 14.0f);
+                       base.bottom - 14.0f);
 }
 
 // The live conversation: what Solu is doing, what you said and what it answered.
@@ -2197,7 +2283,12 @@ void IslandWindow::DrawSoluCaption(ID2D1DeviceContext* dc, D2D1_RECT_F base, flo
     DrawText(dc, label, quiet, D2D1::RectF(r.left + 14, r.top, r.left + 120, r.top + 16), WithAlpha(kTextDim, 1.25f * a));
 
     // On the right of the label: the microphone while listening, pulsing dots while thinking.
-    const float right = r.right;
+    const D2D1_RECT_F end = D2D1::RectF(r.right - 44, r.top - 3, r.right + 2, r.top + 19);
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.06f + 0.14f * captionEndHover_) * a));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{end, 11, 11}, brush_.Get());
+    DrawText(dc, L"End", gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), end, WithAlpha(kText, (0.55f + 0.45f * captionEndHover_) * a),
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+    const float right = r.right - 56;
     if (solu_.state == SoluState::Listening) {
         for (int i = 0; i < 18; ++i) {
             const float v = soluBars_[soluBars_.size() - 18 + static_cast<size_t>(i)];
@@ -2216,7 +2307,7 @@ void IslandWindow::DrawSoluCaption(ID2D1DeviceContext* dc, D2D1_RECT_F base, flo
 
     float y = r.top + 24;
     float heardLeft = r.left;
-    if (solu_.lookImage && !solu_.lookImage->empty()) {              // what Solu looked at: always visible, so it is never a secret
+    if (solu_.lookImage && !solu_.lookImage->empty() && !solu_.heard.empty()) {              // what Solu looked at: always visible, so it is never a secret
         if (lookKey_ != solu_.lookImage.get() || !lookBitmap_) {
             lookKey_ = solu_.lookImage.get();
             lookBitmap_.Reset();
@@ -2545,6 +2636,14 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         OnMouseMove(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+        return 0;
+    case WM_APP_CLICKAWAY:                                         // a click outside the island while the live view is up: tuck away, keep talking
+        if (expanded_ && CaptionsShown() && !CursorInIsland(3.0f) && !(mascot_ && mascot_->permissionPending())) {
+            captionsYielded_ = true;
+            Log("island: live view closed by a click outside");
+            UpdateClickAway();
+            Collapse();
+        }
         return 0;
     case WM_MOUSELEAVE:
         tracking_ = false;

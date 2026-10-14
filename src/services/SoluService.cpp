@@ -269,7 +269,7 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                         if (st->text == "loading") snapshot_.state = SoluState::Loading;
                         else if (st->text == "ready") snapshot_.state = SoluState::Ready;
                         else if (st->text == "listening") {
-                            if (snapshot_.state == SoluState::Ready) snapshot_.heard.clear(), snapshot_.said.clear();   // a new conversation
+                            if (snapshot_.state == SoluState::Ready) snapshot_.heard.clear(), snapshot_.said.clear(), snapshot_.lookImage.reset(), snapshot_.lookTitle.clear();   // a new conversation
                             snapshot_.state = SoluState::Listening;
                         }
                         else if (st->text == "thinking") snapshot_.state = SoluState::Thinking;
@@ -296,6 +296,23 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                             pendingHeard_.clear();
                         }
                     }
+                } else if (ev->text == "approve") {                       // Solu wants to do something on the PC: show the card
+                    PermissionRequest r;
+                    const json::Value* id = root.Find("id");
+                    r.id = kSoluApprovalBase + (id ? static_cast<uint64_t>(atof(id->text.c_str())) : 0);
+                    r.source = L"Solu";
+                    if (const json::Value* v = root.Find("action")) r.action = FromUtf8(v->text);
+                    if (const json::Value* v = root.Find("detail")) r.detail = FromUtf8(v->text);
+                    if (const json::Value* v = root.Find("risky"); v && v->type == json::Value::Type::Bool) r.risky = v->boolean;
+                    if (const json::Value* v = root.Find("always"); v && v->type == json::Value::Type::Bool) r.canAlways = v->boolean;
+                    r.tool = r.action;
+                    snapshot_.approvals.push_back(std::move(r));
+                    ++snapshot_.approvalsVersion;
+                } else if (ev->text == "resolved") {                      // answered (here or by voice), or it timed out
+                    const json::Value* id = root.Find("id");
+                    const uint64_t key = kSoluApprovalBase + (id ? static_cast<uint64_t>(atof(id->text.c_str())) : 0);
+                    std::erase_if(snapshot_.approvals, [key](const PermissionRequest& r) { return r.id == key; });
+                    ++snapshot_.approvalsVersion;
                 } else if (ev->text == "looking") {                       // Solu captured the window it is asked about
                     const json::Value* title = root.Find("title");
                     const json::Value* thumb = root.Find("thumb");
@@ -350,6 +367,7 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
             }
             snapshot_.state = SoluState::Off;
             snapshot_.level = 0;
+            if (!snapshot_.approvals.empty()) snapshot_.approvals.clear(), ++snapshot_.approvalsVersion;   // nobody is waiting any more
             if (writePipe_) CloseHandle(writePipe_);
             if (job_) CloseHandle(job_);
             writePipe_ = nullptr;
@@ -375,6 +393,11 @@ void SoluService::Changed(bool coalesce) {
     if (coalesce && posted_.exchange(true)) return;             // one pending message is enough for a stream of levels
     if (!coalesce) posted_ = true;
     PostMessageW(notify_, message_, 0, 0);
+}
+
+std::vector<PermissionRequest> SoluService::Approvals() {
+    std::lock_guard lock(mutex_);
+    return snapshot_.approvals;
 }
 
 SoluSnapshot SoluService::Snapshot() {
@@ -409,6 +432,7 @@ void SoluService::Enable(bool on) {
         }
         Kill();
         std::lock_guard lock(mutex_);
+        if (!snapshot_.approvals.empty()) snapshot_.approvals.clear(), ++snapshot_.approvalsVersion;
         snapshot_.state = SoluState::Off;
         snapshot_.level = 0;
     }
@@ -471,6 +495,17 @@ void SoluService::SetScreen(bool on) {
         SaveSettings();
     }
     Send(std::string("{\"cmd\":\"screen\",\"on\":") + (on ? "true" : "false") + "}");
+    Changed(false);
+}
+
+void SoluService::Answer(uint64_t id, PermissionDecision decision) {
+    {
+        std::lock_guard lock(mutex_);
+        std::erase_if(snapshot_.approvals, [id](const PermissionRequest& r) { return r.id == id; });
+        ++snapshot_.approvalsVersion;
+    }
+    const char* answer = decision == PermissionDecision::Allow ? "allow" : decision == PermissionDecision::Defer ? "always" : "deny";
+    Send("{\"cmd\":\"approval\",\"id\":" + std::to_string(id - kSoluApprovalBase) + ",\"answer\":\"" + answer + "\"}");
     Changed(false);
 }
 

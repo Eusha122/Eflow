@@ -241,6 +241,10 @@ voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until t
   thing, says so, and reports a `setting` event so Eflow's menu follows.
 * **Live captions** is a setting. On: a conversation opens the island and shows the live view (what you said, the
   answer, the microphone). Off: the island stays closed and you just talk; the thin bar shows Solu is there.
+* **The live view stays out of the way.** Tabs, the round buttons and Settings always work mid-conversation (the live view
+  steps aside until the conversation ends); a click anywhere outside the island tucks it away while Solu keeps talking (a
+  low-level mouse hook that exists only while the live view is up); opening the island again brings the live view back. Only
+  the **End** pill ends the conversation, and the view grows to fit a long answer.
 * **Speakers or headphones.** Speaker mode (default): Solu does not listen while it talks (plus a second after), and
   it drops anything that is just its own words coming back through the microphone. Headphones mode: you can talk
   over it.
@@ -261,7 +265,37 @@ voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until t
   with a scanning line while Solu reads) so it is never secret what was seen. Windows whose title or program contains
   password / authenticator / key-vault words are refused. The **Screen help** switch in Settings (or "turn off screen help")
   disables it; the helper then starts with `--no-screen`.
-* **Not in this version.** Running tasks on the PC and memory; a native C++ engine instead of Python.
+* **Doing things on the PC** (`solu/actions.py`). Ordinary requests go through an agent loop: qwen3:8b gets 18 tools through
+  Ollama tool calling (open apps via `Get-StartApps` + `shell:AppsFolder`, websites, web search, media keys, volume keys,
+  timers, system info incl. free disk space, look at / click text on the screen via Windows OCR word boxes, type (SendInput
+  Unicode), shortcuts, list/focus/min/max/close windows, find/open/read/write files, clipboard, PowerShell). Up to 8 steps per
+  request; real tool calls and results are kept in the history; exact repeats are not executed twice; a "let me..." without a
+  call gets one nudge; a refusal ends the request. **Permission:** harmless tools run at once (music, volume, timer, time,
+  web search, reading the screen); everything else emits `approve` (id, action, detail, risky, always) and waits up to
+  120 s. `SoluService` turns it into a `PermissionRequest` (id + `kSoluApprovalBase`, source "Solu") that `App` merges into
+  the island's approval card next to Claude Code / Codex requests; Reject / Approve / **Always allow** (offered for safe
+  kinds only, never for commands, file writes or closing windows) go back as `{"cmd":"approval"}`. The user can also answer
+  out loud ("yes", "no", "always"): while a card is up the microphone stays on and the next sentence is the answer.
+  "Always allow" is stored in `%LOCALAPPDATA%\Eflow\solu_trust.json` ("Solu, forget what I allowed" clears it). Commands
+  matching destructive patterns are marked *Potentially destructive*; typing / clicking cards name the target window.
+* **Long-term memory** (`solu/memory.py`, `%LOCALAPPDATA%\Eflow\solu_memory.json`). Not sentence by sentence: "remember
+  that ..." and "my name is / call me ..." are saved at once; everything else is picked out once per conversation, after it
+  ends, by one background JSON call to the brain (at most 3 lasting facts: name, people and how to reach them, preferences,
+  plans; usually none). Duplicates update the existing fact. Recall is a word match (microseconds, no embedding model): each
+  request gets the core facts (name, preferences) plus up to 5 that share words with it. Voice: "what do you remember about
+  me?", "forget (about) ...", "forget everything" (a `.bak` copy is kept). Each request also only gets the tools its words
+  ask for (`actions.pick_tools`); plain chat gets none, and time/date/battery/disk questions are answered from real values
+  fetched before the model replies.
+* **Deep research** (`solu/research.py`). "Deep research on X" / "research X in depth and make a doc" calls the
+  `deep_research` tool, which starts a background job and returns at once: plan (3 or 5 sub-questions, JSON), search each
+  (DuckDuckGo), fetch every page once in parallel, notes per sub-question with numbered sources, then a Markdown report
+  (Summary, Key findings, 2-4 sections, Conclusion) rendered to a styled HTML page (light/dark, clickable citations, source list)
+  and an .md copy in `Documents\Solu Research`, opened in a new Chrome window. Every brain call of the job waits while Solu is
+  speaking, so the conversation stays quick. When done Solu says so; "read it" reads the summary, "read the whole report",
+  "how's the research going?", "open my last report". A deep job takes about 2 minutes on the RTX 5050.
+* **Exact answers.** Arithmetic in a request ("12 times 8", "15% of 240", "square root of 144") is computed
+  (`actions.spoken_math`, a safe AST evaluator) and handed to the model, like the time and disk values.
+* **Not in this version.** A native C++ engine instead of Python.
 
 ## 9. Mascot pipeline
 

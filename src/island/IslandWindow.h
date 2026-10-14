@@ -69,6 +69,7 @@ public:
     }
     void SetCamera(const CameraSnapshot& snapshot);
     void SetSolu(const SoluSnapshot& snapshot);
+    void PostClickAway();                        // called by the global mouse hook
     void ShowForSolu();                          // the hotkey was pressed: open so the conversation is visible
     void SetSoluHandlers(std::function<void(bool)> enable, std::function<void()> talk, std::function<void(const std::wstring&)> voice,
                          std::function<void(bool)> headphones, std::function<void()> stop, std::function<void(bool)> captions,
@@ -176,7 +177,7 @@ private:
     void DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout& g, float a);      // the gear's menu
     void DrawSoluBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& bar, float alpha);       // the living indicator on the thin bar
     bool SoluAwake() const { return solu_.state == SoluState::Ready || SoluActive(); }
-    bool CaptionsShown() const { return solu_.captions && SoluActive(); }                 // the live conversation view
+    bool CaptionsShown() const { return solu_.captions && SoluActive() && !captionsYielded_ && permissions_.empty(); }   // the live view; an approval card comes first
     void ToggleMute(int side);                   // mute the mic / speaker, or block the camera
     D2D1_RECT_F MuteSwitch(const PopoverLayout& g) const;
     PopoverLayout PopoverGeometry(const D2D1_RECT_F& island) const;   // the menu area inside the island
@@ -190,7 +191,8 @@ private:
     float TargetHeight() const;                  // panel height the current tab wants
     void ApplyHeightTarget();                    // spring to it (and resize the clickable area)
     void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
-    std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;  // reject, approve, defer
+    std::array<D2D1_RECT_F, 3> PermissionButtons(const D2D1_RECT_F& island) const;
+    float PermissionDetailH() const;             // the detail box grows to show a whole email / long command (Solu)  // reject, approve, defer
     void UpdateArtwork();
     void DrawMascot(float opacity);
     void DrawMascotEffects(ID2D1DeviceContext* dc, float opacity);
@@ -265,6 +267,10 @@ private:
     std::function<void(bool)> soluEnable_, soluHeadphones_, soluCaptions_, soluScreen_;
     Com<ID2D1Bitmap1> lookBitmap_;               // the picture of what Solu is looking at (rebuilt when a new one arrives)
     const ImageBGRA* lookKey_ = nullptr;
+    float captionEndHover_ = 0;                  // the "End" pill of the live view
+    bool clickAwayOn_ = false;
+    void UpdateClickAway();                      // watch for clicks outside the island only while the live view is up
+    bool captionsYielded_ = false;               // the user picked a tab / menu during a conversation: the live view steps aside until it ends
     std::function<void()> soluTalk_, soluStop_;
     std::function<void(const std::wstring&)> soluVoice_;
     int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices
@@ -300,6 +306,7 @@ private:
     std::vector<PermissionRequest> permissions_;  // oldest first; the first one is on screen
     std::function<void(uint64_t, PermissionDecision)> permissionHandler_;
     std::array<float, 3> permissionHover_{};      // reject, approve, defer
+    uint64_t cardId_ = 0, cardShownAt_ = 0;        // the card on screen, and when it appeared (no clicks in its first moment)
 };
 
 } // namespace eflow

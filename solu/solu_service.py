@@ -11,6 +11,8 @@ commands {"cmd": "talk"}        start a hands-free conversation (the microphone 
          {"cmd": "voice", "name": "cozy"}      change the voice (Solu says hello in it)
          {"cmd": "headphones", "on": true}     headphones: you can talk over Solu; speakers: it never hears itself
          {"cmd": "ask", "text": "..."}         answer a typed question (no microphone needed)
+         {"cmd": "approval", "id": 3, "answer": "allow" | "always" | "deny"}   the user's answer on the approval card
+         (events: {"event": "approve", id, action, detail, risky, always} shows the card, {"event": "resolved", id} removes it)
          {"cmd": "screen", "on": true}         allow or forbid "look at this" (events: {"event": "looking", title, app, thumb})
          {"cmd": "quit"}
 The microphone is only ever open between "talk" and the end of the conversation.
@@ -105,6 +107,8 @@ def main():
             solu.half_duplex = not bool(cmd.get("on"))
         elif name == "screen":
             solu.screen_enabled = bool(cmd.get("on"))
+        elif name == "approval" and cmd.get("answer") in ("allow", "always", "deny", "all"):
+            solu.resolve_approval(int(cmd.get("id", 0)), cmd["answer"])
         elif name == "ask" and cmd.get("text") and not solu.speaking.is_set():
             emit("heard", text=cmd["text"])
             emit("state", state="thinking")

@@ -5,7 +5,9 @@ Nothing here runs in the background and nothing is stored: a capture exists for 
 import asyncio
 import base64
 import ctypes
+import difflib
 import io
+import re
 from ctypes import wintypes
 
 from PIL import Image, ImageGrab
@@ -46,6 +48,7 @@ class Look:
         self.title, self.app, self.image, self.scope = title, app, image, scope
         self.text = ""
         self.blocked = None                              # a reason, when the window must not be looked at
+        self.origin = (0, 0)                             # where the picture's top-left corner is on the screen
 
 
 def _text(fn, hwnd):
@@ -113,13 +116,19 @@ def look_at_foreground(whole_screen=False):
         look.blocked = "That looks like a password or security window, so I won't look at it."
         return look
     if whole_screen or not hwnd or cls in SHELL_CLASSES:
-        return Look("Your screen", "Windows", ImageGrab.grab(all_screens=True).convert("RGB"), "screen")
+        look = Look("Your screen", "Windows", ImageGrab.grab(all_screens=True).convert("RGB"), "screen")
+        look.origin = (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77))   # the virtual screen's corner
+        return look
     image = _print_window(hwnd)
     if image is None:                                                 # fall back to the pixels on screen
         rect = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(rect))
         image = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True).convert("RGB")
-    return Look(title, app, image, "window")
+    look = Look(title, app, image, "window")
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    look.origin = (rect.left, rect.top)
+    return look
 
 
 async def _ocr(png):
@@ -139,6 +148,63 @@ async def _ocr(png):
         return ""
     result = await engine.recognize_async(bitmap)
     return "\n".join(line.text for line in result.lines)
+
+
+async def _ocr_words(png):
+    from winrt.windows.graphics.imaging import BitmapDecoder
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
+    stream = InMemoryRandomAccessStream()
+    writer = DataWriter(stream)
+    writer.write_bytes(png)
+    await writer.store_async()
+    writer.detach_stream()
+    stream.seek(0)
+    bitmap = await (await BitmapDecoder.create_async(stream)).get_software_bitmap_async()
+    engine = OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        return []
+    result = await engine.recognize_async(bitmap)
+    return [[(w.text, w.bounding_rect.x, w.bounding_rect.y, w.bounding_rect.width, w.bounding_rect.height) for w in line.words]
+            for line in result.lines]
+
+
+def _norm(word):
+    return re.sub(r"[^\w]", "", word.lower())
+
+
+def find_text(look, wanted):
+    """Where `wanted` is written on the captured window: (screen x, screen y, what was read there), or None."""
+    image, scale = look.image, 1.0
+    if image.width > 3840:
+        scale = 3840 / image.width
+        image = image.resize((3840, int(image.height * scale)))
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    try:
+        lines = asyncio.run(_ocr_words(buf.getvalue()))
+    except Exception:                                                  # noqa: BLE001
+        return None
+    target = [_norm(w) for w in wanted.split() if _norm(w)]
+    if not target:
+        return None
+    best, best_score = None, 0.0
+    for words in lines:
+        normed = [_norm(w[0]) for w in words]
+        for i in range(len(words)):
+            for j in range(i + 1, min(len(words), i + len(target) + 2) + 1):
+                score = difflib.SequenceMatcher(None, " ".join(normed[i:j]), " ".join(target)).ratio()
+                if score > best_score:
+                    best_score, best = score, words[i:j]
+    if best is None or best_score < 0.75:
+        return None
+    left = min(w[1] for w in best)
+    right = max(w[1] + w[3] for w in best)
+    top = min(w[2] for w in best)
+    bottom = max(w[2] + w[4] for w in best)
+    x = look.origin[0] + (left + right) / 2 / scale
+    y = look.origin[1] + (top + bottom) / 2 / scale
+    return x, y, " ".join(w[0] for w in best)
 
 
 def read_text(look):

@@ -51,6 +51,11 @@ what the microphone hears is transcribed locally to spot its name, and sentences
 talk. Using speakers? Solu waits until it has finished talking before it listens; wearing headphones? Switch on
 *Headphones mode* and you can talk over it.
 
+**Solu can use your PC:** *"Solu, open Spotify"*, *"close Chrome"*, *"set a 10 minute timer"*, *"what's taking space on my C drive?"*,
+*"click Sign in"*, *"type my address"*, *"run ipconfig"*. Harmless things (music, volume, timers, the time, a web search) just happen;
+anything else shows an **Approve / Reject / Always allow** card on the island first, and you can also simply say *yes* or *no*.
+It runs a local model, so it is quick and dependable for single actions and simpler tasks, and less reliable for long multi-step jobs.
+
 **Screen help:** say *"Solu, what does this error mean?"* or *"Solu, look at this"* and it looks at the window you are in, reads it
 and answers out loud, so you never need a screenshot. It only looks when you ask, shows a small picture of what it saw, stores nothing,
 refuses password-manager style windows, and can be switched off in Settings. See `solu\README.md`.

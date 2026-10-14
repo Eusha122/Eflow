@@ -9,8 +9,12 @@
 #include <vector>
 
 #include "core/Image.h"
+#include "services/PermissionServer.h"
 
 namespace eflow {
+
+// Solu's approval requests share the island's approval card with the coding tools; their ids live up here.
+constexpr uint64_t kSoluApprovalBase = 1ull << 40;
 
 enum class SoluState { Off, Missing, Loading, Ready, Listening, Thinking, Speaking };
 
@@ -37,6 +41,8 @@ struct SoluSnapshot {
     bool screen = true;                          // "Solu, look at this" is allowed (Solu can switch this by voice)
     std::wstring lookTitle;                      // what Solu is looking at for the current question
     std::shared_ptr<const ImageBGRA> lookImage;  // a small picture of it, shown so it is always clear what was seen
+    std::vector<PermissionRequest> approvals;     // things Solu wants to do on the PC, waiting for the user
+    uint32_t approvalsVersion = 0;               // grows whenever that list changes
     bool sleepRequested = false;                 // "Solu, go to sleep": the app switches Solu off
     std::wstring error;                          // something the user should know ("Ollama is not running")
     float level = 0;                             // how loudly Solu is speaking right now, 0..1 (the cat's mouth)
@@ -63,8 +69,10 @@ public:
     void SetHeadphones(bool on);
     void SetCaptions(bool on);
     void SetScreen(bool on);
+    void Answer(uint64_t id, PermissionDecision decision);   // the approval card: Approve / Reject / Always allow (Defer)
     void Ask(const std::wstring& text);          // answers a typed question (tests / future text box)
     SoluSnapshot Snapshot();
+    std::vector<PermissionRequest> Approvals();
 
 private:
     bool Launch();
