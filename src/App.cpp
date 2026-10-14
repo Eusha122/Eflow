@@ -294,7 +294,8 @@ void App::BuildIslands() {
             [this](const std::wstring& voice) { if (solu_) solu_->SetVoice(voice); },
             [this](bool headphones) { if (solu_) solu_->SetHeadphones(headphones); },
             [this] { if (solu_) solu_->StopSpeaking(); },
-            [this](bool captions) { if (solu_) solu_->SetCaptions(captions); });
+            [this](bool captions) { if (solu_) solu_->SetCaptions(captions); },
+            [this](bool screen) { if (solu_) solu_->SetScreen(screen); });
         island->SetMediaHandler([this](MediaCommand cmd, double seconds) {
             if (media_) media_->Send(cmd, seconds);
         });
@@ -494,6 +495,7 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == 5) solu_->Ask(L"Turn off the live captions");
             else if (wp == 6) solu_->Ask(L"Turn on the live captions");
             else if (wp == 7) solu_->Ask(L"Use the tiny voice");
+            else if (wp == 8) solu_->Ask(L"Solu, what does this error mean?");
         }
         return 0;
 #endif

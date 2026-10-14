@@ -8,3 +8,11 @@ soundfile==0.14.0
 numpy==2.4.6
 nvidia-cublas-cu12==12.9.2.10  # CUDA libraries for Whisper on NVIDIA GPUs
 nvidia-cudnn-cu12==9.27.0.42
+pillow==12.3.0                 # screen help: capture and thumbnails
+winrt-runtime==3.2.1           # screen help: Windows OCR
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage.Streams==3.2.1

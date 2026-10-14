@@ -32,9 +32,19 @@ from faster_whisper import WhisperModel  # noqa: E402
 from kokoro_onnx import Kokoro  # noqa: E402
 
 from voice_presets import PRESETS, speak  # noqa: E402
+import screen as screen_mod  # noqa: E402
 
 OLLAMA = "http://127.0.0.1:11434/api/chat"
 BRAIN = "qwen3:8b"
+VISION = "qwen3-vl:4b"                          # only used for questions about pictures; it is swapped in and out of the GPU
+SCREEN_NOTE = (
+    " The user is asking about what is on their screen, which you can see through the text (and picture) given with their question. "
+    "Answer their question directly in one to three spoken sentences. Quote only the few words that matter. "
+    "Do not mention OCR, screenshots or extracted text: talk as if you are looking at their screen. "
+    "If what you can see does not contain the answer, say what you can see and ask what they want to know."
+)
+SCREEN_ONLY_LOOK = ("Describe what is on my screen in a sentence or two, and point out anything important, "
+                    "like an error, a question, or something I need to answer.")
 SR_IN, FRAME = 16000, 512                       # 32 ms frames, what Silero expects
 SYSTEM = (
     "You are Solu, a small, warm cat-fox who lives on the user's desktop and is their close friend. "
@@ -105,6 +115,7 @@ class Solu:
         self.mic_level = 0.0
         self.cfg_mtime = None
         self.half_duplex = not args.headphones                               # speakers: never listen while talking
+        self.screen_enabled = not getattr(args, 'no_screen', False)              # "Solu, look" works
         self.event = lambda _event, **kw: None                                 # the service replaces this: state/heard/said/level events
         self.in_conversation = True                                          # talking with Solu right now (the CLI is always in one)
         self.wake_mode = False                                               # True in the island: wait for its name before a conversation
@@ -243,9 +254,9 @@ class Solu:
             self.audio_out.put(np.zeros(int(24000 * 0.08), np.float32))
 
     # ---- brain --------------------------------------------------------------------------------
-    def respond(self, user_text):
+    def respond(self, user_text, screen=None):
         try:
-            self._respond(user_text)
+            self._respond(user_text, screen)
         except Exception as e:                                                # noqa: BLE001  (Ollama not running, ...)
             print(f"   (the brain failed: {e})")
             self.event("error", message="Solu's brain (Ollama) did not answer. Is Ollama running?")
@@ -285,14 +296,29 @@ class Solu:
         if after:
             after()
 
-    def _respond(self, user_text):
+    def _respond(self, user_text, screen=None):
         self.cancel.clear()
         self._speaking_reported = False
         self.speaking.set()
-        self.history.append({"role": "user", "content": user_text})
-        body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
-                "options": {"num_ctx": 4096, "temperature": 0.8},
-                "messages": [{"role": "system", "content": SYSTEM}] + self.history[-12:]}
+        if screen is None:
+            self.history.append({"role": "user", "content": user_text})
+            body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
+                    "options": {"num_ctx": 4096, "temperature": 0.8},
+                    "messages": [{"role": "system", "content": SYSTEM}] + self.history[-12:]}
+        else:                                                                # a question about the screen
+            where = f"window \u201c{screen['title']}\u201d ({screen['app']})" if screen["scope"] == "window" else "the whole screen"
+            seen = screen["text"][:3000]
+            asked = f"{user_text}\n\n[What is on the user's screen: {where}. Text read from it, it may contain mistakes:]\n{seen}"
+            self.history.append({"role": "user", "content": f"{user_text}\n[Screen: {where}: {screen['text'][:1200]}]"})   # kept short for follow-ups
+            if screen["vlm"]:
+                message = {"role": "user", "content": asked, "images": [screen["image"]]}
+                body = {"model": VISION, "stream": True, "think": False, "keep_alive": 0,          # free the GPU for the brain right after
+                        "options": {"num_ctx": 4096, "temperature": 0.4},
+                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + self.history[-5:-1] + [message]}
+            else:
+                body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
+                        "options": {"num_ctx": 4096, "temperature": 0.4},
+                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + self.history[-12:-1] + [{"role": "user", "content": asked}]}
         req = urllib.request.Request(OLLAMA, json.dumps(body).encode(), {"Content-Type": "application/json"})
         reply, buf, first_chunk, t0 = "", "", True, time.perf_counter()
         sentence_end = re.compile(r"(?<=[.!?…])\s+")
@@ -325,6 +351,70 @@ class Solu:
         self.spoken = (self.spoken + [reply.strip()])[-3:]
         self.event("said", text=reply.strip())
         self._wait_for_playback()
+        if screen is not None and screen["vlm"]:
+            threading.Thread(target=self._load_brain, daemon=True).start()     # the vision model left: bring the brain back
+
+    def _load_brain(self):
+        try:
+            req = urllib.request.Request(OLLAMA.replace("/chat", "/generate"), json.dumps({"model": BRAIN, "prompt": "", "keep_alive": "30m"}).encode(),
+                                         {"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=120).read()
+        except Exception:                                                     # noqa: BLE001
+            pass
+
+    # ---- looking at the screen ----------------------------------------------------------------------------
+    SCREEN_NOUNS = r"screen|page|error|warning|code|text|message|email|window|document|image|picture|photo|article|website|tab|dialog|popup|pop up|button|menu|chart|graph|table|spreadsheet|slide|video|file|terminal|console|log|stack trace|exception|bug|result|form"
+    SCREEN_ASKS = r"what|why|how|explain|read|translate|summari[sz]e|describe|help|fix|mean|say|tell|check|look|see|wrong|going on|solve|answer|reply|respond"
+
+    def is_screen_request(self, text):
+        """True for "look at this", "what does this error mean", "what's on my screen" ... (not for "look up the weather")."""
+        t = " ".join(re.findall(r"[a-z0-9']+", text.lower()))
+        if not t:
+            return False
+        if re.match(r"^(look|have a look|take a look)\b(?!\s+(up|for|after|out|forward)\b)", t):
+            return True
+        if re.search(r"\b(what am i looking at|can you see (this|my screen|it|that)|what('?s| is) on my screen|what('?s| is) happening on my screen|help me with this|what('?s| is) wrong (with )?(this|here)|what does (this|that|it) (say|mean))\b", t):
+            return True
+        return bool(re.search(r"\b(this|that|these|those|here|my screen|the screen|on screen)\b", t)
+                    and re.search(rf"\b({self.SCREEN_NOUNS})\b", t) and re.search(rf"\b({self.SCREEN_ASKS})", t))
+
+    @staticmethod
+    def needs_vision(question, ocr_text):
+        """Text questions are answered from what Windows read (fast); pictures need the vision model (slower: it swaps in)."""
+        if len(ocr_text) < 30:
+            return True
+        return bool(re.search(r"\b(picture|photo|image|logo|colou?r|looks? like|drawing|chart|graph|diagram|meme|video|who is|who's|what animal|what is in|what's in)\b", question.lower()))
+
+    def respond_screen(self, text):
+        """Look at the window the user is in, then answer their question about it."""
+        t = " ".join(re.findall(r"[a-z0-9']+", text.lower()))
+        if not self.screen_enabled:
+            return self.respond_text("Screen help is switched off. You can turn it on in Settings, or tell me to turn on screen help.")
+        whole = bool(re.search(r"\b(whole|entire|all|full|both)\b.*\bscreens?\b|\ball my (screens|monitors)\b", t))
+        look = screen_mod.look_at_foreground(whole)
+        if look.blocked:
+            return self.respond_text(look.blocked)
+        self.event("looking", title=look.title, app=look.app, scope=look.scope, thumb=screen_mod.thumbnail_b64(look))
+        ocr = screen_mod.read_text(look)
+        question = text
+        if re.fullmatch(r"(look( at (this|that|it|my screen|the screen))?|take a look|have a look|see this|what('?s| is) on my screen|can you see (this|it|that|my screen))", t):
+            question = SCREEN_ONLY_LOOK
+        vlm = self.needs_vision(question, ocr)
+        screen = {"title": look.title, "app": look.app, "scope": look.scope, "text": ocr, "vlm": vlm,
+                  "image": screen_mod.picture_b64(look) if vlm else None}
+        print(f"   looking at: {look.app} \u2014 {look.title!r} ({len(ocr)} characters read, {'picture' if vlm else 'text'} mode)")
+        if vlm:
+            self.cancel.clear()
+            self._speaking_reported = False
+            self.speaking.set()
+            self.say("One moment, I'll take a closer look.")                 # the vision model takes a few seconds to wake up
+        try:
+            self._respond(question, screen)
+        except Exception as e:                                                # noqa: BLE001
+            print(f"   (looking failed: {e})")
+            self.event("error", message="Solu couldn't look at the screen. Is Ollama running?")
+        finally:
+            self._after_speaking()
 
     # ---- listening ----------------------------------------------------------------------------
     def is_echo(self, text):
@@ -421,8 +511,13 @@ class Solu:
         if re.search(r"\b(go to sleep|stop listening|turn yourself off|switch yourself off|sleep now|shut down)\b", t):
             self._after = lambda: self.event("setting", name="enabled", value=False)
             return "Okay, going to sleep. Switch me back on from the island."
-        if re.match(r"^(look|take a look|have a look|what is on my screen|what's on my screen|can you see my screen|look at)", t):
-            return "I can't look at your screen just yet, but I'm learning to."
+        if re.search(r"\bscreen help\b", t):                                 # "turn off screen help"
+            off = re.search(r"\b(off|disable|stop|without)\b", t)
+            on = re.search(r"\b(on|enable|start|with)\b", t)
+            if off or on:
+                self.screen_enabled = not off
+                self.event("setting", name="screen", value=self.screen_enabled)
+                return f"Screen help is {'on' if self.screen_enabled else 'off'}."
         if t in {"stop", "be quiet", "quiet", "shush", "enough", "stop talking", "okay stop", "hush"}:
             self.cancel.set()
             while not self.audio_out.empty():
@@ -568,6 +663,10 @@ class Solu:
                     print(f"you: {target}   (speech-to-text {stt_ms:.0f} ms)")
                     self.event("heard", text=target)
                     self.event("state", state="thinking")
+                    if self.is_screen_request(target):
+                        worker = threading.Thread(target=self.respond_screen, args=(target,), daemon=True)
+                        worker.start()
+                        continue
                     answer = self.try_command(target)
                     if answer is not None:                                    # a setting or control: Solu does it and says so
                         worker = threading.Thread(target=self.respond_text, args=(answer,) if answer else ("",), daemon=True)

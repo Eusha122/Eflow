@@ -71,13 +71,15 @@ public:
     void SetSolu(const SoluSnapshot& snapshot);
     void ShowForSolu();                          // the hotkey was pressed: open so the conversation is visible
     void SetSoluHandlers(std::function<void(bool)> enable, std::function<void()> talk, std::function<void(const std::wstring&)> voice,
-                         std::function<void(bool)> headphones, std::function<void()> stop, std::function<void(bool)> captions) {
+                         std::function<void(bool)> headphones, std::function<void()> stop, std::function<void(bool)> captions,
+                         std::function<void(bool)> screen) {
         soluEnable_ = std::move(enable);
         soluTalk_ = std::move(talk);
         soluVoice_ = std::move(voice);
         soluHeadphones_ = std::move(headphones);
         soluStop_ = std::move(stop);
         soluCaptions_ = std::move(captions);
+        soluScreen_ = std::move(screen);
     }
 #ifndef NDEBUG
     void DebugOpenTab(int section);              // scripted tests: open on a tab and keep it open (-1 releases)
@@ -163,7 +165,7 @@ private:
     void ToggleTest(int side);
     void StopRunningTest();
     int MenuRows(int side) const {
-        if (side == 3) return settingsPage_ == 1 ? 5 : 4;    // Settings: the options, or Solu's voices
+        if (side == 3) return 5;    // Settings: the options, or Solu's voices
         return std::max<int>(1, static_cast<int>(side == 2 ? camera_.devices.size() : VoiceSide(side).devices.size()));
     }
     int MaxRows(int side) const;                 // rows visible at once
@@ -260,7 +262,9 @@ private:
     AudioSnapshot audio_;
     CameraSnapshot camera_;
     SoluSnapshot solu_;
-    std::function<void(bool)> soluEnable_, soluHeadphones_, soluCaptions_;
+    std::function<void(bool)> soluEnable_, soluHeadphones_, soluCaptions_, soluScreen_;
+    Com<ID2D1Bitmap1> lookBitmap_;               // the picture of what Solu is looking at (rebuilt when a new one arrives)
+    const ImageBGRA* lookKey_ = nullptr;
     std::function<void()> soluTalk_, soluStop_;
     std::function<void(const std::wstring&)> soluVoice_;
     int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices

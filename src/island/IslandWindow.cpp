@@ -929,7 +929,10 @@ void IslandWindow::OnClick(int id) {
                 } else if (k == 2) {                               // headphones mode
                     solu_.headphones = !solu_.headphones;
                     if (soluHeadphones_) soluHeadphones_(solu_.headphones);
-                } else if (k == 3) {                               // Voice >
+                } else if (k == 3) {                               // screen help
+                    solu_.screen = !solu_.screen;
+                    if (soluScreen_) soluScreen_(solu_.screen);
+                } else if (k == 4) {                               // Voice >
                     settingsPage_ = 1;
                     voiceScroll_ = 0;
                     ApplyHeightTarget();
@@ -2212,10 +2215,38 @@ void IslandWindow::DrawSoluCaption(ID2D1DeviceContext* dc, D2D1_RECT_F base, flo
     }
 
     float y = r.top + 24;
+    float heardLeft = r.left;
+    if (solu_.lookImage && !solu_.lookImage->empty()) {              // what Solu looked at: always visible, so it is never a secret
+        if (lookKey_ != solu_.lookImage.get() || !lookBitmap_) {
+            lookKey_ = solu_.lookImage.get();
+            lookBitmap_.Reset();
+            const auto props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            dc_->CreateBitmap(D2D1::SizeU(solu_.lookImage->width, solu_.lookImage->height), solu_.lookImage->pixels.data(),
+                              solu_.lookImage->width * 4, &props, &lookBitmap_);
+        }
+        if (lookBitmap_) {
+            const float aspect = static_cast<float>(solu_.lookImage->width) / static_cast<float>(solu_.lookImage->height);
+            float w = 64.0f, h = w / aspect;
+            if (h > 40.0f) h = 40.0f, w = h * aspect;
+            const D2D1_RECT_F thumb = D2D1::RectF(r.left, y, r.left + w, y + h);
+            dc->DrawBitmap(lookBitmap_.Get(), thumb, 0.95f * a, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+            if (solu_.state == SoluState::Thinking) {                // a scanning line while it reads
+                const float p = 0.5f + 0.5f * std::sin(now * 4.0f);
+                brush_->SetColor(D2D1::ColorF(kAmber.r, kAmber.g, kAmber.b, 0.85f * a));
+                dc->DrawLine(D2D1::Point2F(thumb.left, thumb.top + p * h), D2D1::Point2F(thumb.right, thumb.top + p * h), brush_.Get(), 1.5f);
+            }
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.22f * a));
+            dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{thumb, 3, 3}, brush_.Get(), 1.0f);
+            heardLeft = thumb.right + 10;
+            DrawText(dc, (L"Looking at " + solu_.lookTitle).c_str(), quiet, D2D1::RectF(heardLeft, y, r.right, y + 15), WithAlpha(kTextDim, 1.15f * a));
+        }
+    }
     if (!solu_.heard.empty()) {                                      // what you said
-        DrawText(dc, solu_.heard.c_str(), heardFont, D2D1::RectF(r.left, y, r.right, y + 38), WithAlpha(kTextDim, 1.3f * a),
+        const float top = heardLeft > r.left ? y + 15 : y;
+        DrawText(dc, solu_.heard.c_str(), heardFont, D2D1::RectF(heardLeft, top, r.right, top + 38), WithAlpha(kTextDim, 1.3f * a),
                  DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        y += 40;
+        y += heardLeft > r.left ? 46 : 40;
     } else if (solu_.state == SoluState::Listening) {
         DrawText(dc, L"Say something…", gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left, y + 10, r.right, y + 34),
                  WithAlpha(kTextDim, 1.1f * a));
@@ -2288,6 +2319,8 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
             case 1: title = L"Live captions"; note = L"Show the conversation on the island"; isSwitch = true; on = solu_.captions; break;
             case 2: title = L"Headphones mode"; note = solu_.headphones ? L"You can talk over Solu" : L"Solu waits until it has finished talking";
                     isSwitch = true; on = solu_.headphones; break;
+            case 3: title = L"Screen help"; note = solu_.screen ? L"Say \u201cSolu, look at this\u201d \u00B7 only when you ask" : L"Solu will not look at your screen";
+                    isSwitch = true; on = solu_.screen; break;
             default: title = L"Voice"; note = voiceName + L" · " + voiceNote; chevron = true; break;
             }
         } else {

@@ -237,7 +237,7 @@ voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until t
   (**Ctrl+Alt+Space**, also a click on the conversation view); then it goes back to waiting for its name.
 * **Settings by voice.** Before anything goes to the language model, a sentence is checked against a small set of
   controls Solu handles itself: "turn on/off live captions", "headphones mode on/off", "use the tiny voice",
-  "go to sleep" (switches itself off), "stop", "bye", and "look at ..." (not available yet, it says so). It does the
+  "screen help on/off", "go to sleep" (switches itself off), "stop", "bye". It does the
   thing, says so, and reports a `setting` event so Eflow's menu follows.
 * **Live captions** is a setting. On: a conversation opens the island and shows the live view (what you said, the
   answer, the microphone). Off: the island stays closed and you just talk; the thin bar shows Solu is there.
@@ -251,8 +251,17 @@ voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until t
   thinks. It costs no frames while nothing is said.
 * **The cat.** `Mascot::SetTalk`: wide attentive eyes while listening, three pulsing dots while thinking, and while
   speaking the rhythmic bob with the mouth opening and closing with the voice level.
-* **Not in this version.** Looking at the screen, running tasks on the PC and memory (the vision model and Ollama tool
-  calling are tested but not wired in); a native C++ engine instead of Python.
+* **Screen help** (`solu/screen.py`). "Solu, what does this error mean?", "Solu, look at this", "explain this code": only
+  when asked, Solu captures the *foreground window* (`PrintWindow` with `PW_RENDERFULLCONTENT`, so nothing in front of
+  it leaks in; the desktop if no window is active or you say "my whole screen"), reads it with Windows' built-in OCR
+  (~0.5 s) and gives the text plus the window title to the brain (qwen3:8b, first word in ~3 s). Questions about pictures,
+  or windows with almost no text, use the vision model qwen3-vl:4b instead (it swaps in and out of the 8 GB GPU, so 15-30 s;
+  Solu says "One moment" first and reloads the brain afterwards). Nothing is stored: the capture lives for one question.
+  A `looking` event carries the window title and a 176 px thumbnail, which the conversation view shows ("Looking at ...",
+  with a scanning line while Solu reads) so it is never secret what was seen. Windows whose title or program contains
+  password / authenticator / key-vault words are refused. The **Screen help** switch in Settings (or "turn off screen help")
+  disables it; the helper then starts with `--no-screen`.
+* **Not in this version.** Running tasks on the PC and memory; a native C++ engine instead of Python.
 
 ## 9. Mascot pipeline
 

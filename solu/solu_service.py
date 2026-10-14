@@ -11,6 +11,7 @@ commands {"cmd": "talk"}        start a hands-free conversation (the microphone 
          {"cmd": "voice", "name": "cozy"}      change the voice (Solu says hello in it)
          {"cmd": "headphones", "on": true}     headphones: you can talk over Solu; speakers: it never hears itself
          {"cmd": "ask", "text": "..."}         answer a typed question (no microphone needed)
+         {"cmd": "screen", "on": true}         allow or forbid "look at this" (events: {"event": "looking", title, app, thumb})
          {"cmd": "quit"}
 The microphone is only ever open between "talk" and the end of the conversation.
 """
@@ -41,11 +42,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", default="cozy")
     ap.add_argument("--headphones", action="store_true")
+    ap.add_argument("--no-screen", action="store_true", help="Solu may not look at the screen")
     ap.add_argument("--idle", type=float, default=15.0, help="seconds of silence that end a conversation")
     opts = ap.parse_args()
 
     emit("state", state="loading")
-    args = argparse.Namespace(voice=opts.voice, lang="en", headphones=opts.headphones, endpoint=600, mic=None, wav=None, service=True)
+    args = argparse.Namespace(voice=opts.voice, lang="en", headphones=opts.headphones, endpoint=600, mic=None, wav=None, service=True, no_screen=opts.no_screen)
     solu = solu_chat.Solu(args)
     solu.event = emit
     solu.wake_mode = True                                     # wait for its name; a conversation starts when it hears it
@@ -101,9 +103,14 @@ def main():
                 threading.Thread(target=solu.respond_text, args=("Hi! This is my new voice.", False), daemon=True).start()
         elif name == "headphones":
             solu.half_duplex = not bool(cmd.get("on"))
+        elif name == "screen":
+            solu.screen_enabled = bool(cmd.get("on"))
         elif name == "ask" and cmd.get("text") and not solu.speaking.is_set():
             emit("heard", text=cmd["text"])
             emit("state", state="thinking")
+            if solu.is_screen_request(cmd["text"]):
+                threading.Thread(target=solu.respond_screen, args=(cmd["text"],), daemon=True).start()
+                continue
             answer = solu.try_command(cmd["text"])
             if answer is not None and answer:
                 threading.Thread(target=solu.respond_text, args=(answer,), daemon=True).start()

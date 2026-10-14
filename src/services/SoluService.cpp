@@ -21,6 +21,28 @@ const SoluVoice kSoluVoices[5] = {
 
 namespace {
 
+std::string Base64Decode(const std::string& in) {
+    std::string out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char ch : in) {
+        int v;
+        if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+        else if (ch == '+') v = 62;
+        else if (ch == '/') v = 63;
+        else continue;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 std::string ToUtf8(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
@@ -88,6 +110,7 @@ void SoluService::LoadSettings() {
     if (const json::Value* v = root.Find("enabled"); v && v->type == json::Value::Type::Bool) snapshot_.enabled = v->boolean;
     if (const json::Value* v = root.Find("headphones"); v && v->type == json::Value::Type::Bool) snapshot_.headphones = v->boolean;
     if (const json::Value* v = root.Find("captions"); v && v->type == json::Value::Type::Bool) snapshot_.captions = v->boolean;
+    if (const json::Value* v = root.Find("screen"); v && v->type == json::Value::Type::Bool) snapshot_.screen = v->boolean;
     if (const json::Value* v = root.Find("voice"); v && v->type == json::Value::Type::String) {
         const std::wstring id = FromUtf8(v->text);
         for (const SoluVoice& voice : kSoluVoices)
@@ -109,6 +132,10 @@ void SoluService::SaveSettings() const {
     captions.type = json::Value::Type::Bool;
     captions.boolean = snapshot_.captions;
     root.Member("captions") = captions;
+    json::Value screen;
+    screen.type = json::Value::Type::Bool;
+    screen.boolean = snapshot_.screen;
+    root.Member("screen") = screen;
     const std::wstring path = AppDataDir() + L"\\solu.json";
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (file) file << json::Write(root);
@@ -157,6 +184,7 @@ bool SoluService::Launch() {
         std::lock_guard lock(mutex_);
         voice = snapshot_.voice;
         headphones = snapshot_.headphones ? L" --headphones" : L"";
+        if (!snapshot_.screen) headphones += L" --no-screen";
     }
     std::wstring command = L"\"" + dir + L"\\venv\\Scripts\\python.exe\" -u solu_service.py --voice " + voice + headphones;
     SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
@@ -217,6 +245,7 @@ void SoluService::Kill() {
 }
 
 void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));   // the picture of what Solu looked at is decoded here
     std::string buffer;
     char chunk[4096];
     DWORD got = 0;
@@ -252,6 +281,8 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                 } else if (ev->text == "heard") {
                     if (const json::Value* t = root.Find("text")) {
                         snapshot_.heard = pendingHeard_ = FromUtf8(t->text);
+                        snapshot_.lookImage.reset();
+                        snapshot_.lookTitle.clear();
                         snapshot_.said.clear();
                         ++snapshot_.turn;
                     }
@@ -265,6 +296,17 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                             pendingHeard_.clear();
                         }
                     }
+                } else if (ev->text == "looking") {                       // Solu captured the window it is asked about
+                    const json::Value* title = root.Find("title");
+                    const json::Value* thumb = root.Find("thumb");
+                    snapshot_.lookTitle = title ? FromUtf8(title->text) : L"";
+                    snapshot_.lookImage.reset();
+                    if (thumb) {
+                        const std::string bytes = Base64Decode(thumb->text);
+                        auto image = std::make_shared<ImageBGRA>();
+                        if (DecodeImage(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), 1.0f, 256, *image)) snapshot_.lookImage = image;
+                    }
+                    ++snapshot_.turn;
                 } else if (ev->text == "mic") {
                     if (const json::Value* v = root.Find("v")) snapshot_.mic = static_cast<float>(atof(v->text.c_str()));
                     coalesce = true;
@@ -274,6 +316,7 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                     if (name && value) {
                         if (name->text == "captions") snapshot_.captions = value->boolean;
                         else if (name->text == "headphones") snapshot_.headphones = value->boolean;
+                        else if (name->text == "screen") snapshot_.screen = value->boolean;
                         else if (name->text == "voice") snapshot_.voice = FromUtf8(value->text);
                         else if (name->text == "enabled" && !value->boolean) snapshot_.sleepRequested = true;
                         SaveSettings();
@@ -317,6 +360,7 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
     }
     CloseHandle(readPipe);
     Changed(false);
+    if (com) CoUninitialize();
 }
 
 void SoluService::Send(const std::string& json) {
@@ -417,6 +461,16 @@ void SoluService::SetCaptions(bool on) {
         snapshot_.captions = on;
         SaveSettings();
     }
+    Changed(false);
+}
+
+void SoluService::SetScreen(bool on) {
+    {
+        std::lock_guard lock(mutex_);
+        snapshot_.screen = on;
+        SaveSettings();
+    }
+    Send(std::string("{\"cmd\":\"screen\",\"on\":") + (on ? "true" : "false") + "}");
     Changed(false);
 }
 

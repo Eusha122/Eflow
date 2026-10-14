@@ -2,10 +2,13 @@
 #include <windows.h>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "core/Image.h"
 
 namespace eflow {
 
@@ -31,6 +34,9 @@ struct SoluSnapshot {
     std::vector<SoluExchange> history;           // the last few exchanges, oldest first (the Solu AI tab)
     bool captions = true;                        // show the live conversation view (Solu can switch this by voice)
     float mic = 0;                               // how loudly somebody is talking right now, 0..1 (the thin bar reacts)
+    bool screen = true;                          // "Solu, look at this" is allowed (Solu can switch this by voice)
+    std::wstring lookTitle;                      // what Solu is looking at for the current question
+    std::shared_ptr<const ImageBGRA> lookImage;  // a small picture of it, shown so it is always clear what was seen
     bool sleepRequested = false;                 // "Solu, go to sleep": the app switches Solu off
     std::wstring error;                          // something the user should know ("Ollama is not running")
     float level = 0;                             // how loudly Solu is speaking right now, 0..1 (the cat's mouth)
@@ -56,6 +62,7 @@ public:
     void SetVoice(const std::wstring& id);
     void SetHeadphones(bool on);
     void SetCaptions(bool on);
+    void SetScreen(bool on);
     void Ask(const std::wstring& text);          // answers a typed question (tests / future text box)
     SoluSnapshot Snapshot();
 

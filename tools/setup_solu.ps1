@@ -26,5 +26,6 @@ if (-not $SkipOllama) {
     Write-Host '3/3  Language model (Ollama, about 5 GB)...'
     if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) { Write-Warning 'Install Ollama first: https://ollama.com'; exit 1 }
     ollama pull qwen3:8b
+    ollama pull qwen3-vl:4b      # screen help: questions about pictures (about 3 GB)
 }
-Write-Host 'Done. Switch Solu on from the gear button on the island (Whisper downloads itself the first time).'
+Write-Host 'Done. Switch Solu on in Settings (the gear on the island) (Whisper downloads itself the first time).'

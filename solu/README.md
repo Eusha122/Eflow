@@ -10,6 +10,11 @@ Eflow starts and stops Solu for you: switch **Solu AI** on in Settings (the gear
 **"Solu"** ("Solu, what's up?", "Hey Solu, turn on live captions"). **Ctrl+Alt+Space** also starts and ends a
 conversation.
 
+**Screen help.** "Solu, what does this error mean?" / "Solu, look at this" / "explain this code": Solu captures the window you are
+in (only then), reads its text with Windows OCR and answers; picture questions use the `qwen3-vl:4b` vision model (pull it with
+`ollama pull qwen3-vl:4b`; it takes 15-30 s because it swaps with the brain on an 8 GB GPU). Nothing is saved; password-manager windows are
+refused; "turn off screen help" or the Settings switch disables it.
+
 **Privacy.** While Solu is on, the microphone is open and each sentence is transcribed on your PC to spot the name
 "Solu". Sentences that are not for Solu are discarded at once: nothing is stored, nothing leaves the machine. Switch
 Solu off (or say "go to sleep") and the microphone closes.

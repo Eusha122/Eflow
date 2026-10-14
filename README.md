@@ -49,7 +49,11 @@ indicator on the thin bar shows Solu is awake and moves with the voices. Everyth
 what the microphone hears is transcribed locally to spot its name, and sentences that are not for Solu are thrown away.
 **Live captions** (a setting Solu can also change by voice) decides whether a conversation opens the island or you just
 talk. Using speakers? Solu waits until it has finished talking before it listens; wearing headphones? Switch on
-*Headphones mode* and you can talk over it. See `solu\README.md`.
+*Headphones mode* and you can talk over it.
+
+**Screen help:** say *"Solu, what does this error mean?"* or *"Solu, look at this"* and it looks at the window you are in, reads it
+and answers out loud, so you never need a screenshot. It only looks when you ask, shows a small picture of what it saw, stores nothing,
+refuses password-manager style windows, and can be switched off in Settings. See `solu\README.md`.
 
 ### Approving AI requests in the island
 
