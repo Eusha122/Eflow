@@ -14,6 +14,7 @@
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
+#include "services/SoluService.h"
 #include "services/SystemMonitor.h"
 
 namespace eflow {
@@ -39,6 +40,8 @@ private:
     void OnSystemChanged();
     void OnAudioChanged();
     void OnCameraChanged();
+    void OnSoluChanged();
+    void OnSoluHotkey();
     void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
@@ -65,6 +68,8 @@ private:
     std::unique_ptr<SystemMonitor> system_;
     std::unique_ptr<AudioDevices> audio_;
     std::unique_ptr<CameraService> camera_;
+    std::unique_ptr<SoluService> solu_;
+    bool hotkey_ = false;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
 };
 

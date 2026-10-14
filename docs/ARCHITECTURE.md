@@ -160,24 +160,6 @@ Windows offers no supported way to read CPU temperature or motherboard fan speed
 program; that takes a hardware driver and administrator rights, which Eflow deliberately does not
 include. When no sensor tool is running, those two readings say "Needs sensor app" instead of guessing.
 
-## 8. Messages tab
-
-Notifications from chat apps (matched by AppUserModelId / display name against `kChatApps`, currently
-`whatsapp`) are removed from the Notifications list and shown in their own **Messages** tab: avatar with
-the sender's initial, sender, time, up to three lines of the message. A new message opens the island on
-that tab by itself (5 s, then it closes again unless the pointer is on it).
-
-* **The panel resizes to the content.** `LayoutMessages` measures each message with DirectWrite, which
-  gives `TargetHeight()` (176 DIP up to 300 DIP); the height spring follows it in both directions, the
-  mascot rides the panel's bottom edge, and beyond 300 DIP the list scrolls (wheel, thin scrollbar). The
-  window itself is sized for the tallest panel, but its click-through region is only as tall as the panel
-  is (or is heading to), so the transparent part never blocks the desktop beneath.
-* **Replying is deliberately not offered.** Windows only lets an app *read* another app's notifications;
-  it cannot press their buttons or use their inline reply box. The remaining routes (unofficial
-  WhatsApp libraries, or driving WhatsApp's window with simulated typing) risk account bans or sending to
-  the wrong chat, so the action is *Open in WhatsApp* (launches/activates the app through its
-  AppUserModelId, after validating the id) and the notification is dismissed, like clicking a toast.
-
 ## 8b. Microphone, speaker and camera
 
 Not a tab: three round buttons (microphone, speaker, camera) sit at the right end of the tab row. Each has a connection light (green = the
@@ -195,10 +177,16 @@ the island folds it back. The wheel scrolls past four rows.
   buttons without polling. The peak level (`IAudioMeterInformation`) is sampled ~15 times a second, only
   while the island is open (refcounted `Watch`, like the System tab). Microphone levels only move while
   something (Solu) is capturing from that device; speaker levels follow whatever is playing.
-* **Picking a device never changes the Windows default.** The choice is written to
-  `%LOCALAPPDATA%\Eflowoice.json` (`{"input": {"id", "name"}, "output": {...}}`, empty = follow the system
-  default, written atomically) and Solu follows that file, re-reading it whenever it changes. A picked device
-  that is not plugged in keeps its last known name, and Solu falls back to the default meanwhile.
+* **Picking a device makes it the Windows default** (all three roles), so Spotify, Chrome, Discord... really
+  follow it; the checkmark is simply the device Windows is using, and the menu has no separate "Automatic"
+  entry. Windows has no public API for this; `AudioDevices` uses `IPolicyConfig::SetDefaultEndpoint`, the same
+  interface Windows' own Sound settings and every sound-switcher tool use (unchanged since Vista). The old
+  Solu-only choice in `voice.json` is therefore always empty ("follow the system default"). Unplugged devices
+  (e.g. a headphone jack with nothing in it) are not listed.
+* **Where is it playing?** The Music tab shows a chip (headphones / speakers / monitor / headset glyph and name)
+  with the output the playing app really uses. It is found from Windows' audio sessions: the output endpoint
+  that has an active stream from the media app (so a per-app output choice is respected), else the default
+  output. The glyph turns green while music plays there; clicking the chip opens the speaker menu.
 * **Status light = "can I use it right now?"** Grey (the normal look) means not available: the device is
   missing, or it is a phone-based device whose phone is not connected. Green means connected and ready. Amber
   means in use right now (a microphone with an active capture stream, a camera that an app has open); the
@@ -228,6 +216,43 @@ the island folds it back. The wheel scrolls past four rows.
   (Settings > Privacy > Camera): no app can open the camera until it is switched back. Read once a second
   while the island is open.
 * The tab strip is left-aligned and its padding adapts so five labels and the three buttons fit 600 DIP.
+
+## 8c. Solu, the voice assistant, inside the island
+
+Solu is a Python program (`solu/`: Whisper for hearing, a local Ollama model for thinking, Kokoro for the
+voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until the user switches it on.
+
+* **Process.** `services/SoluService` starts `solu/venv/Scripts/python.exe solu_service.py` with no window, inside
+  a job object (it dies with Eflow, even if Eflow crashes), and talks to it over its stdin/stdout, one JSON line
+  each way. Events: `state` (loading, ready, listening, thinking, speaking), `heard`, `said`, `level` (how loud Solu
+  is, for the cat's mouth), `mic` (how loud somebody is talking, for the thin bar), `setting` (Solu changed one of
+  its own settings by voice) and `error`. Commands: `talk`, `stop`, `voice`, `headphones`, `ask`, `quit`. Its log is
+  `%LOCALAPPDATA%\Eflow\solu.log`; the settings (on, voice, headphones, captions) are in `solu.json` there. If Solu was
+  on it wakes up with Eflow.
+* **No clicking: it listens for its name.** While Solu is on, the microphone is open and every spoken sentence is
+  transcribed locally (Whisper, nothing stored or sent anywhere). A sentence that does not address Solu is thrown
+  away. "Solu", "Hey Solu, ...", "..., Solu" (and the ways Whisper mishears the name: Salu, Zulu, so low...) start a
+  conversation and carry on with whatever followed the name: "Solu, what's up?" is answered at once, a bare "Solu"
+  is answered with "Yes?". A conversation ends by itself after 15 s of quiet, or with "bye" / the hotkey
+  (**Ctrl+Alt+Space**, also a click on the conversation view); then it goes back to waiting for its name.
+* **Settings by voice.** Before anything goes to the language model, a sentence is checked against a small set of
+  controls Solu handles itself: "turn on/off live captions", "headphones mode on/off", "use the tiny voice",
+  "go to sleep" (switches itself off), "stop", "bye", and "look at ..." (not available yet, it says so). It does the
+  thing, says so, and reports a `setting` event so Eflow's menu follows.
+* **Live captions** is a setting. On: a conversation opens the island and shows the live view (what you said, the
+  answer, the microphone). Off: the island stays closed and you just talk; the thin bar shows Solu is there.
+* **Speakers or headphones.** Speaker mode (default): Solu does not listen while it talks (plus a second after), and
+  it drops anything that is just its own words coming back through the microphone. Headphones mode: you can talk
+  over it.
+* **UI.** The **Solu AI** tab: status (with a dot on the tab label), what to say, and the last exchange. The **gear** is
+  general Settings (a menu that will grow): Solu AI on/off, Live captions, Headphones mode, Voice (a sub-page with the
+  five voices; picking one makes Solu say hello in it). The **thin bar** shows five tiny green dots while Solu is
+  awake and waiting, and they dance with the voice (yours, then Solu's); amber dots chase each other while it
+  thinks. It costs no frames while nothing is said.
+* **The cat.** `Mascot::SetTalk`: wide attentive eyes while listening, three pulsing dots while thinking, and while
+  speaking the rhythmic bob with the mouth opening and closing with the voice level.
+* **Not in this version.** Looking at the screen, running tasks on the PC and memory (the vision model and Ollama tool
+  calling are tested but not wired in); a native C++ engine instead of Python.
 
 ## 9. Mascot pipeline
 

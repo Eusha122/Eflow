@@ -1,0 +1,46 @@
+{
+  "cozy": {
+    "voices": {
+      "af_heart": 0.6,
+      "af_sky": 0.4
+    },
+    "pitch": 1.1,
+    "pace": 1.0,
+    "description": "Warm and gentle, like a purring friend"
+  },
+  "bubbly": {
+    "voices": {
+      "af_bella": 0.5,
+      "af_sky": 0.5
+    },
+    "pitch": 1.18,
+    "pace": 1.08,
+    "description": "Bright and excited, quick little voice"
+  },
+  "tiny": {
+    "voices": {
+      "af_nicole": 0.5,
+      "af_sarah": 0.5
+    },
+    "pitch": 1.28,
+    "pace": 1.05,
+    "description": "Small and squeaky-sweet, the cutest"
+  },
+  "calm": {
+    "voices": {
+      "bf_lily": 0.6,
+      "af_heart": 0.4
+    },
+    "pitch": 1.08,
+    "pace": 0.94,
+    "description": "Soft and unhurried, good for late evenings"
+  },
+  "natural": {
+    "voices": {
+      "af_heart": 1.0
+    },
+    "pitch": 1.0,
+    "pace": 1.0,
+    "description": "No pet effect, just the natural voice"
+  }
+}

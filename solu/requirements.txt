@@ -1,0 +1,10 @@
+# Solu's Python packages (tools/setup_solu.ps1 installs these into solu/venv)
+faster-whisper==1.2.1          # speech to text (Whisper)
+ctranslate2==4.8.3
+kokoro-onnx==0.6.1             # the voice
+onnxruntime==1.31.0            # runs the voice and the voice-activity detector on the CPU
+sounddevice==0.5.6             # microphone and speakers
+soundfile==0.14.0
+numpy==2.4.6
+nvidia-cublas-cu12==12.9.2.10  # CUDA libraries for Whisper on NVIDIA GPUs
+nvidia-cudnn-cu12==9.27.0.42

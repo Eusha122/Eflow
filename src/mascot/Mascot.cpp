@@ -82,6 +82,13 @@ void Mascot::SetPermissionPending(bool pending) {
     if (state_ != State::Notify && state_ != Resting()) Enter(Resting());
 }
 
+void Mascot::SetTalk(Talk talk) {
+    if (talk == talk_) return;
+    talk_ = talk;
+    mouthOpen_ = false;
+    if (state_ != State::Notify && state_ != Resting()) Enter(Resting());
+}
+
 void Mascot::Enter(State s) {
     state_ = s;
     stateTime_ = 0;
@@ -107,6 +114,12 @@ void Mascot::Update(float dt) {
     if (state_ == State::Notify && current_.clip >= 0 && current_.t >= asset_->clips[current_.clip].duration)
         Enter(Resting());
 
+    if (talk_ == Talk::Speaking) {                // mouth: open while loud, held a moment so it does not flicker
+        if (talkLevel_ > 0.13f) mouthHold_ = 0.09f;
+        mouthOpen_ = mouthHold_ > 0;
+        mouthHold_ -= dt;
+    }
+
     // Blinks (shown only with the neutral face): every few seconds, sometimes a quick double blink.
     if (blinkLeft_ > 0) {
         blinkLeft_ -= dt;
@@ -127,10 +140,14 @@ void Mascot::Update(float dt) {
 
 const char* Mascot::Face() const {
     switch (state_) {
-    case State::Music: return "happy";
+    case State::Music:
+        if (talk_ == Talk::Speaking) return mouthOpen_ ? "happy" : "neutral";    // talking: the mouth opens and closes
+        return "happy";
     case State::Notify: return "surprised";
     case State::Permission: return "wink";
-    default: return blinkLeft_ > 0 ? "blink" : "neutral";
+    default:
+        if (talk_ == Talk::Listening) return "surprised";                         // wide, attentive eyes
+        return blinkLeft_ > 0 ? "blink" : "neutral";
     }
 }
 

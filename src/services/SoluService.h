@@ -1,0 +1,83 @@
+#pragma once
+#include <windows.h>
+
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace eflow {
+
+enum class SoluState { Off, Missing, Loading, Ready, Listening, Thinking, Speaking };
+
+struct SoluVoice {
+    const wchar_t* id;                           // what the helper understands
+    const wchar_t* name;                         // shown in the menu
+    const wchar_t* description;
+};
+extern const SoluVoice kSoluVoices[5];
+
+struct SoluExchange {
+    std::wstring heard, said;
+};
+
+struct SoluSnapshot {
+    SoluState state = SoluState::Off;
+    bool enabled = false;                        // the user switched Solu on
+    std::wstring voice = L"cozy";
+    bool headphones = false;                     // headphones: you may talk over Solu; speakers: it never hears itself
+    std::wstring heard, said;                    // the last thing each side said
+    std::vector<SoluExchange> history;           // the last few exchanges, oldest first (the Solu AI tab)
+    bool captions = true;                        // show the live conversation view (Solu can switch this by voice)
+    float mic = 0;                               // how loudly somebody is talking right now, 0..1 (the thin bar reacts)
+    bool sleepRequested = false;                 // "Solu, go to sleep": the app switches Solu off
+    std::wstring error;                          // something the user should know ("Ollama is not running")
+    float level = 0;                             // how loudly Solu is speaking right now, 0..1 (the cat's mouth)
+    uint32_t turn = 0;                           // grows with every new heard/said line
+};
+
+// Runs Solu (the voice assistant) as a hidden helper process and talks to it over its stdin/stdout: one JSON
+// line each way. Solu is off until the user switches it on; then it loads its models (a few seconds to a
+// minute) and waits with the microphone CLOSED. The microphone opens only for a conversation the user starts
+// (hotkey / button) and closes when it ends. The helper lives in a job object, so it dies with Eflow.
+// Posts `message` to `notify` when the snapshot changes (level updates are coalesced).
+class SoluService {
+public:
+    SoluService(HWND notify, UINT message);
+    ~SoluService();
+    SoluService(const SoluService&) = delete;
+    SoluService& operator=(const SoluService&) = delete;
+
+    void Start();                                // reads the saved settings; starts Solu if it was on
+    void Enable(bool on);
+    void Talk();                                 // starts a conversation, or ends the running one; starts Solu first if needed
+    void StopSpeaking();
+    void SetVoice(const std::wstring& id);
+    void SetHeadphones(bool on);
+    void SetCaptions(bool on);
+    void Ask(const std::wstring& text);          // answers a typed question (tests / future text box)
+    SoluSnapshot Snapshot();
+
+private:
+    bool Launch();
+    void ReaderLoop(HANDLE process, HANDLE readPipe);
+    void Send(const std::string& json);
+    void Kill();
+    void LoadSettings();
+    void SaveSettings() const;
+    void Changed(bool coalesce);
+    std::wstring FindDir() const;
+
+    HWND notify_;
+    UINT message_;
+    std::mutex mutex_;
+    SoluSnapshot snapshot_;
+    HANDLE process_ = nullptr, writePipe_ = nullptr, job_ = nullptr;
+    std::thread reader_;
+    bool talkWhenReady_ = false;
+    std::wstring pendingHeard_;
+    std::atomic<bool> posted_{false};
+};
+
+} // namespace eflow

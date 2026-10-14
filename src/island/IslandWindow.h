@@ -15,6 +15,7 @@
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
+#include "services/SoluService.h"
 #include "services/SystemMonitor.h"
 
 namespace eflow {
@@ -30,7 +31,7 @@ inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 // inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
-    enum class Section { Music, Notifications, Messages, Ai, System };
+    enum class Section { Music, Notifications, Solu, Ai, System };
 
     // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
     // may be null, in which case the island runs without the mascot.
@@ -67,13 +68,22 @@ public:
         audioTestHandler_ = std::move(test);
     }
     void SetCamera(const CameraSnapshot& snapshot);
+    void SetSolu(const SoluSnapshot& snapshot);
+    void ShowForSolu();                          // the hotkey was pressed: open so the conversation is visible
+    void SetSoluHandlers(std::function<void(bool)> enable, std::function<void()> talk, std::function<void(const std::wstring&)> voice,
+                         std::function<void(bool)> headphones, std::function<void()> stop, std::function<void(bool)> captions) {
+        soluEnable_ = std::move(enable);
+        soluTalk_ = std::move(talk);
+        soluVoice_ = std::move(voice);
+        soluHeadphones_ = std::move(headphones);
+        soluStop_ = std::move(stop);
+        soluCaptions_ = std::move(captions);
+    }
 #ifndef NDEBUG
     void DebugOpenTab(int section);              // scripted tests: open on a tab and keep it open (-1 releases)
 #endif
     // Called with true while the System tab is on screen (so the monitor samples), false otherwise.
     void SetSystemWatchHandler(std::function<void(bool)> handler) { systemWatchHandler_ = std::move(handler); }
-    // Opens the app a chat message came from (by AppUserModelId).
-    void SetOpenAppHandler(std::function<void(const std::wstring&)> handler) { openAppHandler_ = std::move(handler); }
     void SetPermissions(const std::vector<PermissionRequest>& pending);
     void SetPermissionHandler(std::function<void(uint64_t, PermissionDecision)> handler) {
         permissionHandler_ = std::move(handler);
@@ -115,6 +125,14 @@ private:
     void DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float alpha);
     void DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     std::array<D2D1_POINT_2F, 3> ControlCenters(const D2D1_RECT_F& island) const;   // previous, play/pause, next
+    std::array<D2D1_POINT_2F, 2> ExtraControlCenters(const D2D1_RECT_F& island) const;   // shuffle, repeat
+    struct OutputInfo {                          // where the playing app's sound comes out
+        bool valid = false, playingHere = false;
+        const wchar_t* glyph = L"\uE7F5";
+        std::wstring label;
+    };
+    OutputInfo MediaOutput() const;
+    D2D1_RECT_F OutputChipRect(const D2D1_RECT_F& base, const OutputInfo& out) const;
     void DrawNotifications(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     D2D1_RECT_F NotificationList(const D2D1_RECT_F& island) const;                 // clip rect of the rows
     D2D1_RECT_F NotificationRow(const D2D1_RECT_F& island, size_t index) const;    // row `index` at the current scroll
@@ -133,8 +151,10 @@ private:
         int shown = 0, total = 0;                // rows visible / devices + "Automatic"
     };
     D2D1_RECT_F AudioButton(const D2D1_RECT_F& island, int side) const;   // side 0 = microphone, 1 = speaker, 2 = camera
-    bool SideValid(int side) const { return side == 2 ? camera_.valid : audio_.valid; }
-    bool SideMuted(int side) const { return side == 0 ? audio_.input.muted : side == 1 ? audio_.output.muted : camera_.blocked; }
+    bool SideValid(int side) const { return side == 2 ? camera_.valid : side == 3 ? true : audio_.valid; }
+    bool SideMuted(int side) const {             // for Solu "muted" means switched off
+        return side == 0 ? audio_.input.muted : side == 1 ? audio_.output.muted : side == 2 ? camera_.blocked : !solu_.enabled;
+    }
     enum class Dot { Unavailable, Ready, InUse };   // grey: not available / green: connected and ready / amber: in use now
     Dot SideDot(int side) const;
     std::wstring SideInUse(int side) const;      // "Discord, Chrome"
@@ -142,7 +162,19 @@ private:
     D2D1_RECT_F TestPill(const PopoverLayout& g, int side) const;
     void ToggleTest(int side);
     void StopRunningTest();
-    int MenuRows(int side) const { return side == 2 ? std::max<int>(1, static_cast<int>(camera_.devices.size())) : static_cast<int>(VoiceSide(side).devices.size()) + 1; }
+    int MenuRows(int side) const {
+        if (side == 3) return settingsPage_ == 1 ? 5 : 4;    // Settings: the options, or Solu's voices
+        return std::max<int>(1, static_cast<int>(side == 2 ? camera_.devices.size() : VoiceSide(side).devices.size()));
+    }
+    int MaxRows(int side) const;                 // rows visible at once
+    bool SoluActive() const;                     // a conversation is on: listening, thinking or speaking
+    D2D1_RECT_F SoluCaptionRect(const D2D1_RECT_F& base) const;
+    void DrawSoluCaption(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    void DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);               // the Solu AI tab
+    void DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout& g, float a);      // the gear's menu
+    void DrawSoluBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& bar, float alpha);       // the living indicator on the thin bar
+    bool SoluAwake() const { return solu_.state == SoluState::Ready || SoluActive(); }
+    bool CaptionsShown() const { return solu_.captions && SoluActive(); }                 // the live conversation view
     void ToggleMute(int side);                   // mute the mic / speaker, or block the camera
     D2D1_RECT_F MuteSwitch(const PopoverLayout& g) const;
     PopoverLayout PopoverGeometry(const D2D1_RECT_F& island) const;   // the menu area inside the island
@@ -153,10 +185,6 @@ private:
     void UpdateAudioWatch();
     void OpenPopover(int side);                  // -1 closes
     bool InsideZone(D2D1_POINT_2F p, float slack) const;   // the island, with a little slack
-    void DrawMessages(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
-    D2D1_RECT_F MessageViewport(const D2D1_RECT_F& panel) const;
-    D2D1_RECT_F MessageRow(const D2D1_RECT_F& panel, size_t index) const;
-    void LayoutMessages();                       // wrapped heights -> row sizes -> how tall the panel wants to be
     float TargetHeight() const;                  // panel height the current tab wants
     void ApplyHeightTarget();                    // spring to it (and resize the clickable area)
     void DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
@@ -218,6 +246,7 @@ private:
     Com<ID2D1Bitmap1> artwork_;
     uint64_t artworkId_ = 0;
     std::array<float, 3> controlHover_{};        // previous, play/pause, next
+    std::array<float, 3> extraHover_{};          // shuffle, repeat, the output chip
 
     NotificationSnapshot notifications_;
     std::function<void(uint32_t)> dismissHandler_;
@@ -228,18 +257,17 @@ private:
     float notifClearHover_ = 0;
     void OnWheel(int delta);
 
-    // Chat messages (WhatsApp...) are split off the notification list into their own tab.
-    std::vector<NotificationItem> messages_;
-    std::vector<float> msgRowHeight_, msgRowTop_;
-    std::vector<int> msgLines_;
-    float msgLineHeight_ = 16.0f, msgContentHeight_ = 0;
-    float msgScroll_ = 0, msgScrollTarget_ = 0;
-    std::unordered_map<uint32_t, float> msgHover_, msgCloseHover_;
-    std::function<void(const std::wstring&)> openAppHandler_;
-    bool latestIsMessage_ = false;               // the newest arrival was a chat message
-
     AudioSnapshot audio_;
     CameraSnapshot camera_;
+    SoluSnapshot solu_;
+    std::function<void(bool)> soluEnable_, soluHeadphones_, soluCaptions_;
+    std::function<void()> soluTalk_, soluStop_;
+    std::function<void(const std::wstring&)> soluVoice_;
+    int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices
+    float barLevel_ = 0, micImpulse_ = 0;        // the thin bar's voice meter and the last burst of the microphone
+    float captionT_ = 0;                         // the live conversation view fades in over the tab content
+    bool soluWake_ = false;                      // the island opened for Solu: stay open until it is awake
+    std::array<float, 24> soluBars_{};           // recent microphone levels while Solu listens
     std::function<void(int, bool)> muteHandler_;
     std::function<void(bool, bool)> audioTestHandler_;
     std::array<float, 32> testBars_{};           // recent levels of a running test, newest last
@@ -252,7 +280,7 @@ private:
     int popoverSide_ = -1;                       // the side still being drawn while the menu fades out
     float popoverT_ = 0;                         // 0 closed .. 1 open
     int voiceScroll_ = 0;                        // first visible row of the open menu
-    std::array<float, 3> audioHover_{}, audioOpen_{}, voiceLevel_{}, muteAnim_{1, 1, 1};
+    std::array<float, 4> audioHover_{}, audioOpen_{}, voiceLevel_{}, muteAnim_{1, 1, 1, 1};
     std::array<float, 6> popRowHover_{};
     float popFooterHover_ = 0;
 

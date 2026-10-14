@@ -12,12 +12,10 @@ companion that reacts to what is happening.
 > done, and so are AI permission requests from Claude Code and Codex, the Windows notification list and
 > the System tab (CPU, GPU, memory and network rings; click or scroll a ring for its next reading).
 
-### The Messages tab
+### The Music tab
 
-WhatsApp message notifications get their own tab (sender, text, time). It grows and shrinks to fit what
-is there. Windows does not allow one app to type into another app's notification, so there is no reply
-box; each message has **Open in WhatsApp** instead. To route another chat app there, add its name to
-`kChatApps` in `src/island/IslandWindow.cpp`.
+Shuffle and repeat buttons flank the transport controls (green when on). A chip under the title shows where the
+sound comes out (headphones, speakers, monitor...); click it to switch.
 
 ### The System tab
 
@@ -40,6 +38,18 @@ unmute it without opening the menu. Picking a microphone or speaker does not cha
 the choice is saved in `%LOCALAPPDATA%\Eflow\voice.json` for the voice assistant to follow. Windows cannot
 mute a webcam from a normal program, so the camera switch turns off Windows' own camera privacy setting
 (Settings > Privacy > Camera) for your user; turn it back on from the same switch.
+
+### Solu, your voice assistant
+
+Run `tools\setup_solu.ps1` once, then switch **Solu AI** on in Settings (the gear). From then on just say
+**"Solu"**: "Solu, what's up?", "Hey Solu, turn on live captions", "Solu, use the tiny voice". It carries on from what you
+said; Ctrl+Alt+Space also starts and ends a conversation. It hears you with Whisper, thinks with a local model through
+Ollama and answers in a pet voice you choose; the cat on the island listens, thinks and talks with it. A small
+indicator on the thin bar shows Solu is awake and moves with the voices. Everything runs on your PC: while Solu is on,
+what the microphone hears is transcribed locally to spot its name, and sentences that are not for Solu are thrown away.
+**Live captions** (a setting Solu can also change by voice) decides whether a conversation opens the island or you just
+talk. Using speakers? Solu waits until it has finished talking before it listens; wearing headphones? Switch on
+*Headphones mode* and you can talk over it. See `solu\README.md`.
 
 ### Approving AI requests in the island
 

@@ -43,6 +43,7 @@ add_executable(eflow WIN32
     src/services/MediaService.cpp
     src/services/NotificationService.cpp
     src/services/PermissionServer.cpp
+    src/services/SoluService.cpp
     src/services/SystemMonitor.cpp
     src/app.manifest
     ${SHADER_OUT}/mascot_vs.h

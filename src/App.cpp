@@ -23,6 +23,7 @@ constexpr UINT kMenuQuit = 2;
 constexpr UINT kMenuConnectClaude = 3;
 constexpr UINT kMenuConnectCodex = 4;
 constexpr UINT kMenuMascotFirst = 10;           // Mascot test submenu: Idle, Music, Notification, AI request
+constexpr int kSoluHotkeyId = 1;                  // Ctrl+Alt+Space: start / end a conversation with Solu
 constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
 std::wstring ExePath() {
@@ -74,6 +75,10 @@ int App::Run() {
     audio_->Start();
     camera_ = std::make_unique<CameraService>(msgWnd_, WM_APP_CAMERA);
     camera_->Start();
+    solu_ = std::make_unique<SoluService>(msgWnd_, WM_APP_SOLU);
+    solu_->Start();                         // starts Solu again if it was switched on last time
+    hotkey_ = RegisterHotKey(msgWnd_, kSoluHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE) != FALSE;
+    if (!hotkey_) Log("Ctrl+Alt+Space is taken by another program; Solu can still be started from the island");
     BuildIslands();
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
@@ -102,6 +107,8 @@ int App::Run() {
     }
 
     system_.reset();
+    if (hotkey_) UnregisterHotKey(msgWnd_, kSoluHotkeyId);
+    solu_.reset();                           // stops the Solu helper
     audio_.reset();
     camera_.reset();
     notifications_.reset();
@@ -155,10 +162,10 @@ void App::OnMediaChanged() {
     if (!media_) return;
     const MediaInfo info = media_->Snapshot();
 #ifndef NDEBUG   // track titles are personal: only debug builds log them
-    Log("media: session=%d playing=%d app=%ls title=\"%ls\" artist=\"%ls\" pos=%.0f/%.0fs art=%ux%u controls=%d%d%d seek=%d",
+    Log("media: session=%d playing=%d app=%ls title=\"%ls\" artist=\"%ls\" pos=%.0f/%.0fs art=%ux%u controls=%d%d%d seek=%d shuffle=%d/%d repeat=%d/%d",
         info.hasSession, info.playing, info.sourceApp.c_str(), info.title.c_str(), info.artist.c_str(),
         info.PositionNow(), info.duration, info.artwork ? info.artwork->width : 0, info.artwork ? info.artwork->height : 0,
-        info.canPrevious, info.canToggle, info.canNext, info.canSeek);
+        info.canPrevious, info.canToggle, info.canNext, info.canSeek, info.canShuffle, info.shuffleOn, info.canRepeat, info.repeat);
 #endif
     for (auto& island : islands_) {
         island->SetMedia(info);
@@ -176,6 +183,24 @@ void App::OnSystemChanged() {
     if (!system_) return;
     const SystemSnapshot snapshot = system_->Snapshot();
     for (auto& island : islands_) island->SetSystem(snapshot);
+}
+
+void App::OnSoluChanged() {
+    if (!solu_) return;
+    const SoluSnapshot snapshot = solu_->Snapshot();
+    for (auto& island : islands_) island->SetSolu(snapshot);
+    if (snapshot.sleepRequested) solu_->Enable(false);               // "Solu, go to sleep"
+}
+
+void App::OnSoluHotkey() {
+    if (!solu_) return;
+    // Open the island where the pointer is, so the user sees the conversation start.
+    POINT pt;
+    GetCursorPos(&pt);
+    const HMONITOR here = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    for (auto& island : islands_)
+        if (island->monitor() == here || islands_.size() == 1) island->ShowForSolu();
+    solu_->Talk();
 }
 
 void App::OnCameraChanged() {
@@ -238,13 +263,6 @@ void App::BuildIslands() {
         auto island = std::make_unique<IslandWindow>(gfx_, m, msgWnd_, mascotReady_ ? mascotAsset_ : nullptr,
                                                      mascotReady_ ? &mascotRenderer_ : nullptr);
         if (!island->Create()) continue;
-        island->SetOpenAppHandler([](const std::wstring& appId) {
-            // Only plausible AppUserModelIds (letters, digits and . _ ! - ), so nothing odd reaches the shell.
-            if (appId.empty() || appId.size() > 200) return;
-            for (wchar_t c : appId)
-                if (!(iswalnum(c) || c == L'.' || c == L'_' || c == L'!' || c == L'-')) return;
-            ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + appId).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        });
         island->SetSystemWatchHandler([this](bool watching) {
             if (system_) system_->Watch(watching ? +1 : -1);
         });
@@ -256,8 +274,10 @@ void App::BuildIslands() {
             [this](bool input, const std::wstring& id) {
                 if (audio_) audio_->Select(input, id);
             },
-            [this](int side, bool muted) {                      // 0 microphone, 1 speaker, 2 camera (privacy switch)
-                if (side == 2) {
+            [this](int side, bool muted) {                      // 0 microphone, 1 speaker, 2 camera (privacy switch), 3 Solu (off = muted)
+                if (side == 3) {
+                    if (solu_) solu_->Enable(!muted);
+                } else if (side == 2) {
                     if (camera_) camera_->SetBlocked(muted);
                 } else if (audio_) {
                     audio_->SetMute(side == 0, muted);
@@ -268,6 +288,13 @@ void App::BuildIslands() {
                 if (start) audio_->StartTest(input);
                 else audio_->StopTest();
             });
+        island->SetSoluHandlers(
+            [this](bool on) { if (solu_) solu_->Enable(on); },
+            [this] { OnSoluHotkey(); },
+            [this](const std::wstring& voice) { if (solu_) solu_->SetVoice(voice); },
+            [this](bool headphones) { if (solu_) solu_->SetHeadphones(headphones); },
+            [this] { if (solu_) solu_->StopSpeaking(); },
+            [this](bool captions) { if (solu_) solu_->SetCaptions(captions); });
         island->SetMediaHandler([this](MediaCommand cmd, double seconds) {
             if (media_) media_->Send(cmd, seconds);
         });
@@ -295,6 +322,7 @@ void App::RebuildGraphics() {
     OnMediaChanged();                        // fresh islands start with the current track
     OnAudioChanged();
     OnCameraChanged();
+    OnSoluChanged();
     OnPermissionsChanged();
     OnNotificationsChanged();
     UpdateFullscreenState();
@@ -449,6 +477,26 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_CAMERA:
         OnCameraChanged();
         return 0;
+    case WM_APP_SOLU:
+        OnSoluChanged();
+        return 0;
+    case WM_HOTKEY:
+        if (wp == kSoluHotkeyId) OnSoluHotkey();
+        return 0;
+#ifndef NDEBUG
+    case WM_APP_DEBUG_SOLU:                  // scripted tests: 1 on, 0 off, 2 talk, 3 ask, 4 stop
+        if (solu_) {
+            if (wp == 1) solu_->Enable(true);
+            else if (wp == 0) solu_->Enable(false);
+            else if (wp == 2) OnSoluHotkey();
+            else if (wp == 3) solu_->Ask(L"Hey Solu, tell me something cheerful in two short sentences.");
+            else if (wp == 4) solu_->StopSpeaking();
+            else if (wp == 5) solu_->Ask(L"Turn off the live captions");
+            else if (wp == 6) solu_->Ask(L"Turn on the live captions");
+            else if (wp == 7) solu_->Ask(L"Use the tiny voice");
+        }
+        return 0;
+#endif
     case WM_APP_PERMISSION:
         OnPermissionsChanged();
         return 0;

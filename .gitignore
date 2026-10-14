@@ -14,6 +14,12 @@ CMakeUserPresets.json
 __pycache__/
 *.py[cod]
 
+# Solu (the voice assistant): the source is tracked; its Python environment, models and scratch files are not
+/solu/venv/
+/solu/models/
+/solu/dev/
+/solu/*.log
+
 # Blender backups
 *.blend1
 

@@ -15,6 +15,7 @@ namespace eflow {
 class Mascot {
 public:
     enum class State { Idle, Music, Notify, Permission };
+    enum class Talk { None, Listening, Thinking, Speaking };   // Solu, the voice assistant
 
     explicit Mascot(std::shared_ptr<const MascotAsset> asset);
 
@@ -24,6 +25,11 @@ public:
     void SetAmbient(State ambient);              // Idle or Music
     void Notify();                               // one-shot reaction; also bumps the badge
     void SetPermissionPending(bool pending);
+    // A conversation with Solu sits between the permission request and the ambient mood: attentive eyes while
+    // listening, a thoughtful look while thinking, and while speaking the cat bobs and its mouth follows `level`.
+    void SetTalk(Talk talk);
+    void SetTalkLevel(float level) { talkLevel_ = level; }
+    Talk talk() const { return talk_; }
     State state() const { return state_; }       // what is showing right now
     State baseState() const { return base_; }    // the ambient mood underneath
     bool permissionPending() const { return permission_; }
@@ -47,7 +53,10 @@ private:
         float t = 0;
     };
     void Enter(State s);                 // unconditional transition with cross-fade
-    State Resting() const { return permission_ ? State::Permission : base_; }   // where to settle after a reaction
+    State Resting() const {                                                    // where to settle after a reaction
+        if (permission_) return State::Permission;
+        return talk_ == Talk::Speaking ? State::Music : base_;                 // the music clip is the cat's rhythmic bob
+    }
     void Sample(const Playback& p, std::vector<MascotAsset::TRS>& pose) const;
     int ClipFor(State s) const;
 
@@ -61,6 +70,9 @@ private:
     float nextBlink_ = 3.0f, blinkLeft_ = 0;
     bool secondBlink_ = false;
     int badge_ = 0;
+    Talk talk_ = Talk::None;
+    float talkLevel_ = 0, mouthHold_ = 0;
+    bool mouthOpen_ = false;
     std::mt19937 rng_{std::random_device{}()};
 };
 
