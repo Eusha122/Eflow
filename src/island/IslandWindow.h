@@ -10,6 +10,8 @@
 #include "core/Gfx.h"
 #include "island/Spring.h"
 #include "mascot/Mascot.h"
+#include "services/AudioDevices.h"
+#include "services/CameraService.h"
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
@@ -47,13 +49,24 @@ public:
     void OnNotification();                       // opens briefly on the Notifications tab
     void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
     void SetMedia(const MediaInfo& media);
-    void SetMediaHandler(std::function<void(MediaCommand)> handler) { mediaHandler_ = std::move(handler); }
+    void SetMediaHandler(std::function<void(MediaCommand, double)> handler) { mediaHandler_ = std::move(handler); }
     void SetNotifications(const NotificationSnapshot& snapshot);
     void SetNotificationHandlers(std::function<void(uint32_t)> dismiss, std::function<void()> clearAll) {
         dismissHandler_ = std::move(dismiss);
         clearAllHandler_ = std::move(clearAll);
     }
     void SetSystem(const SystemSnapshot& snapshot);
+    void SetAudio(const AudioSnapshot& snapshot);
+    // `watch(true)` while the island is open (live levels on the buttons); `select(isInput, id)` when the user picks a
+    // device (empty id = follow the system default).
+    void SetAudioHandlers(std::function<void(bool)> watch, std::function<void(bool, const std::wstring&)> select,
+                          std::function<void(int, bool)> mute, std::function<void(bool, bool)> test) {
+        audioWatchHandler_ = std::move(watch);
+        audioSelectHandler_ = std::move(select);
+        muteHandler_ = std::move(mute);
+        audioTestHandler_ = std::move(test);
+    }
+    void SetCamera(const CameraSnapshot& snapshot);
 #ifndef NDEBUG
     void DebugOpenTab(int section);              // scripted tests: open on a tab and keep it open (-1 releases)
 #endif
@@ -113,6 +126,33 @@ private:
     D2D1_RECT_F RingCell(const D2D1_RECT_F& panel, int index) const;
     void CyclePage(int metric, int direction);
     void UpdateSystemWatch();                    // start/stop sampling to match what is on screen
+    // Microphone / speaker: two round buttons on the tab row; each makes the island grow to show a device menu.
+    struct PopoverLayout {
+        D2D1_RECT_F card{}, footer{};            // the menu, and its last row
+        float rowsTop = 0;                       // first device row
+        int shown = 0, total = 0;                // rows visible / devices + "Automatic"
+    };
+    D2D1_RECT_F AudioButton(const D2D1_RECT_F& island, int side) const;   // side 0 = microphone, 1 = speaker, 2 = camera
+    bool SideValid(int side) const { return side == 2 ? camera_.valid : audio_.valid; }
+    bool SideMuted(int side) const { return side == 0 ? audio_.input.muted : side == 1 ? audio_.output.muted : camera_.blocked; }
+    enum class Dot { Unavailable, Ready, InUse };   // grey: not available / green: connected and ready / amber: in use now
+    Dot SideDot(int side) const;
+    std::wstring SideInUse(int side) const;      // "Discord, Chrome"
+    std::wstring SideHint(int side) const;       // why it is not available
+    D2D1_RECT_F TestPill(const PopoverLayout& g, int side) const;
+    void ToggleTest(int side);
+    void StopRunningTest();
+    int MenuRows(int side) const { return side == 2 ? std::max<int>(1, static_cast<int>(camera_.devices.size())) : static_cast<int>(VoiceSide(side).devices.size()) + 1; }
+    void ToggleMute(int side);                   // mute the mic / speaker, or block the camera
+    D2D1_RECT_F MuteSwitch(const PopoverLayout& g) const;
+    PopoverLayout PopoverGeometry(const D2D1_RECT_F& island) const;   // the menu area inside the island
+    float MenuHeight(int side) const;                                 // island height that fits that menu
+    const AudioSide& VoiceSide(int side) const { return side == 0 ? audio_.input : audio_.output; }
+    void DrawAudioButtons(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    void DrawAudioPopover(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    void UpdateAudioWatch();
+    void OpenPopover(int side);                  // -1 closes
+    bool InsideZone(D2D1_POINT_2F p, float slack) const;   // the island, with a little slack
     void DrawMessages(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     D2D1_RECT_F MessageViewport(const D2D1_RECT_F& panel) const;
     D2D1_RECT_F MessageRow(const D2D1_RECT_F& panel, size_t index) const;
@@ -169,7 +209,12 @@ private:
     Section section_ = Section::Music;
 
     MediaInfo media_;
-    std::function<void(MediaCommand)> mediaHandler_;
+    std::function<void(MediaCommand, double)> mediaHandler_;
+    bool seeking_ = false;                       // the progress bar is being dragged
+    float seekFraction_ = 0, seekHover_ = 0;
+    struct SeekBar { float x0, x1, y; };
+    SeekBar SeekGeometry(const D2D1_RECT_F& panel) const;
+    float SeekFractionAt(float x, const D2D1_RECT_F& panel) const;
     Com<ID2D1Bitmap1> artwork_;
     uint64_t artworkId_ = 0;
     std::array<float, 3> controlHover_{};        // previous, play/pause, next
@@ -192,6 +237,24 @@ private:
     std::unordered_map<uint32_t, float> msgHover_, msgCloseHover_;
     std::function<void(const std::wstring&)> openAppHandler_;
     bool latestIsMessage_ = false;               // the newest arrival was a chat message
+
+    AudioSnapshot audio_;
+    CameraSnapshot camera_;
+    std::function<void(int, bool)> muteHandler_;
+    std::function<void(bool, bool)> audioTestHandler_;
+    std::array<float, 32> testBars_{};           // recent levels of a running test, newest last
+    float testHover_ = 0;
+    ULONGLONG lastTestDone_ = 0;
+    std::function<void(bool)> audioWatchHandler_;
+    std::function<void(bool, const std::wstring&)> audioSelectHandler_;
+    bool audioWatching_ = false;
+    int popover_ = -1;                           // which button's menu is open (-1 none)
+    int popoverSide_ = -1;                       // the side still being drawn while the menu fades out
+    float popoverT_ = 0;                         // 0 closed .. 1 open
+    int voiceScroll_ = 0;                        // first visible row of the open menu
+    std::array<float, 3> audioHover_{}, audioOpen_{}, voiceLevel_{}, muteAnim_{1, 1, 1};
+    std::array<float, 6> popRowHover_{};
+    float popFooterHover_ = 0;
 
     SystemSnapshot system_;
     std::function<void(bool)> systemWatchHandler_;

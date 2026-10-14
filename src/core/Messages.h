@@ -14,5 +14,7 @@ constexpr UINT WM_APP_PERMISSION = WM_APP + 7;   // permission server -> app: th
 constexpr UINT WM_APP_NOTIFICATION = WM_APP + 8; // notification service -> app: a new snapshot is available
 constexpr UINT WM_APP_SYSTEM = WM_APP + 9;       // system monitor -> app: a new sample is available
 constexpr UINT WM_APP_DEBUG_TAB = WM_APP + 10;   // debug builds only: wParam = section to open and pin (-1 = release)
+constexpr UINT WM_APP_AUDIO = WM_APP + 11;       // audio devices -> app: the device list or a level changed
+constexpr UINT WM_APP_CAMERA = WM_APP + 12;      // camera service -> app: cameras, who uses them, or the privacy switch changed
 
 } // namespace eflow

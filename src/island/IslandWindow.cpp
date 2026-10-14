@@ -1,6 +1,7 @@
 #include "island/IslandWindow.h"
 
 #include <d2d1effects.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
 #include <windowsx.h>
 
@@ -21,7 +22,7 @@ constexpr float kTopInset = 6.0f;          // gap between the screen edge and th
 constexpr float kMargin = 26.0f;           // room around the island for the shadow and spring overshoot
 constexpr float kCollapsedW = 196.0f;
 constexpr float kCollapsedH = 7.0f;
-constexpr float kExpandedW = 560.0f;
+constexpr float kExpandedW = 600.0f;
 constexpr float kExpandedH = 176.0f;
 constexpr float kMaxRadius = 24.0f;
 constexpr float kHotSlackX = 14.0f;        // extra hover area around the idle bar
@@ -61,6 +62,7 @@ constexpr D2D1_COLOR_F kText = Rgba(0.96f, 0.96f, 0.98f, 1.0f);
 constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
+constexpr int kHitSeek = 13;                                // the progress bar (click or drag to seek)
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
 constexpr int kHitRing = 40;                                 // + metric index (System tab)
 constexpr int kHitMsgOpen = 200;                            // + message index: its row (opens the chat app)
@@ -68,6 +70,16 @@ constexpr int kHitMsgClose = 400;                           // + message index: 
 constexpr float kMaxPanelH = 300.0f;                        // tallest the panel grows (Messages tab)
 constexpr float kMsgTop = 54.0f, kMsgBottomPad = 12.0f, kMsgGap = 6.0f;
 constexpr int kMsgMaxLines = 3;
+constexpr int kHitAudioButton = 60;                         // + 0 microphone, + 1 speaker (round buttons on the tab row)
+constexpr int kHitPopAway = 71;                             // anywhere else on the island while a menu is open: dismiss
+constexpr int kHitPopRow = 1000;                            // + visible row in the open device menu
+constexpr int kHitPopFooter = 1010;                         // "Sound settings..."
+constexpr int kHitPopTest = 1030;                           // the "Test" pill in the microphone / speaker menu
+constexpr UINT_PTR kTestTimer = 5;                          // refreshes the menu when a test result expires
+constexpr int kHitPopSwitch = 1020;                         // the mute / block switch in the menu header
+constexpr float kAudioBtn = 30.0f;                          // round button diameter
+constexpr float kPopHeaderH = 30.0f, kPopRowH = 42.0f, kPopFooterH = 38.0f, kMenuPad = 10.0f;   // the device menu, inside the island
+constexpr int kPopMaxRows = 4;                              // rows visible at once (the wheel scrolls the rest)
 constexpr int kHitNotifClear = 30;                          // "Clear all"
 constexpr int kHitNotifClose = 100;                         // + notification index: its dismiss button
 constexpr float kNotifRowH = 44.0f;
@@ -107,6 +119,8 @@ bool IsChatMessage(const NotificationItem& n) {
 constexpr D2D1_COLOR_F kAccent = Rgba(0.42f, 0.70f, 1.0f, 1.0f);
 constexpr D2D1_COLOR_F kAmber = Rgba(1.0f, 0.73f, 0.30f, 1.0f);
 constexpr D2D1_COLOR_F kRed = Rgba(1.0f, 0.42f, 0.38f, 1.0f);
+constexpr D2D1_COLOR_F kGreen = Rgba(0.36f, 0.86f, 0.56f, 1.0f);
+constexpr D2D1_COLOR_F kNeutral = Rgba(0.60f, 0.60f, 0.65f, 1.0f);   // "normal": not available, connect it first
 constexpr float kRingRadius = 27.0f;
 constexpr float kRingThickness = 6.0f;
 
@@ -246,6 +260,23 @@ std::wstring RelativeTime(ULONGLONG fileTime) {
     return std::to_wstring(secs / 86400) + L"d";
 }
 
+// Windows names devices "Speakers (High Definition Audio Device)" or "MSI MP223 (NVIDIA High Definition Audio)".
+// Show the product on the main line and the kind of device / hardware quietly underneath.
+void SplitDeviceName(const std::wstring& full, std::wstring& main, std::wstring& sub) {
+    main = full;
+    sub.clear();
+    const size_t open = full.rfind(L" (");
+    if (open == std::wstring::npos || open == 0 || full.back() != L')') return;
+    main = full.substr(0, open);
+    sub = full.substr(open + 2, full.size() - open - 3);
+    static const wchar_t* const kGeneric[] = {L"microphone", L"speakers", L"speaker", L"headphones", L"headset", L"line in",
+                                              L"line out", L"stereo mix", L"digital audio", L"digital audio (s/pdif)",
+                                              L"output", L"input", L"mic in", L"headset earphone", L"headset microphone"};
+    const std::wstring lower = [&] { std::wstring t = main; for (auto& c : t) c = static_cast<wchar_t>(std::towlower(c)); return t; }();
+    for (const wchar_t* g : kGeneric)
+        if (lower == g) { std::swap(main, sub); return; }
+}
+
 D2D1_COLOR_F WithAlpha(D2D1_COLOR_F c, float a) { return {c.r, c.g, c.b, c.a * a}; }
 
 void SetOpenSprings(Spring& w, Spring& h) {
@@ -273,6 +304,7 @@ IslandWindow::IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_p
 
 IslandWindow::~IslandWindow() {
     if (watching_ && systemWatchHandler_) systemWatchHandler_(false);
+    if (audioWatching_ && audioWatchHandler_) audioWatchHandler_(false);
     if (hwnd_) {
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);
@@ -370,29 +402,42 @@ bool IslandWindow::Pinned() const {
 
 std::array<D2D1_RECT_F, kSectionCount> IslandWindow::TabRects(const D2D1_RECT_F& island) const {
     IDWriteTextFormat* fmt = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    std::array<float, kSectionCount> widths{};
-    float total = 0;
+    std::array<float, kSectionCount> text{};
+    float textTotal = 0;
     for (int i = 0; i < kSectionCount; ++i) {
-        widths[i] = std::ceil(gfx_.MeasureWidth(kTabLabels[i], fmt)) + 2 * kTabPadX;
-        total += widths[i];
+        text[i] = std::ceil(gfx_.MeasureWidth(kTabLabels[i], fmt));
+        textTotal += text[i];
     }
-    total += (kSectionCount - 1) * kTabGap;
-    float x = island.left + ((island.right - island.left) - total) / 2.0f;
+    // Tabs start at the left; the microphone and speaker buttons sit at the right end of the same row.
+    const float left = island.left + 22.0f;
+    const float room = (island.right - 22.0f - 3 * kAudioBtn - 2 * 8.0f - 14.0f) - left - (kSectionCount - 1) * kTabGap;
+    const float padX = std::clamp((room - textTotal) / (2.0f * kSectionCount), 8.0f, kTabPadX);
     std::array<D2D1_RECT_F, kSectionCount> out{};
+    float x = left;
     for (int i = 0; i < kSectionCount; ++i) {
-        out[i] = D2D1::RectF(x, island.top + kTabTop, x + widths[i], island.top + kTabTop + kTabH);
-        x += widths[i] + kTabGap;
+        const float w = text[i] + 2 * padX;
+        out[i] = D2D1::RectF(x, island.top + kTabTop, x + w, island.top + kTabTop + kTabH);
+        x += w + kTabGap;
     }
     return out;
+}
+
+D2D1_RECT_F IslandWindow::AudioButton(const D2D1_RECT_F& island, int side) const {
+    const float cx = island.right - 22.0f - kAudioBtn / 2 - (2 - side) * (kAudioBtn + 8.0f);
+    const float cy = island.top + kTabTop + kTabH / 2;
+    return D2D1::RectF(cx - kAudioBtn / 2, cy - kAudioBtn / 2, cx + kAudioBtn / 2, cy + kAudioBtn / 2);
 }
 
 bool IslandWindow::CursorInIsland(float slackDip) const {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(hwnd_, &pt);
-    const D2D1_POINT_2F p = ToDip(pt);
+    return InsideZone(ToDip(pt), slackDip);
+}
+
+bool IslandWindow::InsideZone(D2D1_POINT_2F p, float slack) const {
     const D2D1_RECT_F r = IslandRect();
-    return p.x >= r.left - slackDip && p.x <= r.right + slackDip && p.y >= 0 && p.y <= r.bottom + slackDip;
+    return p.x >= r.left - slack && p.x <= r.right + slack && p.y >= 0 && p.y <= r.bottom + slack;
 }
 
 void IslandWindow::SetHitRegion(bool full) {
@@ -423,6 +468,7 @@ void IslandWindow::Expand() {
     expanded_ = true;
     KillTimer(hwnd_, kCloseTimer);
     UpdateSystemWatch();
+    UpdateAudioWatch();
     SetOpenSprings(w_, h_);
     w_.target = kExpandedW;
     h_.target = TargetHeight();
@@ -434,7 +480,11 @@ void IslandWindow::Collapse() {
     if (!expanded_) return;
     expanded_ = false;
     hover_ = pressed_ = -1;
+    StopRunningTest();
+    popover_ = popoverSide_ = -1;                // the device menu goes with the panel
+    popoverT_ = 0;
     UpdateSystemWatch();
+    UpdateAudioWatch();
     KillTimer(hwnd_, kAutoCloseTimer);
     autoClosePending_ = false;
     if (mascot_) mascot_->ClearBadge();        // the panel was open: the user has seen it
@@ -458,7 +508,10 @@ void IslandWindow::SetSuppressed(bool suppressed) {
         w_.Snap(kCollapsedW);
         h_.Snap(kCollapsedH);
         SetHitRegion(false);
+        popover_ = popoverSide_ = -1;
+        popoverT_ = 0;
         UpdateSystemWatch();
+        UpdateAudioWatch();
         ShowWindow(hwnd_, SW_HIDE);
     } else {
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
@@ -481,6 +534,101 @@ void IslandWindow::UpdateSystemWatch() {
 void IslandWindow::SetSystem(const SystemSnapshot& snapshot) {
     system_ = snapshot;
     Animate();
+}
+
+// ---- audio: round buttons on the tab row and the floating device menu ------------------------------
+
+void IslandWindow::UpdateAudioWatch() {
+    const bool want = expanded_ && !suppressed_;                // live levels only while the island is open
+    if (want == audioWatching_) return;
+    audioWatching_ = want;
+    if (audioWatchHandler_) audioWatchHandler_(want);
+}
+
+void IslandWindow::SetCamera(const CameraSnapshot& snapshot) {
+    camera_ = snapshot;
+    if (popover_ == 2) ApplyHeightTarget();      // the camera list may have grown or shrunk
+    Animate();
+}
+
+void IslandWindow::ToggleMute(int side) {
+    const bool now = !SideMuted(side);
+    if (side == 0) audio_.input.muted = now;     // show it at once; the service confirms a moment later
+    else if (side == 1) audio_.output.muted = now;
+    else camera_.blocked = now;
+    if (muteHandler_) muteHandler_(side, now);
+    Animate();
+}
+
+D2D1_RECT_F IslandWindow::MuteSwitch(const PopoverLayout& g) const {
+    return D2D1::RectF(g.card.right - 40.0f, g.card.top + 1.0f, g.card.right, g.card.top + 25.0f);
+}
+
+void IslandWindow::StopRunningTest() {
+    if (audio_.test.state != AudioTest::State::Running) return;
+    audio_.test.state = AudioTest::State::Idle;
+    if (audioTestHandler_) audioTestHandler_(audio_.test.input, false);
+}
+
+void IslandWindow::ToggleTest(int side) {
+    if (side < 0 || side > 1) return;
+    const bool input = side == 0;
+    if (audio_.test.state == AudioTest::State::Running && audio_.test.input == input) {
+        StopRunningTest();
+    } else {
+        audio_.test = AudioTest{};                                    // show it at once; the service takes over
+        audio_.test.state = AudioTest::State::Running;
+        audio_.test.input = input;
+        testBars_.fill(0.0f);
+        if (audioTestHandler_) audioTestHandler_(input, true);
+    }
+    Animate();
+}
+
+void IslandWindow::SetAudio(const AudioSnapshot& snapshot) {
+    if (snapshot.test.state == AudioTest::State::Running) {           // feed the scrolling meter
+        for (size_t i = 1; i < testBars_.size(); ++i) testBars_[i - 1] = testBars_[i];
+        testBars_.back() = Clamp01(std::sqrt(snapshot.test.level) * 1.3f);
+    } else if (snapshot.test.state == AudioTest::State::Done && snapshot.test.doneAt != lastTestDone_) {
+        lastTestDone_ = snapshot.test.doneAt;                         // the verdict is shown for 6 s, then the normal status returns
+        SetTimer(hwnd_, kTestTimer, 6100, nullptr);
+    }
+    audio_ = snapshot;
+    if (popover_ >= 0) {                         // keep the open menu valid if a device came or went
+        const int total = MenuRows(popover_);
+        voiceScroll_ = std::clamp(voiceScroll_, 0, std::max(0, total - kPopMaxRows));
+        ApplyHeightTarget();                     // the menu may have grown or shrunk
+    }
+    Animate();
+}
+
+void IslandWindow::OpenPopover(int side) {
+    if (side != popover_) StopRunningTest();
+    popover_ = side;
+    if (side >= 0) popoverSide_ = side;
+    voiceScroll_ = 0;
+    hover_ = -1;
+    ApplyHeightTarget();                         // the island itself grows (or shrinks back) to fit the menu
+    Animate();
+}
+
+float IslandWindow::MenuHeight(int side) const {
+    const int shown = std::min(MenuRows(side), kPopMaxRows);
+    return kTabTop + kTabH + 8.0f + kPopHeaderH + shown * kPopRowH + kPopFooterH + kMenuPad;
+}
+
+IslandWindow::PopoverLayout IslandWindow::PopoverGeometry(const D2D1_RECT_F& island) const {
+    PopoverLayout g;
+    const int side = popoverSide_ >= 0 ? popoverSide_ : std::max(0, popover_);
+    g.total = MenuRows(side);
+    g.shown = std::min(g.total, kPopMaxRows);
+    const float left = island.left + 22.0f;
+    const float right = island.left + kExpandedW - (mascot_ ? kMascotLane : 22.0f);
+    const float top = island.top + kTabTop + kTabH + 8.0f;
+    g.rowsTop = top + kPopHeaderH;
+    g.card = D2D1::RectF(left, top, right, g.rowsTop + g.shown * kPopRowH + kPopFooterH);
+    g.footer = D2D1::RectF(left, g.rowsTop + g.shown * kPopRowH, right, g.card.bottom);
+    return g;
 }
 
 void IslandWindow::CyclePage(int metric, int direction) {
@@ -568,6 +716,12 @@ void IslandWindow::OnWheel(int delta) {
         CyclePage(hover_ - kHitRing, delta > 0 ? -1 : +1);          // wheel flips the ring under the pointer
         return;
     }
+    if (expanded_ && popover_ >= 0) {                                // scroll a long device menu
+        const int total = MenuRows(popover_);
+        voiceScroll_ = std::clamp(voiceScroll_ + (delta > 0 ? -1 : 1), 0, std::max(0, total - kPopMaxRows));
+        Animate();
+        return;
+    }
     if (expanded_ && section_ == Section::Messages) {
         const float view = TargetHeight() - kMsgTop - kMsgBottomPad;
         const float maxScroll = std::max(0.0f, msgContentHeight_ - view);
@@ -602,6 +756,30 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     const auto tabs = TabRects(island);
     for (int i = 0; i < kSectionCount; ++i)
         if (p.x >= tabs[i].left && p.x <= tabs[i].right && p.y >= tabs[i].top && p.y <= tabs[i].bottom) return i;
+    for (int side = 0; side < 3; ++side) {                        // microphone / speaker / camera buttons
+        const D2D1_RECT_F b = AudioButton(island, side);
+        const float dx = p.x - (b.left + b.right) / 2, dy = p.y - (b.top + b.bottom) / 2;
+        if (dx * dx + dy * dy <= (kAudioBtn / 2 + 2) * (kAudioBtn / 2 + 2)) return kHitAudioButton + side;
+    }
+    if (popover_ >= 0) {                                          // an open menu owns the pointer
+        const PopoverLayout g = PopoverGeometry(island);
+        auto inside = [&](const D2D1_RECT_F& r) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; };
+        for (int i = 0; i < g.shown; ++i)
+            if (inside(D2D1::RectF(g.card.left, g.rowsTop + i * kPopRowH, g.card.right, g.rowsTop + (i + 1) * kPopRowH)))
+                return kHitPopRow + i;
+        if (inside(g.footer)) return kHitPopFooter;
+        if (popover_ < 2) {
+            const D2D1_RECT_F pill = TestPill(g, popover_);
+            if (inside(D2D1::RectF(pill.left - 4, pill.top - 4, pill.right + 4, pill.bottom + 4))) return kHitPopTest;
+        }
+        {
+            D2D1_RECT_F sw = MuteSwitch(g);
+            sw = D2D1::RectF(sw.left - 6, sw.top - 4, sw.right + 6, sw.bottom + 4);
+            if (inside(sw)) return kHitPopSwitch;
+        }
+        if (inside(g.card)) return -1;
+        return inside(island) ? kHitPopAway : -1;                 // click anywhere else on the island: just dismiss
+    }
     if (section_ == Section::System) {
         for (int i = 0; i < kMetricCount; ++i) {
             const D2D1_RECT_F cell = RingCell(island, i);
@@ -635,6 +813,10 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
                 return kHitNotifClose + static_cast<int>(i);
         }
     }
+    if (section_ == Section::Music && media_.hasSession && media_.canSeek && media_.duration > 0) {
+        const SeekBar bar = SeekGeometry(island);
+        if (p.x >= bar.x0 - 6 && p.x <= bar.x1 + 6 && p.y >= bar.y - 9 && p.y <= bar.y + 10) return kHitSeek;
+    }
     if (section_ == Section::Music && media_.hasSession) {
         const auto centers = ControlCenters(island);
         for (int i = 0; i < 3; ++i) {
@@ -657,19 +839,61 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
         }
         return;
     }
-    const D2D1_RECT_F r = IslandRect();
-    const bool inside = p.x >= r.left - kLeaveSlack && p.x <= r.right + kLeaveSlack && p.y <= r.bottom + kLeaveSlack;
+    const bool inside = InsideZone(p, kLeaveSlack);
     if (inside) KillTimer(hwnd_, kCloseTimer);
     else if (!Pinned()) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
 
     const int hit = HitTest(p);
-    if (hit != hover_) {
-        hover_ = hit;
+    const int shown = hit == kHitPopAway ? -1 : hit;               // the dismiss area is not a button: no hand cursor
+    if (shown != hover_) {
+        hover_ = shown;
         Animate();
     }
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id == kHitPopAway) {
+        OpenPopover(-1);
+        return;
+    }
+    if (id == kHitPopSwitch) {
+        if (popover_ >= 0) ToggleMute(popover_);
+        return;
+    }
+    if (id == kHitPopTest) {
+        ToggleTest(popover_);
+        return;
+    }
+    if (id >= kHitAudioButton && id < kHitAudioButton + 3) {      // before the notification ids: their range is open-ended
+        const int side = id - kHitAudioButton;
+        OpenPopover(popover_ == side ? -1 : side);
+        return;
+    }
+    if (id == kHitPopFooter) {
+        const wchar_t* page = popover_ == 2 ? L"ms-settings:privacy-webcam" : L"ms-settings:sound";
+        OpenPopover(-1);
+        ShellExecuteW(nullptr, L"open", page, nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id >= kHitPopRow && id < kHitPopRow + kPopMaxRows) {
+        if (popover_ == 2) return;                                 // cameras are listed, not picked
+        if (popover_ >= 0 && audioSelectHandler_) {
+            AudioSide& side = popover_ == 0 ? audio_.input : audio_.output;
+            const int k = voiceScroll_ + (id - kHitPopRow);                // 0 = automatic (system default), then every device
+            if (k >= 0 && k <= static_cast<int>(side.devices.size())) {
+                const std::wstring picked = k == 0 ? std::wstring() : side.devices[static_cast<size_t>(k - 1)].id;
+                side.selectedId = picked;                                  // show it now; the service confirms right after
+                const auto it = std::find_if(side.devices.begin(), side.devices.end(), [&](const AudioDevice& d) {
+                    return picked.empty() ? d.isDefault : d.id == picked;
+                });
+                if (it != side.devices.end()) side.name = it->name, side.connected = true;
+                audioSelectHandler_(popover_ == 0, picked);
+            }
+        }
+        hover_ = -1;                                                       // stay open: the checkmark moves, then Test can be pressed
+        Animate();
+        return;
+    }
     if (id >= kHitMsgOpen && id < kHitMsgClose + 200) {      // before the notification ids: their range overlaps
         const bool close = id >= kHitMsgClose;
         const size_t i = static_cast<size_t>(id - (close ? kHitMsgClose : kHitMsgOpen));
@@ -718,6 +942,7 @@ void IslandWindow::OnClick(int id) {
         Animate();
         return;
     }
+    if (id == kHitSeek) return;                  // handled by press/drag/release, not as a click
     if (id >= kHitPrev && id <= kHitNext) {
         const bool enabled = id == kHitPlay ? media_.canToggle : id == kHitNext ? media_.canNext : media_.canPrevious;
         if (!enabled || !mediaHandler_) return;
@@ -727,13 +952,15 @@ void IslandWindow::OnClick(int id) {
             media_.playing = !media_.playing;
         }
         mediaHandler_(id == kHitPlay ? MediaCommand::TogglePlayPause : id == kHitNext ? MediaCommand::Next
-                                                                                      : MediaCommand::Previous);
+                                                                                      : MediaCommand::Previous, 0.0);
         Animate();
         return;
     }
     if (id < 0 || id >= kSectionCount) return;
     section_ = static_cast<Section>(id);
+    popover_ = -1;                               // switching tabs dismisses an open menu
     UpdateSystemWatch();
+    UpdateAudioWatch();
     ApplyHeightTarget();
     const auto tabs = TabRects(D2D1::RectF(0, 0, kExpandedW, kExpandedH));
     tabX_.target = tabs[id].left;
@@ -811,6 +1038,19 @@ bool IslandWindow::StepAnimation(float dt) {
             moving |= Approach(ringFrac_[i], pages[ringPage_[i] % pages.size()].fraction, dt, 6.5f);
         }
     }
+    for (int side = 0; side < 3; ++side) {
+        moving |= Approach(audioHover_[side], hover_ == kHitAudioButton + side ? 1.0f : 0.0f, dt, 22.0f);
+        moving |= Approach(audioOpen_[side], popover_ == side ? 1.0f : 0.0f, dt, 18.0f);
+        moving |= Approach(voiceLevel_[side], side < 2 && VoiceSide(side).connected && !SideMuted(side) ? VoiceSide(side).level : 0.0f, dt, 20.0f);
+        moving |= Approach(muteAnim_[side], SideMuted(side) ? 0.0f : 1.0f, dt, 18.0f);
+    }
+    moving |= Approach(popoverT_, popover_ >= 0 ? 1.0f : 0.0f, dt, 16.0f);
+    if (popover_ < 0 && popoverT_ < 0.003f) popoverT_ = 0, popoverSide_ = -1;
+    for (int i = 0; i < static_cast<int>(popRowHover_.size()); ++i)
+        moving |= Approach(popRowHover_[i], hover_ == kHitPopRow + i ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(popFooterHover_, hover_ == kHitPopFooter ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(testHover_, hover_ == kHitPopTest ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(seekHover_, (seeking_ || hover_ == kHitSeek) ? 1.0f : 0.0f, dt, 22.0f);
     moving |= Approach(notifScroll_, notifScrollTarget_, dt, 16.0f);
     if (expanded_ && section_ == Section::Messages) {
         moving |= Approach(msgScroll_, msgScrollTarget_, dt, 16.0f);
@@ -974,6 +1214,8 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         DrawText(dc, kTabLabels[i], tabFont, tabs[i], WithAlpha(kText, std::min(a, 0.96f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
+    DrawAudioButtons(dc, base, alpha);
+
     // Section body: empty states for now; cross-fades with a small vertical slide.
     IDWriteTextFormat* titleFont = gfx_.Text(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     IDWriteTextFormat* bodyFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_NORMAL);
@@ -981,7 +1223,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
     const float bodyBottom = base.bottom - 18.0f;
     const float mid = (bodyTop + bodyBottom) / 2.0f;
     for (int i = 0; i < kSectionCount; ++i) {
-        const float a = sectionAlpha_[i] * alpha;
+        const float a = sectionAlpha_[i] * alpha * (1.0f - popoverT_);   // the tab's content gives way to the menu
         if (a < 0.003f) continue;
         const float slide = (1.0f - sectionAlpha_[i]) * 8.0f;
         if (i == static_cast<int>(Section::System)) {
@@ -1029,9 +1271,20 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         DrawText(dc, emptyBody, bodyFont, D2D1::RectF(base.left + 24, mid + 2 + slide, right, mid + 24 + slide),
                  WithAlpha(kTextDim, a), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
+    DrawAudioPopover(dc, base, alpha);
 }
 
 // ---- music -----------------------------------------------------------------------------------
+
+IslandWindow::SeekBar IslandWindow::SeekGeometry(const D2D1_RECT_F& panel) const {
+    // The same numbers DrawMusic uses: left edge after the artwork, right edge before the mascot's lane.
+    return {panel.left + 24 + kArtSize + 18, panel.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f), panel.top + 113 + 1.5f};
+}
+
+float IslandWindow::SeekFractionAt(float x, const D2D1_RECT_F& panel) const {
+    const SeekBar bar = SeekGeometry(panel);
+    return Clamp01((x - bar.x0) / std::max(1.0f, bar.x1 - bar.x0));
+}
 
 void IslandWindow::SetMedia(const MediaInfo& media) {
     media_ = media;
@@ -1106,20 +1359,29 @@ void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alp
     DrawText(dc, subtitle.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_NORMAL),
              D2D1::RectF(x0, base.top + 84, x1, base.top + 102), WithAlpha(kTextDim, alpha));
 
-    // Progress.
+    // Progress. When the app allows seeking the bar thickens on hover and shows a handle you can drag.
     const float barY = base.top + 113;
-    const D2D1_ROUNDED_RECT track{D2D1::RectF(x0, barY, x1, barY + 3), 1.5f, 1.5f};
-    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.14f * alpha));
+    const bool seekable = media_.canSeek && media_.duration > 0;
+    const float grow = seekable ? seekHover_ : 0.0f;
+    const float thick = 3.0f + 2.5f * grow, top = barY + 1.5f - thick / 2;
+    const D2D1_ROUNDED_RECT track{D2D1::RectF(x0, top, x1, top + thick), thick / 2, thick / 2};
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.14f + 0.05f * grow) * alpha));
     dc->FillRoundedRectangle(track, brush_.Get());
-    const double pos = media_.PositionNow();
+    const double pos = seeking_ ? seekFraction_ * media_.duration : media_.PositionNow();
     if (media_.duration > 0) {
         const float f = static_cast<float>(std::clamp(pos / media_.duration, 0.0, 1.0));
-        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.88f * alpha));
-        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x0, barY, x0 + (x1 - x0) * f, barY + 3), 1.5f, 1.5f},
+        const float fillX = x0 + (x1 - x0) * f;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.88f + 0.1f * grow) * alpha));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x0, top, std::max(x0 + thick, fillX), top + thick), thick / 2, thick / 2},
                                  brush_.Get());
+        if (grow > 0.01f) {                                          // the handle
+            const float r = 5.5f * grow;
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fillX, barY + 1.5f), r, r), brush_.Get());
+        }
         IDWriteTextFormat* timeFont = gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL);
         DrawText(dc, FormatTime(pos).c_str(), timeFont, D2D1::RectF(x0, barY + 5, x0 + 60, barY + 19),
-                 WithAlpha(kTextDim, alpha));
+                 seeking_ ? WithAlpha(kText, alpha) : WithAlpha(kTextDim, alpha));
         DrawText(dc, FormatTime(media_.duration).c_str(), timeFont, D2D1::RectF(x1 - 60, barY + 5, x1, barY + 19),
                  WithAlpha(kTextDim, alpha), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -1349,6 +1611,7 @@ void IslandWindow::LayoutMessages() {
 }
 
 float IslandWindow::TargetHeight() const {
+    if (popover_ >= 0) return std::clamp(MenuHeight(popover_), kExpandedH, kMaxPanelH);
     if (section_ == Section::Messages && !messages_.empty())
         return std::clamp(kMsgTop + msgContentHeight_ + kMsgBottomPad, kExpandedH, kMaxPanelH);
     return kExpandedH;
@@ -1538,6 +1801,292 @@ void IslandWindow::DrawSystem(ID2D1DeviceContext* dc, D2D1_RECT_F base, float al
     }
 }
 
+// ---- audio: buttons and menu -------------------------------------------------------------------
+
+// ---- audio and camera: round buttons and the menu inside the island ---------------------------------
+
+IslandWindow::Dot IslandWindow::SideDot(int side) const {
+    if (!SideValid(side)) return Dot::Unavailable;
+    if (side == 2) {
+        bool anyReady = false;
+        for (const auto& d : camera_.devices) anyReady |= d.ready;
+        if (!anyReady) return Dot::Unavailable;
+        return camera_.inUseBy.empty() ? Dot::Ready : Dot::InUse;
+    }
+    const AudioSide& s = VoiceSide(side);
+    if (!s.connected || !s.ready) return Dot::Unavailable;
+    return side == 0 && !s.inUseBy.empty() ? Dot::InUse : Dot::Ready;     // a playing speaker is just "ready"
+}
+
+std::wstring IslandWindow::SideInUse(int side) const {
+    const std::vector<std::wstring>& apps = side == 2 ? camera_.inUseBy : VoiceSide(side).inUseBy;
+    std::wstring text;
+    for (size_t i = 0; i < apps.size() && i < 2; ++i) text += (i ? L", " : L"") + apps[i];
+    if (apps.size() > 2) text += L" +" + std::to_wstring(apps.size() - 2);
+    return text;
+}
+
+std::wstring IslandWindow::SideHint(int side) const {
+    if (!SideValid(side)) return {};
+    if (side == 2) {
+        if (camera_.devices.empty()) return L"No camera found";
+        for (const auto& d : camera_.devices)
+            if (!d.ready) return d.hint;
+        return {};
+    }
+    const AudioSide& s = VoiceSide(side);
+    return s.connected ? s.hint : L"Not connected";
+}
+
+void IslandWindow::DrawAudioButtons(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    if (!roundStroke_) {
+        const D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                               D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+        gfx_.d2dFactory()->CreateStrokeStyle(props, nullptr, 0, &roundStroke_);
+    }
+    IDWriteTextFormat* glyphFont = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_NORMAL, true);
+    const wchar_t* const glyphs[3] = {L"", L"", L""};     // microphone, speaker, camera (Segoe Fluent Icons)
+    for (int side = 0; side < 3; ++side) {
+        const Dot dot = SideDot(side);
+        const bool muted = SideMuted(side);
+        const bool usable = dot != Dot::Unavailable;
+        const D2D1_RECT_F r = AudioButton(base, side);
+        const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+        const float hover = audioHover_[side], open = audioOpen_[side];
+
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.075f + 0.07f * hover + 0.10f * open) * alpha));
+        dc->FillEllipse(D2D1::Ellipse(c, kAudioBtn / 2, kAudioBtn / 2), brush_.Get());
+
+        // A soft green ring breathes with the live level (what Solu hears / what is playing); an amber ring
+        // means an app is using the camera right now.
+        const float level = side < 2 && usable && !muted ? Clamp01(std::sqrt(voiceLevel_[side]) * 1.2f) : 0.0f;
+        if (level > 0.05f) {
+            brush_->SetColor(D2D1::ColorF(kGreen.r, kGreen.g, kGreen.b, std::min(0.75f, level) * alpha));
+            dc->DrawEllipse(D2D1::Ellipse(c, kAudioBtn / 2 + 1.2f + 1.6f * level, kAudioBtn / 2 + 1.2f + 1.6f * level), brush_.Get(), 1.3f);
+        }
+        if (side == 2 && dot == Dot::InUse && !muted) {
+            brush_->SetColor(D2D1::ColorF(kAmber.r, kAmber.g, kAmber.b, 0.85f * alpha));
+            dc->DrawEllipse(D2D1::Ellipse(c, kAudioBtn / 2 + 2.0f, kAudioBtn / 2 + 2.0f), brush_.Get(), 1.4f);
+        }
+
+        DrawText(dc, glyphs[side], glyphFont, r,
+                 WithAlpha(muted ? kRed : kText, ((usable || muted) ? 0.92f : 0.40f + 0.25f * hover) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (muted) {                                                // a slash through it, with a thin gap like SF Symbols
+            const D2D1_POINT_2F p0{c.x - 7.0f, c.y + 7.0f}, p1{c.x + 7.0f, c.y - 7.0f};
+            brush_->SetColor(D2D1::ColorF(0.118f, 0.118f, 0.130f, alpha));
+            dc->DrawLine(D2D1::Point2F(p0.x - 1.2f, p0.y + 0.2f), D2D1::Point2F(p1.x - 1.2f, p1.y + 0.2f), brush_.Get(), 3.4f, roundStroke_.Get());
+            brush_->SetColor(WithAlpha(kRed, alpha));
+            dc->DrawLine(p0, p1, brush_.Get(), 1.8f, roundStroke_.Get());
+        }
+
+        // Status light, cut into the button with a ring in the island's colour:
+        // green = connected and ready, amber = in use right now, grey = not available (connect it first).
+        const D2D1_POINT_2F d{c.x + 10.5f, c.y + 10.5f};
+        const D2D1_COLOR_F light = dot == Dot::Ready ? kGreen : dot == Dot::InUse ? kAmber : kNeutral;
+        brush_->SetColor(WithAlpha(kIslandFill, alpha));
+        dc->FillEllipse(D2D1::Ellipse(d, 5.4f, 5.4f), brush_.Get());
+        brush_->SetColor(WithAlpha(light, alpha));
+        dc->FillEllipse(D2D1::Ellipse(d, 3.4f, 3.4f), brush_.Get());
+    }
+}
+
+D2D1_RECT_F IslandWindow::TestPill(const PopoverLayout& g, int side) const {
+    const float titleW = std::ceil(gfx_.MeasureWidth(side == 0 ? L"Microphone" : L"Speaker", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD)));
+    const float left = g.card.left + 30 + titleW + 10;
+    return D2D1::RectF(left, g.card.top + 3, left + 46, g.card.top + 23);
+}
+
+void IslandWindow::DrawAudioPopover(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
+    const float t = popoverT_;
+    if (t < 0.003f || popoverSide_ < 0) return;
+    if (!roundStroke_) {
+        const D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                               D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+        gfx_.d2dFactory()->CreateStrokeStyle(props, nullptr, 0, &roundStroke_);
+    }
+    const int side = popoverSide_;
+    const AudioSide* s = side < 2 ? &VoiceSide(side) : nullptr;     // null for the camera
+    const float a = alpha * Clamp01(t * 1.15f - 0.15f);            // the old tab content fades out first, then this fades in
+    const float slide = (1.0f - t) * 8.0f;                          // and rises into place while the island grows
+    const PopoverLayout g = PopoverGeometry(D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide));
+    const D2D1_RECT_F area = g.card;
+    IDWriteTextFormat* quiet = gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* mainFont = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
+
+    // ---- what to say about this device ------------------------------------------------------------------------------
+    const bool valid = SideValid(side), muted = SideMuted(side);
+    const Dot dot = SideDot(side);
+    std::wstring statusText;
+    D2D1_COLOR_F light = kNeutral;
+    if (!valid) {
+        statusText = L"Looking…";
+    } else if (muted) {
+        statusText = side == 2 ? L"Blocked" : L"Muted";
+        light = kRed;
+    } else if (dot == Dot::Unavailable) {
+        statusText = SideHint(side);
+        if (statusText.empty()) statusText = L"Not connected";
+    } else if (dot == Dot::InUse) {
+        statusText = L"In use · " + SideInUse(side);
+        light = kAmber;
+    } else {
+        statusText = L"Ready";
+        light = kGreen;
+    }
+    // A finished test replaces the status for a few seconds.
+    const AudioTest& test = audio_.test;
+    const bool mine = side < 2 && test.input == (side == 0);
+    const bool testing = mine && test.state == AudioTest::State::Running;
+    if (mine && test.state == AudioTest::State::Done && GetTickCount64() - test.doneAt < 6000) {
+        switch (test.verdict) {
+        case AudioTest::Verdict::Works: statusText = side == 0 ? L"Microphone works" : L"Test sound played"; light = kGreen; break;
+        case AudioTest::Verdict::Quiet: statusText = L"Very quiet — speak closer"; light = kAmber; break;
+        case AudioTest::Verdict::Silent: statusText = dot == Dot::Unavailable && !SideHint(side).empty() ? SideHint(side) : L"No sound heard"; light = kRed; break;
+        case AudioTest::Verdict::Blocked: statusText = L"Blocked in Windows privacy"; light = kRed; break;
+        case AudioTest::Verdict::Muted: statusText = L"Muted — switch it on first"; light = kRed; break;
+        default: statusText = L"Couldn't run the test"; light = kRed; break;
+        }
+    }
+
+    // ---- header: glyph, title and Test on the left; state (or the live meter) and the on/off switch on the right -------
+    const float headTop = area.top;
+    const wchar_t* const glyphs[3] = {L"", L"", L""};
+    const wchar_t* const titles[3] = {L"Microphone", L"Speaker", L"Camera"};
+    DrawText(dc, glyphs[side], gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_NORMAL, true),
+             D2D1::RectF(area.left, headTop, area.left + 24, headTop + 26), WithAlpha(kText, 0.92f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawText(dc, titles[side], gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+             D2D1::RectF(area.left + 30, headTop, area.left + 130, headTop + 26), WithAlpha(kText, a));
+    float slotLeft = area.left + 30 + std::ceil(gfx_.MeasureWidth(titles[side], gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD))) + 12.0f;
+    if (side < 2) {                                                 // the compact Test control
+        const D2D1_RECT_F pill = TestPill(g, side);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.10f + 0.10f * testHover_ + (testing ? 0.08f : 0.0f)) * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{pill, 10, 10}, brush_.Get());
+        DrawText(dc, testing ? L"Stop" : L"Test", gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), pill,
+                 WithAlpha(kText, (0.82f + 0.15f * testHover_) * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        slotLeft = pill.right + 14.0f;
+    }
+
+    const D2D1_RECT_F sw = MuteSwitch(g);                          // Apple-style switch: on = sound / camera on
+    const float on = muteAnim_[side];
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.20f * a));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{sw, 12, 12}, brush_.Get());
+    brush_->SetColor(D2D1::ColorF(0.20f, 0.78f, 0.35f, on * a));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{sw, 12, 12}, brush_.Get());
+    const D2D1_POINT_2F knob{sw.left + 12.0f + on * 16.0f, (sw.top + sw.bottom) / 2};
+    brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.28f * a));
+    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob.x, knob.y + 1.2f), 10.0f, 10.0f), brush_.Get());
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, a));
+    dc->FillEllipse(D2D1::Ellipse(knob, 10.0f, 10.0f), brush_.Get());
+
+    const float slotRight = sw.left - 14.0f;
+    if (testing) {                                                  // a scrolling waveform of what is being heard / played
+        const wchar_t* label = side == 0 ? L"Listening" : L"Playing";
+        const float labelW = std::ceil(gfx_.MeasureWidth(label, quiet));
+        DrawText(dc, label, quiet, D2D1::RectF(slotLeft, headTop + 5, slotLeft + labelW + 4, headTop + 21), WithAlpha(kTextDim, 1.2f * a));
+        const float barsLeft = slotLeft + labelW + 10.0f;
+        const int bars = std::clamp(static_cast<int>((slotRight - barsLeft) / 4.4f), 4, static_cast<int>(testBars_.size()));
+        for (int i = 0; i < bars; ++i) {
+            const float v = testBars_[testBars_.size() - static_cast<size_t>(bars) + static_cast<size_t>(i)];
+            const float h = 3.0f + 15.0f * v;
+            const float x = barsLeft + i * 4.4f;
+            brush_->SetColor(D2D1::ColorF(kGreen.r, kGreen.g, kGreen.b, (0.25f + 0.70f * (static_cast<float>(i + 1) / bars)) * a));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x, headTop + 13 - h / 2, x + 2.6f, headTop + 13 + h / 2), 1.3f, 1.3f}, brush_.Get());
+        }
+    } else {
+        const float textRight = slotRight;
+        const float textW = std::min(textRight - slotLeft - 12.0f, std::ceil(gfx_.MeasureWidth(statusText.c_str(), quiet)));
+        brush_->SetColor(D2D1::ColorF(light.r, light.g, light.b, a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(textRight - textW - 9, headTop + 13), 3.0f, 3.0f), brush_.Get());
+        DrawText(dc, statusText.c_str(), quiet, D2D1::RectF(textRight - textW - 3, headTop + 5, textRight + 3, headTop + 21),
+                 WithAlpha(kTextDim, 1.15f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * a));
+    dc->DrawLine(D2D1::Point2F(area.left, g.rowsTop - 1.5f), D2D1::Point2F(area.right, g.rowsTop - 1.5f), brush_.Get(), 1.0f);
+
+    // ---- rows: microphones/speakers ("Automatic" first), or the cameras -----------------------------------------------
+    std::wstring defaultMain, ignore;
+    if (s)
+        for (const auto& d : s->devices)
+            if (d.isDefault) SplitDeviceName(d.name, defaultMain, ignore);
+    const float textLeft = area.left + 38, textRight = area.right - 24;
+    dc->PushAxisAlignedClip(D2D1::RectF(area.left - 10, g.rowsTop - 1, area.right + 10, g.footer.top), D2D1_ANTIALIAS_MODE_ALIASED);
+    for (int i = 0; i < g.shown; ++i) {
+        const int k = voiceScroll_ + i;                              // for devices: 0 = automatic
+        if (k >= g.total) break;
+        const D2D1_RECT_F row = D2D1::RectF(area.left, g.rowsTop + i * kPopRowH, area.right, g.rowsTop + (i + 1) * kPopRowH);
+        const float hover = side < 2 ? popRowHover_[static_cast<size_t>(i)] : 0.0f;
+        if (hover > 0.01f) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.075f * hover * a));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(row.left - 8, row.top + 2, row.right + 6, row.bottom - 2), 11, 11}, brush_.Get());
+        }
+        std::wstring main, sub;
+        bool selected = false, ready = true;
+        if (!s) {                                                    // cameras
+            if (camera_.devices.empty()) {
+                main = L"No camera found";
+                sub = L"Plug one in, or connect your phone";
+                ready = false;
+            } else {
+                const CameraDevice& cam = camera_.devices[static_cast<size_t>(k)];
+                SplitDeviceName(cam.name, main, sub);
+                ready = cam.ready;
+                if (!cam.ready) sub = cam.hint;
+                else if (sub.empty()) sub = L"Camera";
+            }
+        } else if (k == 0) {
+            main = L"Automatic";
+            sub = defaultMain.empty() ? L"No device found" : L"Currently " + defaultMain;
+            selected = s->selectedId.empty();
+            ready = s->selectedId.empty() ? (s->connected && s->ready) : true;
+        } else {
+            const AudioDevice& dev = s->devices[static_cast<size_t>(k - 1)];
+            SplitDeviceName(dev.name, main, sub);
+            selected = dev.id == s->selectedId;
+            ready = dev.ready;
+            if (!dev.ready) sub = dev.hint;
+        }
+        const float dim = ready ? 1.0f : 0.55f;
+        DrawText(dc, main.c_str(), mainFont, D2D1::RectF(textLeft, row.top + 5, textRight, row.top + 23), WithAlpha(kText, 0.97f * dim * a));
+        DrawText(dc, sub.c_str(), quiet, D2D1::RectF(textLeft, row.top + 22, textRight, row.top + 37), WithAlpha(kTextDim, 1.1f * a));
+        {                                                            // per-device light: green ready, grey not available
+            const bool inUse = !s && ready && !camera_.inUseBy.empty();
+            const D2D1_COLOR_F dc2 = !ready ? kNeutral : inUse ? kAmber : kGreen;
+            brush_->SetColor(D2D1::ColorF(dc2.r, dc2.g, dc2.b, (ready ? 0.95f : 0.7f) * a));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(area.right - 10, (row.top + row.bottom) / 2), 3.0f, 3.0f), brush_.Get());
+        }
+        if (selected) {                                              // the checkmark, drawn as a stroke so it stays crisp
+            const float x = area.left + 16, y = (row.top + row.bottom) / 2;
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.96f * a));
+            dc->DrawLine(D2D1::Point2F(x - 5.0f, y + 0.5f), D2D1::Point2F(x - 1.6f, y + 4.0f), brush_.Get(), 2.0f, roundStroke_.Get());
+            dc->DrawLine(D2D1::Point2F(x - 1.6f, y + 4.0f), D2D1::Point2F(x + 5.2f, y - 4.2f), brush_.Get(), 2.0f, roundStroke_.Get());
+        }
+        if (i < g.shown - 1 && k < g.total - 1) {                    // hairline between rows, starting at the text
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.085f * a));
+            dc->DrawLine(D2D1::Point2F(textLeft, row.bottom - 0.5f), D2D1::Point2F(area.right, row.bottom - 0.5f), brush_.Get(), 1.0f);
+        }
+    }
+    dc->PopAxisAlignedClip();
+    if (g.total > g.shown) {                                         // thin scrollbar for long lists
+        const float trackH = g.shown * kPopRowH - 12.0f;
+        const float thumbH = std::max(18.0f, trackH * g.shown / g.total);
+        const float thumbTop = g.rowsTop + 6.0f + (trackH - thumbH) * (voiceScroll_ / static_cast<float>(g.total - g.shown));
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.24f * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(area.right + 3, thumbTop, area.right + 5.5f, thumbTop + thumbH), 1.3f, 1.3f},
+                                 brush_.Get());
+    }
+
+    // ---- footer ---------------------------------------------------------------------------------------
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * a));
+    dc->DrawLine(D2D1::Point2F(area.left, g.footer.top - 0.5f), D2D1::Point2F(area.right, g.footer.top - 0.5f), brush_.Get(), 1.0f);
+    if (popFooterHover_ > 0.01f) {
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.075f * popFooterHover_ * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(g.footer.left - 8, g.footer.top + 2, g.footer.right + 6, g.footer.bottom - 2), 11, 11},
+                                 brush_.Get());
+    }
+    DrawText(dc, side == 2 ? L"Camera privacy settings…" : L"Sound settings…", mainFont, g.footer,
+             WithAlpha(kText, (0.86f + 0.1f * popFooterHover_) * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+
 // ---- mascot ----------------------------------------------------------------------------------
 
 void IslandWindow::DrawMascot(float opacity) {
@@ -1626,6 +2175,11 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;               // clicking the island never steals focus
     case WM_MOUSEMOVE:
+        if (seeking_) {                                    // dragging the progress bar: follow the pointer, even outside it
+            seekFraction_ = SeekFractionAt(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}).x, IslandRect());
+            Animate();
+            return 0;
+        }
         OnMouseMove(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
         return 0;
     case WM_MOUSELEAVE:
@@ -1641,11 +2195,33 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL:
         OnWheel(GET_WHEEL_DELTA_WPARAM(wp));
         return 0;
+    case WM_RBUTTONUP: {                                           // right-click a round button: quick mute / unmute
+        const int hit = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+        if (expanded_ && hit >= kHitAudioButton && hit < kHitAudioButton + 3) ToggleMute(hit - kHitAudioButton);
+        return 0;
+    }
     case WM_LBUTTONDOWN:
         pressed_ = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+        if (pressed_ == kHitSeek) {
+            seeking_ = true;
+            seekFraction_ = SeekFractionAt(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}).x, IslandRect());
+            Animate();
+        }
         if (pressed_ >= 0) SetCapture(hwnd_);
         return 0;
     case WM_LBUTTONUP: {
+        if (seeking_) {                                    // let go: jump there
+            seekFraction_ = SeekFractionAt(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}).x, IslandRect());
+            const double seconds = seekFraction_ * media_.duration;
+            seeking_ = false;
+            pressed_ = -1;
+            if (GetCapture() == hwnd_) ReleaseCapture();
+            media_.position = seconds;                     // show it right away; the app confirms a moment later
+            media_.positionStamp = GetTickCount64();
+            if (mediaHandler_) mediaHandler_(MediaCommand::Seek, seconds);
+            Animate();
+            return 0;
+        }
         const int hit = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
         const int was = pressed_;
         pressed_ = -1;
@@ -1655,11 +2231,17 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CAPTURECHANGED:
         pressed_ = -1;
+        seeking_ = false;                                  // capture lost mid-drag: cancel, don't seek
         return 0;
     case WM_SETCURSOR:
         SetCursor(LoadCursorW(nullptr, hover_ >= 0 ? IDC_HAND : IDC_ARROW));
         return TRUE;
     case WM_TIMER:
+        if (wp == kTestTimer) {
+            KillTimer(hwnd_, kTestTimer);
+            Animate();                                   // the test verdict has expired: show the normal status again
+            return 0;
+        }
         if (wp == kOpenTimer) {
             KillTimer(hwnd_, kOpenTimer);
             openPending_ = false;

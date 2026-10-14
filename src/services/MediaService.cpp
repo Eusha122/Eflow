@@ -2,6 +2,7 @@
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Storage.Streams.h>
 
@@ -80,8 +81,9 @@ struct MediaService::Impl {
     Session Pick() const {
         Session current = manager.GetCurrentSession();
         auto isPlaying = [](const Session& s) {
-            return s && s.GetPlaybackInfo().PlaybackStatus() ==
-                            wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+            if (!s) return false;
+            const auto info = s.GetPlaybackInfo();          // null while a session is still starting up
+            return info && info.PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
         };
         if (isPlaying(current)) return current;
         for (const auto& s : manager.GetSessions())
@@ -108,10 +110,10 @@ MediaInfo MediaService::Snapshot() const {
     return snapshot_;
 }
 
-void MediaService::Send(MediaCommand cmd) {
+void MediaService::Send(MediaCommand cmd, double seconds) {
     {
         std::lock_guard lock(mutex_);
-        commands_.push_back(cmd);
+        commands_.push_back({cmd, seconds});
     }
     wake_.notify_all();
 }
@@ -141,7 +143,7 @@ void MediaService::Run() {
 
     for (;;) {
         bool doRefresh, doArtwork;
-        std::deque<MediaCommand> commands;
+        std::deque<MediaRequest> commands;
         {
             std::unique_lock lock(mutex_);
             // Event-driven: wake on session events and commands. The slow timeout only resyncs
@@ -155,12 +157,21 @@ void MediaService::Run() {
         }
 
         try {
-            for (MediaCommand cmd : commands) {
+            for (const MediaRequest& req : commands) {
                 if (!impl.session) break;
-                switch (cmd) {
+                switch (req.command) {
                 case MediaCommand::TogglePlayPause: impl.session.TryTogglePlayPauseAsync().get(); break;
                 case MediaCommand::Next: impl.session.TrySkipNextAsync().get(); break;
                 case MediaCommand::Previous: impl.session.TrySkipPreviousAsync().get(); break;
+                case MediaCommand::Seek:                               // 100 ns ticks from the start of the media
+                    impl.session.TryChangePlaybackPositionAsync(static_cast<int64_t>(std::max(0.0, req.seconds) * 1e7)).get();
+                    break;
+                case MediaCommand::Shuffle: impl.session.TryChangeShuffleActiveAsync(req.seconds > 0.5).get(); break;
+                case MediaCommand::Repeat:
+                    impl.session.TryChangeAutoRepeatModeAsync(req.seconds > 1.5 ? winrt::Windows::Media::MediaPlaybackAutoRepeatMode::List
+                                                              : req.seconds > 0.5 ? winrt::Windows::Media::MediaPlaybackAutoRepeatMode::Track
+                                                                                  : winrt::Windows::Media::MediaPlaybackAutoRepeatMode::None).get();
+                    break;
                 }
                 doRefresh = true;
             }
@@ -187,15 +198,31 @@ void MediaService::Run() {
                 info = MediaInfo{};
             } else {
                 const auto playback = impl.session.GetPlaybackInfo();
+                const auto timeline = impl.session.GetTimelineProperties();
+                if (!playback || !timeline || !playback.Controls()) {   // a brand-new session has no data yet
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    std::lock_guard lock(mutex_);
+                    refresh_ = true;                           // try again shortly
+                    continue;
+                }
                 const auto controls = playback.Controls();
                 info.hasSession = true;
                 info.playing = playback.PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
                 info.canToggle = controls.IsPlayPauseToggleEnabled() || controls.IsPlayEnabled() || controls.IsPauseEnabled();
                 info.canNext = controls.IsNextEnabled();
                 info.canPrevious = controls.IsPreviousEnabled();
+                info.canSeek = controls.IsPlaybackPositionEnabled();
+                info.canShuffle = controls.IsShuffleEnabled();
+                info.canRepeat = controls.IsRepeatEnabled();
+                info.shuffleOn = false;
+                if (const auto shuffle = playback.IsShuffleActive()) info.shuffleOn = shuffle.Value();
+                info.repeat = 0;
+                if (const auto mode = playback.AutoRepeatMode()) {
+                    using Mode = winrt::Windows::Media::MediaPlaybackAutoRepeatMode;
+                    info.repeat = mode.Value() == Mode::Track ? 1 : mode.Value() == Mode::List ? 2 : 0;
+                }
                 info.sourceApp = FriendlyAppName(std::wstring(impl.session.SourceAppUserModelId()));
 
-                const auto timeline = impl.session.GetTimelineProperties();
                 info.duration = std::max(0.0, Seconds(timeline.EndTime() - timeline.StartTime()));
                 double position = Seconds(timeline.Position() - timeline.StartTime());
                 // Apps update the timeline sparsely; extrapolate from when they last did.
@@ -235,7 +262,9 @@ void MediaService::Run() {
                                  info.title != before.title || info.artist != before.artist ||
                                  info.sourceApp != before.sourceApp || info.artworkId != before.artworkId ||
                                  info.canToggle != before.canToggle || info.canNext != before.canNext ||
-                                 info.canPrevious != before.canPrevious ||
+                                 info.canPrevious != before.canPrevious || info.canSeek != before.canSeek ||
+                                 info.canShuffle != before.canShuffle || info.shuffleOn != before.shuffleOn ||
+                                 info.canRepeat != before.canRepeat || info.repeat != before.repeat ||
                                  std::abs(info.duration - before.duration) > 0.5 ||
                                  std::abs(info.PositionNow() - before.PositionNow()) > 1.5;
             {

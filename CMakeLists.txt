@@ -36,6 +36,9 @@ add_executable(eflow WIN32
     src/mascot/MascotAsset.cpp
     src/mascot/MascotRenderer.cpp
     src/mascot/cgltf_impl.cpp
+    src/services/AudioDevices.cpp
+    src/services/CameraService.cpp
+    src/services/DeviceReadiness.cpp
     src/services/HookInstaller.cpp
     src/services/MediaService.cpp
     src/services/NotificationService.cpp
@@ -60,7 +63,7 @@ target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EH
 set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
     COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs windowsapp shell32 user32
-    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid)
+    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32)
 
 # The PermissionRequest hook command run by Claude Code / Codex; lives next to eflow.exe (it verifies
 # that the pipe it talks to is served by that eflow.exe).

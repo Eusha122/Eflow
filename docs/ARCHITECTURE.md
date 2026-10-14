@@ -109,6 +109,12 @@ playing, extrapolates the position locally between the app's sparse timeline upd
 with WIC (max 192 px), and posts `WM_APP_MEDIA` with an immutable snapshot. Transport buttons send
 commands back to the worker; the play/pause icon flips immediately and the service confirms.
 
+The progress bar is a scrubber when the app allows it (`PlaybackControls.IsPlaybackPositionEnabled`,
+e.g. Spotify and browsers, but not live streams): click or drag it, the handle and time follow the
+pointer (the pointer is captured, so the drag may leave the bar), and on release the worker calls
+`TryChangePlaybackPositionAsync`. The new position is shown immediately; the app confirms shortly after.
+A session that has just appeared can briefly report no playback info; the worker waits and retries.
+
 The mascot's mood is layered so sources never fight: ambient (idle / music playing) < pending AI
 permission request < one-shot notification reaction.
 
@@ -171,6 +177,57 @@ that tab by itself (5 s, then it closes again unless the pointer is on it).
   WhatsApp libraries, or driving WhatsApp's window with simulated typing) risk account bans or sending to
   the wrong chat, so the action is *Open in WhatsApp* (launches/activates the app through its
   AppUserModelId, after validating the id) and the notification is dismissed, like clicking a toast.
+
+## 8b. Microphone, speaker and camera
+
+Not a tab: three round buttons (microphone, speaker, camera) sit at the right end of the tab row. Each has a connection light (green = the
+device in use is plugged in, red = it is not, amber = still looking) and a ring that breathes with the live
+level. Clicking one makes **the island itself grow** (the height spring, 176 DIP up to 296 DIP) and shows
+the device menu inside it: the tab's content fades out, the menu rises in. It has a compact header (glyph,
+title, "Connected", live level bars), "Automatic" and every device as a two-line row (product name over
+device kind), a checkmark on the one in use, hairline separators inset from the text, and a "Sound
+settings..." footer. Clicking the other button swaps the menu in place; picking a device only moves the checkmark
+(the menu stays open so you can press Test straight away); clicking anywhere else, switching tabs or leaving
+the island folds it back. The wheel scrolls past four rows.
+
+* `services/AudioDevices` (worker thread, MTA) enumerates the active endpoints with `IMMDeviceEnumerator`
+  and rebuilds the list from `IMMNotificationClient` events, so plugging something in or out updates the
+  buttons without polling. The peak level (`IAudioMeterInformation`) is sampled ~15 times a second, only
+  while the island is open (refcounted `Watch`, like the System tab). Microphone levels only move while
+  something (Solu) is capturing from that device; speaker levels follow whatever is playing.
+* **Picking a device never changes the Windows default.** The choice is written to
+  `%LOCALAPPDATA%\Eflowoice.json` (`{"input": {"id", "name"}, "output": {...}}`, empty = follow the system
+  default, written atomically) and Solu follows that file, re-reading it whenever it changes. A picked device
+  that is not plugged in keeps its last known name, and Solu falls back to the default meanwhile.
+* **Status light = "can I use it right now?"** Grey (the normal look) means not available: the device is
+  missing, or it is a phone-based device whose phone is not connected. Green means connected and ready. Amber
+  means in use right now (a microphone with an active capture stream, a camera that an app has open); the
+  menu names the app. Windows alone cannot tell a phone webcam that is streaming from one that is not (the
+  virtual camera and microphone are listed as present, and healthy, either way), so
+  `services/DeviceReadiness` checks the well-known bridges (Iriun, DroidCam, EpocCam, Camo, OBS virtual
+  camera): the PC app must be running and, for the phone apps, it must hold an established TCP connection
+  (that is when a phone is streaming to it; checked once a second while the island is open). Devices not
+  recognised as a bridge count as ready as soon as Windows lists them.
+* **Test.** A small pill next to the microphone / speaker title. The microphone test opens a WASAPI capture
+  stream on the chosen device for up to 5 s and only looks at the loudness (nothing is recorded or kept; it
+  only ever starts from the button, and Windows' own microphone indicator shows it); the header turns into a
+  scrolling live waveform and ends with a verdict ("Microphone works", "Very quiet", "No sound heard",
+  "Muted", "Blocked in Windows privacy" when the microphone privacy switch is off). The speaker test plays a
+  quiet two-note chime through the chosen output (and tells you if it is muted). The verdict replaces the
+  status text for six seconds.
+* **Mute.** Every menu has an Apple-style switch in its header (on = sound / camera on). For the microphone
+  and speaker it sets the *endpoint mute* (`IAudioEndpointVolume::SetMute`, the same mute as Windows' volume
+  panel, applied on the audio worker thread and read back every sample so a hardware mute key shows up too).
+  A muted button gets a red slash. Right-clicking a button toggles the same switch without opening the menu.
+* **Camera.** `services/CameraService` lists cameras with SetupAPI (`KSCATEGORY_VIDEO_CAMERA`, so a phone used
+  as a webcam appears too), reports which apps are using one right now (the `LastUsedTimeStart/Stop` stamps
+  under `CapabilityAccessManager\ConsentStore\webcam`; a desktop app whose stamp never closed is ignored
+  unless its program is actually running) and offers the switch. Windows has no way for a normal program to
+  mute a webcam (disabling the device needs administrator rights), so the camera switch flips Windows' own
+  per-user privacy setting, `Value` = `Deny`/`Allow` under `ConsentStore\webcam` and `...\NonPackaged`
+  (Settings > Privacy > Camera): no app can open the camera until it is switched back. Read once a second
+  while the island is open.
+* The tab strip is left-aligned and its padding adapts so five labels and the three buttons fit 600 DIP.
 
 ## 9. Mascot pipeline
 

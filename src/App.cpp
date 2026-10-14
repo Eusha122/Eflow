@@ -70,6 +70,10 @@ int App::Run() {
     LoadMascot();
     system_ = std::make_unique<SystemMonitor>(msgWnd_, WM_APP_SYSTEM);   // idle until a System tab is on screen
     system_->Start();
+    audio_ = std::make_unique<AudioDevices>(msgWnd_, WM_APP_AUDIO);      // samples levels only while the island is open
+    audio_->Start();
+    camera_ = std::make_unique<CameraService>(msgWnd_, WM_APP_CAMERA);
+    camera_->Start();
     BuildIslands();
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
@@ -98,6 +102,8 @@ int App::Run() {
     }
 
     system_.reset();
+    audio_.reset();
+    camera_.reset();
     notifications_.reset();
     permissions_.reset();                    // pending requests fall back to each tool's own prompt
     media_.reset();                          // joins the media worker thread
@@ -149,10 +155,10 @@ void App::OnMediaChanged() {
     if (!media_) return;
     const MediaInfo info = media_->Snapshot();
 #ifndef NDEBUG   // track titles are personal: only debug builds log them
-    Log("media: session=%d playing=%d app=%ls title=\"%ls\" artist=\"%ls\" pos=%.0f/%.0fs art=%ux%u controls=%d%d%d",
+    Log("media: session=%d playing=%d app=%ls title=\"%ls\" artist=\"%ls\" pos=%.0f/%.0fs art=%ux%u controls=%d%d%d seek=%d",
         info.hasSession, info.playing, info.sourceApp.c_str(), info.title.c_str(), info.artist.c_str(),
         info.PositionNow(), info.duration, info.artwork ? info.artwork->width : 0, info.artwork ? info.artwork->height : 0,
-        info.canPrevious, info.canToggle, info.canNext);
+        info.canPrevious, info.canToggle, info.canNext, info.canSeek);
 #endif
     for (auto& island : islands_) {
         island->SetMedia(info);
@@ -170,6 +176,18 @@ void App::OnSystemChanged() {
     if (!system_) return;
     const SystemSnapshot snapshot = system_->Snapshot();
     for (auto& island : islands_) island->SetSystem(snapshot);
+}
+
+void App::OnCameraChanged() {
+    if (!camera_) return;
+    const CameraSnapshot snapshot = camera_->Snapshot();
+    for (auto& island : islands_) island->SetCamera(snapshot);
+}
+
+void App::OnAudioChanged() {
+    if (!audio_) return;
+    const AudioSnapshot snapshot = audio_->Snapshot();
+    for (auto& island : islands_) island->SetAudio(snapshot);
 }
 
 void App::OnNotificationsChanged() {
@@ -230,8 +248,28 @@ void App::BuildIslands() {
         island->SetSystemWatchHandler([this](bool watching) {
             if (system_) system_->Watch(watching ? +1 : -1);
         });
-        island->SetMediaHandler([this](MediaCommand cmd) {
-            if (media_) media_->Send(cmd);
+        island->SetAudioHandlers(
+            [this](bool watching) {
+                if (audio_) audio_->Watch(watching ? +1 : -1);
+                if (camera_) camera_->Watch(watching ? +1 : -1);
+            },
+            [this](bool input, const std::wstring& id) {
+                if (audio_) audio_->Select(input, id);
+            },
+            [this](int side, bool muted) {                      // 0 microphone, 1 speaker, 2 camera (privacy switch)
+                if (side == 2) {
+                    if (camera_) camera_->SetBlocked(muted);
+                } else if (audio_) {
+                    audio_->SetMute(side == 0, muted);
+                }
+            },
+            [this](bool input, bool start) {                    // the "Test" button in the microphone / speaker menu
+                if (!audio_) return;
+                if (start) audio_->StartTest(input);
+                else audio_->StopTest();
+            });
+        island->SetMediaHandler([this](MediaCommand cmd, double seconds) {
+            if (media_) media_->Send(cmd, seconds);
         });
         island->SetNotificationHandlers(
             [this](uint32_t id) {
@@ -255,6 +293,8 @@ void App::RebuildGraphics() {
     }
     BuildIslands();
     OnMediaChanged();                        // fresh islands start with the current track
+    OnAudioChanged();
+    OnCameraChanged();
     OnPermissionsChanged();
     OnNotificationsChanged();
     UpdateFullscreenState();
@@ -402,6 +442,12 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_SYSTEM:
         OnSystemChanged();
+        return 0;
+    case WM_APP_AUDIO:
+        OnAudioChanged();
+        return 0;
+    case WM_APP_CAMERA:
+        OnCameraChanged();
         return 0;
     case WM_APP_PERMISSION:
         OnPermissionsChanged();

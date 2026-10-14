@@ -28,6 +28,19 @@ to normal programs (that needs a hardware driver and administrator rights), so t
 is running as administrator, in which case Eflow reads them from it. Nothing is sampled unless the System
 tab is on screen.
 
+### Microphone, speaker and camera
+
+Three round buttons at the right end of the tab row, each with a status light: **green** = connected and
+ready, **amber** = in use right now (the menu says by which app), **grey** = not available, so connect it
+first. A phone used as a webcam or microphone (Iriun, DroidCam, ...) stays grey until the phone is really
+connected to the PC app. Click a button and the island grows to show a menu: a switch to **mute** it (for
+the camera: **block** it), a **Test** button (the microphone shows a live waveform and tells you whether it
+hears you; the speaker plays a short chime), and the devices Windows knows. Right-click a button to mute or
+unmute it without opening the menu. Picking a microphone or speaker does not change your Windows default;
+the choice is saved in `%LOCALAPPDATA%\Eflow\voice.json` for the voice assistant to follow. Windows cannot
+mute a webcam from a normal program, so the camera switch turns off Windows' own camera privacy setting
+(Settings > Privacy > Camera) for your user; turn it back on from the same switch.
+
 ### Approving AI requests in the island
 
 Right-click the tray icon, then **Approve AI requests from** and pick Claude Code and/or Codex. Eflow

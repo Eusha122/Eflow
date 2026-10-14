@@ -8,6 +8,8 @@
 #include "core/Gfx.h"
 #include "island/IslandWindow.h"
 #include "mascot/MascotRenderer.h"
+#include "services/AudioDevices.h"
+#include "services/CameraService.h"
 #include "services/HookInstaller.h"
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
@@ -35,6 +37,8 @@ private:
     void OnPermissionsChanged();
     void OnNotificationsChanged();
     void OnSystemChanged();
+    void OnAudioChanged();
+    void OnCameraChanged();
     void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
@@ -59,6 +63,8 @@ private:
     std::unique_ptr<PermissionServer> permissions_;
     std::unique_ptr<NotificationService> notifications_;
     std::unique_ptr<SystemMonitor> system_;
+    std::unique_ptr<AudioDevices> audio_;
+    std::unique_ptr<CameraService> camera_;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
 };
 

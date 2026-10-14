@@ -21,6 +21,10 @@ struct MediaInfo {
     std::wstring sourceApp;                     // friendly name, e.g. "Spotify", "Chrome"
     bool playing = false;
     bool canToggle = false, canNext = false, canPrevious = false;
+    bool canSeek = false;                       // the app accepts "jump to this position"
+    bool canShuffle = false, shuffleOn = false;
+    bool canRepeat = false;
+    int repeat = 0;                             // 0 off, 1 repeat the track, 2 repeat the list
     double position = 0, duration = 0;          // seconds; duration 0 = unknown (live streams, some sites)
     ULONGLONG positionStamp = 0;                // GetTickCount64() when `position` was valid
     std::shared_ptr<const ImageBGRA> artwork;   // null if the app provides none
@@ -29,7 +33,12 @@ struct MediaInfo {
     double PositionNow() const;                 // extrapolated while playing
 };
 
-enum class MediaCommand { TogglePlayPause, Next, Previous };
+enum class MediaCommand { TogglePlayPause, Next, Previous, Seek, Shuffle, Repeat };
+
+struct MediaRequest {
+    MediaCommand command;
+    double seconds = 0;                         // Seek: the position to jump to; Shuffle: 1 on / 0 off; Repeat: the mode (0, 1, 2)
+};
 
 // Watches the system media sessions on a worker thread (event-driven, no polling) and posts
 // WM_APP_MEDIA to `notify` whenever the snapshot changes; read it with Snapshot().
@@ -42,7 +51,7 @@ public:
 
     void Start();
     MediaInfo Snapshot() const;
-    void Send(MediaCommand cmd);
+    void Send(MediaCommand cmd, double seconds = 0);
 
 private:
     void Run();
@@ -55,7 +64,7 @@ private:
     bool stop_ = false;
     bool refresh_ = true;                       // something changed: rebuild the snapshot
     bool refreshArtwork_ = true;
-    std::deque<MediaCommand> commands_;
+    std::deque<MediaRequest> commands_;
     MediaInfo snapshot_;
 };
 
