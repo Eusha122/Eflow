@@ -56,6 +56,25 @@ talk. Using speakers? Solu waits until it has finished talking before it listens
 anything else shows an **Approve / Reject / Always allow** card on the island first, and you can also simply say *yes* or *no*.
 It runs a local model, so it is quick and dependable for single actions and simpler tasks, and less reliable for long multi-step jobs.
 
+**Live on the island:** downloads and file copies show as live pills on the thin bar, so does Solu's research, a
+focus timer ("Solu, start a focus session") and the odd polite nudge. **Ctrl+Alt+Q** lets you drag over any part of the
+screen for Solu to explain or translate; **Ctrl+Alt+H** hides everything and closes Solu's microphone (press again to come
+back). Also try: "good morning", "quiz me on this page", "take notes of this lecture", "clean up my downloads",
+"what did I copy earlier?", "when I say study mode, ...", "tell Shoily I'll be late".
+
+**Long tasks:** give Solu a whole goal ("Solu, start a task: research X, write it up and email it to me", "work on tidying my
+downloads and report back", "every morning at 8 open my notes"). It writes a short plan, you approve it once on the island, and
+then it works through it by itself in the background: looking at the screen, clicking, typing, searching, writing, even handing
+coding to Claude Code or Codex. It checks each step, tries another way when something fails, asks you when it is stuck, and never
+slows the conversation. Say "pause the task", "how's the task going", "stop the task", or use the buttons in the Solu AI tab.
+
+**Shelf:** drag files onto the island (it opens by itself and shows a big drop target) to hold them, then drag them out again into
+any folder, app or web page, one or several at a time. Double-click opens a file, right-click shows it in its folder.
+
+**Agents:** the island's *Agents* tab shows what Claude Code and Codex are doing (click a logo to switch; it opens on
+the busy one), lets you type to them from the island (Ctrl+Alt+A) and shows their approval requests as cards. Or ask Solu:
+*"what is Claude doing?"*, *"tell Codex to fix the build"*.
+
 **Screen help:** say *"Solu, what does this error mean?"* or *"Solu, look at this"* and it looks at the window you are in, reads it
 and answers out loud, so you never need a screenshot. It only looks when you ask, shows a small picture of what it saw, stores nothing,
 refuses password-manager style windows, and can be switched off in Settings. See `solu\README.md`.

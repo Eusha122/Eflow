@@ -49,9 +49,48 @@ TOOLS = [
           {"topic": _s("what to research, in the user's words"), "depth": {"type": "string", "enum": ["deep", "standard"]}}, ["topic"]),
     _tool("send_email", "Write an email in the user's Gmail. The user sees the whole email on an approval card first. With a clear address "
           "it is sent; if the address is missing or unclear, leave 'to' empty and it opens as a draft for the user to add the address. "
-          "Write the complete subject and body yourself.",
+          "Write the complete subject and body yourself. If you only have a person's name (no address), use send_message with app 'email' instead: it finds the address.",
           {"to": _s("the recipient's email address, or empty if you don't have a clear one"), "subject": _s("subject line"),
            "body": _s("the full email text")}, ["subject", "body"]),
+    _tool("focus_timer", "Start (or stop) a focus session: a Pomodoro timer on the island with breaks in between.",
+          {"minutes": _n("focus length in minutes (default 25; 0 stops the session)"), "break_minutes": _n("break length, default 5"),
+           "rounds": _n("how many focus rounds, default 4")}, ["minutes"]),
+    _tool("clipboard_history", "What the user copied recently (newest first). Passwords and keys are hidden.",
+          {"query": _s("optional words to look for")}),
+    _tool("tidy_folder", "Tidy a folder (normally Downloads): sort its loose files into Images, Documents, Videos, Music, Archives, "
+          "Installers, Code and Other. The user sees the plan on an approval card first.", {"folder": _s("folder name or path, default Downloads")}),
+    _tool("send_message", "Send a message to a person by name, number or email address. Solu finds them itself (its memory, WhatsApp's "
+          "search, or Gmail's contact suggestions), checks it found the right chat, and shows the user an approval card before sending.",
+          {"to": _s("who, as the user said it"), "message": _s("the message, written out in full"),
+           "app": {"type": "string", "enum": ["whatsapp", "email", ""], "description": "only if the user said which"}}, ["to", "message"]),
+    _tool("start_quiz", "Start a spoken quiz (study buddy) from the page or PDF on the screen, or from a topic.",
+          {"source": _s("'screen' for what is on the screen, or a topic to learn about")}, ["source"]),
+    _tool("take_notes", "Take notes of a lecture, video or meeting playing on the PC (it listens to the PC's sound, not the microphone), "
+          "or stop and write the notes page.", {"action": {"type": "string", "enum": ["start", "stop"]},
+                                                 "kind": {"type": "string", "enum": ["lecture", "meeting", "video"]}}, ["action"]),
+    _tool("agent_status", "What the user's coding agents (Claude Code and Codex) are doing right now: working, idle, or waiting for the user."),
+    _tool("tell_agent", "Send a prompt to the user's coding agent, like typing it in their editor: it carries on in its session in the background "
+          "and the island shows its progress. The user approves it first.",
+          {"agent": {"type": "string", "enum": ["claude", "codex"]}, "message": _s("the full instruction for the agent"),
+           "project": _s("the project folder name if the user named one")}, ["agent", "message"]),
+    _tool("start_task", "Start a LONG background task: a goal that needs many separate actions over several minutes or more (research then write then send; "
+          "set something up across apps; do a chore end to end; keep working while the user is away). Solu plans it, shows the plan for approval, then works "
+          "through it by itself. Do NOT use it for one or two actions: use the direct tools for those.",
+          {"goal": _s("the whole goal, in the user's words, with every detail they gave")}, ["goal"]),
+    _tool("look", "Look at the window the user is in right now: its title, the buttons / fields / tabs it offers (by name) and the text on it. "
+          "Use it before clicking, and to check what happened after an action."),
+    _tool("click_element", "Click a button, field, tab, menu item, link or icon of the current window by its name (what it is called or what it says). "
+          "Better than click_text for icons and controls; works for any visible text too.",
+          {"name": _s("the control's name or visible words"), "kind": {"type": "string", "enum": ["", "button", "text field", "tab", "link", "checkbox", "menu item", "list item"]},
+           "double": {"type": "boolean", "description": "double-click"}, "right": {"type": "boolean", "description": "right-click"},
+           "times": _n("click this many times in a row (default 1): use it for 'click 5 times'")}, ["name"]),
+    _tool("drag", "Drag one thing to another with the mouse (a file onto a folder, a card into a box, a tab to a window...). Both are named as they appear.",
+          {"from_name": _s("what to pick up"), "to_name": _s("where to drop it")}, ["from_name", "to_name"]),
+    _tool("wait", "Wait a number of seconds (for a page to load, a download, a program to open).", {"seconds": _n("1 to 120")}, ["seconds"]),
+    _tool("wait_for_text", "Wait until some text appears in the current window (up to a time limit). Use it to wait for loading, downloads and results.",
+          {"text": _s("the words to wait for"), "seconds": _n("how long at most, default 30")}, ["text"]),
+    _tool("agent_wait", "Wait for the user's coding agent (Claude Code or Codex) to finish what it is doing, then return its last message. Use it after tell_agent.",
+          {"agent": {"type": "string", "enum": ["claude", "codex"]}, "minutes": _n("how long to wait at most, default 15")}, ["agent"]),
     _tool("media_control", "Control the music or video that is playing.",
           {"action": {"type": "string", "enum": ["play_pause", "next", "previous", "stop"]}}, ["action"]),
     _tool("set_volume", "Change the PC's sound volume.",
@@ -63,8 +102,9 @@ TOOLS = [
     _tool("look_at_screen", "Read the text on the window the user is looking at (its title, app and visible text)."),
     _tool("click_text", "Click on a button, link or any text visible in the window the user is looking at.",
           {"text": _s("the words shown on the thing to click, exactly as they appear")}, ["text"]),
-    _tool("type_text", "Type text into the window the user is working in, as if typed on the keyboard.",
-          {"text": _s("the text to type")}, ["text"]),
+    _tool("type_text", "Type text into the window the user is working in, as if typed on the keyboard. Give 'into' (the field's name "
+          "or label) to click that field first, so the text goes there.",
+          {"text": _s("the text to type"), "into": _s("optional: the name or label of the field to click first")}, ["text"]),
     _tool("press_keys", "Press a key or a keyboard shortcut, e.g. 'enter', 'ctrl+s', 'alt+tab', 'win+d', 'ctrl+shift+esc'.",
           {"keys": _s("the keys, joined with +")}, ["keys"]),
     _tool("window_control", "List the open windows, or bring one to the front, minimize, maximize, restore, snap it to the left or right "
@@ -89,7 +129,9 @@ TOOLS = [
 ]
 
 # name -> (level, can be always-allowed)
-LEVEL = {"research": ("auto", False), "deep_research": ("auto", False), "send_email": ("ask", False), "open_app": ("auto", False), "open_website": ("auto", False),
+LEVEL = {"start_task": ("auto", False), "look": ("auto", False), "click_element": ("ask", True), "drag": ("ask", True), "wait": ("auto", False), "wait_for_text": ("auto", False),
+         "agent_wait": ("auto", False), "research": ("auto", False), "deep_research": ("auto", False), "focus_timer": ("auto", False), "clipboard_history": ("auto", False),
+         "tidy_folder": ("auto", False), "send_message": ("auto", False), "start_quiz": ("auto", False), "take_notes": ("auto", False), "agent_status": ("auto", False), "tell_agent": ("ask", False), "send_email": ("ask", False), "open_app": ("auto", False), "open_website": ("auto", False),
          "scroll": ("auto", False), "web_search": ("auto", False), "media_control": ("auto", False),
          "set_volume": ("auto", False), "set_timer": ("auto", False), "system_info": ("auto", False), "look_at_screen": ("auto", False),
          "click_text": ("ask", True), "type_text": ("ask", True), "press_keys": ("ask", True), "window_control": ("auto", False),
@@ -109,18 +151,36 @@ TRIGGERS = {
     "open_website": r"open|go to|website|site|\.com|\.org|\.net|youtube|chatgpt|gmail|facebook|url|link|browser",
     "web_search": r"search|google|look ?up",
     "research": r"research|search|look ?up|find out|learn about|information|info|news|latest|summar|about",
+    "focus_timer": r"focus|pomodoro|study session|work session|concentrat|deep work",
+    "clipboard_history": r"copied|clipboard|i copy|copy earlier",
+    "tidy_folder": r"tidy|clean ?up|organi[sz]e|sort (my|the|out)|declutter",
+    "send_message": r"(send|write) (a |an |the |my )?(message|text|msg|whatsapp)|message (him|her|them|\w+) (that|saying|to tell)|"
+                    r"text (him|her|them)|on whatsapp|tell \w+ (that|i|i'm|we)|let \w+ know|e-?mail (him|her|them|\w+)",
+    "start_quiz": r"quiz|test me|study with me|ask me questions|flash ?cards",
+    "take_notes": r"notes?\b|lecture|meeting|transcri|record (this|the)",
+    "agent_status": r"(claude|codex)\b.*\b(doing|status|done|finished|working|up to|progress|stuck)|(what|how)('s| is| are)? .*\b(claude|codex|my agents?|the agents?)|"
+                    r"\b(my )?(coding )?agents?\b",
+    "tell_agent": r"\b(tell|ask|have|get|make|let)\b.*\b(claude|codex)\b|\b(claude|codex)\b.*\b(should|to (fix|build|add|write|check|run|update|refactor|make))\b",
+    "start_task": r"\btasks?\b|\bgoal\b|step by step|in the background|by yourself|on your own|automatically|while i('m| am) (away|gone|out|sleeping)|"
+                  r"take care of|figure out|work on|set up|\bprepare\b|and then .*(and then|then)|after that|\bfinally\b|keep (working|going)|end to end",
+    "look": r"look at|what('s| is) (on|in)|see (this|my)|screen|check (the|what)|read (the )?(screen|page|window)",
+    "click_element": r"click|press the|tap|select|choose|open the (menu|tab|settings)|toggle|double[- ]click|right[- ]click",
+    "drag": r"\bdrag\b|drop it|move .* (to|into|onto)",
+    "wait": r"\bwait\b|until it|when it finishes|after it loads",
+    "wait_for_text": r"\bwait\b.*\b(for|until)\b|until .* (appears|shows|says)",
+    "agent_wait": r"(claude|codex).*(finish|done|complete)|wait for (claude|codex)",
     "deep_research": r"deep|in[- ]?depth|detailed|thorough|report|(make|write|create|prepare) (a |me a |an )?(doc|document|paper|summary)|"
                      r"research (on|about|into)|study (on|about)",
     "media_control": r"play|pause|resume|next|previous|skip|song|music|track|video",
     "set_volume": r"volume|louder|quieter|mute|unmute|sound|audio",
     "set_timer": r"timer|remind|alarm|countdown",
-    "system_info": r"time is it|what time|the time|date|what day|battery|disk|drive|space|storage|memory|ram|uptime|been on",
+    "system_info": r"time is it|what time|the time|date|what day|battery|disk|drive|space|storage|memory|ram|uptime|been on|microphone|mic|input device|audio device|sound device",
     "look_at_screen": r"screen|look at (this|that|it|my|the)|see (this|that|it|my)|read (this|that|it)|this (page|window|tab|error|message)|what('?s| is| does) (this|that)|showing",
     "click_text": r"click|tap|select|button|link|press",
     "type_text": r"type|write|enter|fill|reply|send (a |an |the |my )?(message|text|msg)|(?<!i )(?<!we )(message|text) (him|her|them|to)|"
                  r"ask (it|him|her|them|chatgpt|gemini)|prompt|tell (it|him|her|them)",
     "press_keys": r"press|key|shortcut|enter|send|submit|copy|paste|undo|save|ctrl|alt|escape|ask (it|him|her|them|chatgpt|gemini)|prompt",
-    "window_control": r"window|minimi[sz]e|maximi[sz]e|restore|close|quit|exit|switch to|go to|focus|snap|left side|right side|"
+    "window_control": r"window|minimi[sz]e|maximi[sz]e|restore|close|quit|exit|switch to|go to|focus (on )?(the |my )?\w+ window|snap|left side|right side|"
                       r"left half|right half|full ?screen|bring (up|it|that|this|back)|to the front|hide",
     "scroll": r"scroll|page down|page up|go down|go up|to the (top|bottom)|further down",
     "find_files": r"find|where|locate|file|folder|search",
@@ -260,6 +320,15 @@ def describe(name, a):
                 exists and not a.get("append"), False)
     if name == "clipboard":
         return ("read your clipboard", "", False, can_always) if a.get("action") == "read" else ("copy to the clipboard", a.get("text", ""), False, can_always)
+    if name == "run_task":
+        return f"run a task: {a.get('title', '')}", a.get("steps", ""), False, False
+    if name == "tell_agent":
+        who = "Codex" if str(a.get("agent", "")).lower().startswith("co") else "Claude Code"
+        return f"send a prompt to {who}" + (f" in {a['project']}" if a.get("project") else ""), a.get("message", ""), False, False
+    if name == "tidy_folder":
+        return f"tidy {os.path.basename(a.get('folder', '')) or 'a folder'}", a.get("summary", ""), False, False
+    if name == "whatsapp":
+        return f"send a WhatsApp message to {a.get('to', '')}", a.get("text", ""), False, False
     if name == "send_email":
         to = email_address(a.get("to", ""))
         if not to:
@@ -632,6 +701,15 @@ def send_gmail(to, subject, body):
     return f"pressed Send in Gmail for the email to {to}, but could not see Gmail confirm it; tell the user to check"
 
 
+def _glide(x0, y0, x1, y1, steps=8, pause=0.003):
+    """Move the pointer fast (about 25 ms) but through a few points, not a jump: apps still see hover and drag-over events."""
+    for k in range(1, steps + 1):
+        t = k / steps
+        t = t * t * (3 - 2 * t)
+        user32.SetCursorPos(int(x0 + (x1 - x0) * t), int(y0 + (y1 - y0) * t))
+        time.sleep(pause)
+
+
 # ---- the work --------------------------------------------------------------------------------------------------------------
 class Hands:
     def __init__(self, solu):
@@ -641,6 +719,15 @@ class Hands:
         fn = getattr(self, "do_" + name, None)
         if fn is None:
             return f"error: there is no tool called {name}"
+        if name in ("click_text", "type_text", "press_keys", "scroll", "drag", "window_control", "open_app", "open_website", "open_file", "click_element"):
+            self._view = None                                                       # the screen is about to change
+        try:
+            import inspect
+            params = inspect.signature(fn).parameters
+            if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+                a = {k: v for k, v in a.items() if k in params}                      # a small model sometimes invents an argument: ignore it
+        except (TypeError, ValueError):
+            pass
         try:
             return fn(**a)
         except TypeError as e:
@@ -668,6 +755,57 @@ class Hands:
 
     def do_research(self, query):
         return research(query)
+
+    def do_focus_timer(self, minutes=25, break_minutes=5, rounds=4):
+        minutes = int(float(minutes or 0))
+        self.solu.event("focus", minutes=minutes, **{"break": int(float(break_minutes or 5))}, rounds=int(float(rounds or 4)))
+        return "stopped the focus session" if minutes <= 0 else \
+            f"focus session started: {minutes} min focus, {int(float(break_minutes or 5))} min breaks, {int(float(rounds or 4))} rounds (shown on the island)"
+
+    def do_clipboard_history(self, query=""):
+        return self.solu.clipboard.report(query)
+
+    def do_tidy_folder(self, folder="Downloads"):
+        import skills
+        path = _resolve_folder(folder or "Downloads") or os.path.join(HOME, "Downloads")
+        plan = skills.tidy_plan(path)
+        if not plan:
+            return f"{path} is already tidy: no loose files to sort"
+        total = sum(len(v) for v in plan.values())
+        lines = "\n".join(f"{g}: {len(n)} ({', '.join(n[:3])}{', ...' if len(n) > 3 else ''})" for g, n in sorted(plan.items(), key=lambda kv: -len(kv[1])))
+        answer = self.solu.ask_permission("tidy_folder", {"folder": path, "summary": f"Move {total} files into folders:\n{lines}"})
+        if answer not in ("allow", "all"):
+            return "the user said no. Do not do it; just say okay."
+        moved = skills.tidy_apply(path, plan)
+        return f"moved {moved} files in {path} into: {', '.join(sorted(plan))}"
+
+    def do_send_message(self, to, message, app=""):
+        return self.solu.smart_send(to, message, app)
+
+    def do_start_quiz(self, source="screen"):
+        return self.solu.start_quiz_from(source)
+
+    def do_agent_status(self):
+        agents = (self.solu.context or {}).get("agents")
+        if not agents:
+            return "no Claude Code or Codex session has been active in the last few hours"
+        rows = []
+        for a in agents:
+            line = f"{a['agent']} in {a['project']} ({a.get('title', '')[:50]}): {a['state']}"
+            if a["state"] == "working" and a.get("doing"):
+                line += f", now: {a['doing'][:80]}"
+            elif a.get("last_reply"):
+                line += f". Its last message: {a['last_reply'][:160]}"
+            rows.append(line)
+        return "; ".join(rows)
+
+    def do_tell_agent(self, agent, message, project=""):
+        self.solu.event("agent_prompt", tool="codex" if str(agent).lower().startswith("co") else "claude", text=message, project=project or "")
+        name = "Codex" if str(agent).lower().startswith("co") else "Claude Code"
+        return f"sent to {name}; it is working on it in the background and the island's Agents tab shows what it does"
+
+    def do_take_notes(self, action="start", kind="lecture"):
+        return self.solu.notes_start(kind or "lecture") if action == "start" else self.solu.notes_stop()
 
     def do_deep_research(self, topic, depth="deep"):
         return self.solu.start_research(topic, depth)
@@ -738,7 +876,9 @@ class Hands:
                     drives.append(f"{letter}: {u.free / 1e9:.0f} GB free of {u.total / 1e9:.0f} GB")
                 except OSError:
                     pass
-        return (time.strftime("it is %A %d %B %Y, %I:%M %p") + f"; {battery}; PC on for {up // 3600} h {(up % 3600) // 60} min; "
+        mic, mic_ok = getattr(self.solu, "status", {}).get("input", ("", True))
+        mic_text = f"microphone Solu is listening on: {mic}" + ("" if mic_ok else " (not connected)") if mic else "microphone: unknown"
+        return (time.strftime("it is %A %d %B %Y, %I:%M %p") + f"; {mic_text}; {battery}; PC on for {up // 3600} h {(up % 3600) // 60} min; "
                 f"memory {m.load}% used ({m.free / 1e9:.1f} GB free of {m.total / 1e9:.1f} GB); disks: {'; '.join(drives)}")
 
     def do_look_at_screen(self):
@@ -751,6 +891,180 @@ class Hands:
         self.solu.event("looking", title=look.title, app=look.app, scope=look.scope, thumb=screen.thumbnail_b64(look))
         text = screen.read_text(look)
         return f"window '{look.title}' ({look.app}). Visible text:\n{text[:2500]}"
+
+    # ---- eyes and hands that understand controls (UI Automation first, OCR for everything it cannot see)
+    def _view_now(self, fresh=False):
+        """The current window as one capture plus its UI Automation controls. Reused for a few seconds (reading it costs about a second);
+        any action that may change the screen drops it."""
+        import screen
+        import uia
+        hwnd = user32.GetForegroundWindow()
+        v = getattr(self, "_view", None)
+        if v and not fresh and v["hwnd"] == hwnd and time.monotonic() - v["t"] < 4.0:
+            return v
+        look = screen.look_at_foreground()
+        items = []
+        if not look.blocked:
+            try:
+                items = uia.elements(scope="window", limit=120, budget=1.0)
+            except Exception:                                                       # noqa: BLE001
+                items = []
+        self._view = {"t": time.monotonic(), "hwnd": hwnd, "look": look, "items": items}
+        return self._view
+
+    def _screen_hits(self, name, kind=""):
+        """Where `name` is on screen: UI Automation controls first, then the words OCR reads. Returns (x, y, what) or None."""
+        import screen
+        import uia
+        v = self._view_now()
+        if v["look"].blocked:
+            raise RuntimeError(v["look"].blocked)
+        # What the user calls it ("the Apple chip", "the Save button") is not always what the screen says: try the name with its filler words dropped.
+        generic = {"chip", "button", "icon", "field", "box", "zone", "area", "checkbox", "link", "tab", "menu", "item", "the", "a", "an", "text", "label"}
+        words = [w for w in name.split() if w.lower() not in generic] or name.split()
+        variants = [name] + ([" ".join(words)] if " ".join(words) != name else []) + ([max(words, key=len)] if len(words) > 1 else [])
+        for variant in variants:
+            el = uia.find(variant, v["items"], kind if variant == name else None)
+            self._last_el = el
+            if el:
+                x, y = el.center
+                return int(x), int(y), f"{el.kind} \"{el.name}\""
+            hit = screen.find_text(v["look"], variant)
+            if hit:
+                return int(hit[0]), int(hit[1]), f"\"{hit[2]}\""
+        return None
+
+    def observe(self, elements=28, text_chars=900):
+        """What the current window shows, as compact text for a model: title, controls by name, and the visible words."""
+        import screen
+        v = self._view_now(fresh=True)
+        look, items = v["look"], v["items"]
+        if look.blocked:
+            return f"[window: {look.title or 'unknown'}] (a password or security window: not looked at; ask the user)"
+        parts = [f"[window: {look.title or 'the desktop'}{' - ' + look.app if look.app and look.app != 'Windows' else ''}]"]
+        noise = {"minimize", "maximize", "restore", "close", "restore down", "system", "split view resize handle (draggable)"}
+        items = [e for e in items if e.name.lower() not in noise]                  # the window's own caption buttons say nothing about the task
+        browser = (look.app or "").lower() in ("chrome", "msedge", "firefox", "brave", "opera")
+        if browser:                                                                  # the tab strip is noise: keep the toolbar buttons that matter
+            items = [e for e in items if e.kind != "tab"][:10]
+        if items:
+            parts.append("controls: " + "; ".join(f"{e.kind} \"{e.name[:40]}\"" for e in items[:elements]))
+        try:
+            text = screen.read_text(look)
+        except Exception:                                                           # noqa: BLE001
+            text = ""
+        if text:
+            parts.append("text on screen: " + " ".join(text.split())[:text_chars])
+        return "\n".join(parts)
+
+    def do_start_task(self, goal):
+        if not getattr(self.solu, "tasks", None):
+            return "error: tasks are not available right now"
+        t = self.solu.tasks.submit(goal)
+        return (f"started the task '{t.title}'. It is planning now and will show the plan on the island for the user to approve before it does anything. "
+                f"Tell the user in one short sentence.")
+
+    def do_look(self):
+        if not self.solu.screen_enabled:
+            return "error: screen help is switched off by the user"
+        return self.observe(elements=40, text_chars=1400)
+
+    def do_click_element(self, name, kind="", double=False, right=False, times=1):
+        try:
+            hit = self._screen_hits(name, kind)
+        except RuntimeError as e:
+            return f"error: {e}"
+        if not hit:
+            return f"error: could not find '{name}' in this window. Use look to see what is there."
+        x, y, what = hit
+        cur = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(cur))
+        _glide(cur.x, cur.y, x, y)
+        time.sleep(0.02)                                                            # the app sees the hover before the press
+        down, up = (8, 16) if right else (2, 4)
+        count = max(1, min(30, int(float(times or 1))))
+        for _ in range(count * (2 if double else 1)):
+            user32.mouse_event(down, 0, 0, 0, 0)
+            time.sleep(0.015)
+            user32.mouse_event(up, 0, 0, 0, 0)
+            time.sleep(0.07 if count > 1 else 0.02)
+        self._view = None
+        state = ""
+        el = getattr(self, "_last_el", None)
+        if el is not None and el.kind in ("checkbox", "radio"):                    # say what the click did to it
+            time.sleep(0.12)
+            try:
+                on = el.control.GetTogglePattern().ToggleState == 1 if el.kind == "checkbox" else el.control.GetSelectionItemPattern().IsSelected
+                state = f": it is now {'ON (ticked)' if on else 'OFF (not ticked)'}"
+            except Exception:                                                       # noqa: BLE001
+                pass
+        return f"{'double-' if double else 'right-' if right else ''}clicked {what}" + (f" {count} times" if count > 1 else "") + state
+
+    def do_drag(self, from_name, to_name):
+        try:
+            a, b = self._screen_hits(from_name), self._screen_hits(to_name)
+        except RuntimeError as e:
+            return f"error: {e}"
+        if not a:
+            return f"error: could not find '{from_name}'"
+        if not b:
+            return f"error: could not find '{to_name}'"
+        cur = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(cur))
+        _glide(cur.x, cur.y, a[0], a[1])
+        time.sleep(0.03)
+        user32.mouse_event(2, 0, 0, 0, 0)
+        time.sleep(0.05)
+        for dx in (4, 9):                                                           # a small first move starts the drag in the app
+            user32.SetCursorPos(a[0] + dx, a[1])
+            time.sleep(0.02)
+        _glide(a[0] + 9, a[1], b[0], b[1], steps=12, pause=0.008)                   # ~0.1 s: fast, but every drop target still sees it pass
+        time.sleep(0.06)
+        user32.mouse_event(4, 0, 0, 0, 0)
+        time.sleep(0.08)
+        return f"dragged {a[2]} onto {b[2]}"
+
+    def do_wait(self, seconds):
+        seconds = max(0.0, min(120.0, float(seconds)))
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if getattr(self.solu, "task_cancelled", lambda: False)():
+                return "stopped waiting (the task was stopped)"
+            time.sleep(min(0.5, end - time.monotonic()))
+        return f"waited {seconds:g} seconds"
+
+    def do_wait_for_text(self, text, seconds=30):
+        import screen
+        end = time.monotonic() + max(2.0, min(300.0, float(seconds)))
+        want = " ".join(text.lower().split())
+        while time.monotonic() < end:
+            if getattr(self.solu, "task_cancelled", lambda: False)():
+                return "stopped waiting (the task was stopped)"
+            look = screen.look_at_foreground()
+            if not look.blocked and want in " ".join(screen.read_text(look).lower().split()):
+                return f"'{text}' is on the screen"
+            time.sleep(1.5)
+        return f"error: '{text}' did not appear within {seconds} seconds"
+
+    def do_agent_wait(self, agent, minutes=15):
+        name = "Codex" if str(agent).lower().startswith("co") else "Claude Code"
+        end = time.monotonic() + max(1.0, min(120.0, float(minutes))) * 60
+        seen_working = False
+        time.sleep(4)                                                               # it takes a moment to start
+        while time.monotonic() < end:
+            if getattr(self.solu, "task_cancelled", lambda: False)():
+                return "stopped waiting (the task was stopped)"
+            sessions = [a for a in (self.solu.context or {}).get("agents", []) if a.get("agent") == name]
+            if sessions:
+                top = sessions[0]
+                if top["state"] == "working" or top["state"] == "waiting for the user":
+                    seen_working = True
+                    if top["state"] != "working":
+                        pass                                                         # it needs the user: the island shows the card
+                elif seen_working or time.monotonic() - (end - float(minutes) * 60) > 30:
+                    return f"{name} finished. Its last message: {top.get('last_reply', '(none)')[:700]}"
+            time.sleep(2.5)
+        return f"error: {name} was still busy after {minutes} minutes"
 
     def do_click_text(self, text):
         import screen
@@ -768,10 +1082,50 @@ class Hands:
         user32.mouse_event(4, 0, 0, 0, 0)
         return f"clicked '{seen}'"
 
-    def do_type_text(self, text):
-        time.sleep(0.2)
+    def _field_at(self, into):
+        """Where to click to type into the field called `into`: the field itself (by name or placeholder), else the input box
+        nearest the label with that text (to its right, or just below), else the text itself. (x, y, what) or None."""
+        import uia
+        v = self._view_now()
+        fields = [e for e in v["items"] if e.kind in ("text field", "dropdown")]
+        el = uia.find(into, fields)
+        if el:
+            return int(el.center[0]), int(el.center[1]), f"{el.kind} \"{el.name}\""
+        label = self._screen_hits(into)
+        if label and fields:
+            lx, ly = label[0], label[1]
+
+            def score(e):
+                dx, dy = e.center[0] - lx, e.center[1] - ly
+                return abs(dy) * 2 + abs(dx) + (400 if dx < -20 and abs(dy) < 40 else 0) + (400 if dy < -20 else 0)
+            best = min(fields, key=score)
+            if score(best) < 700:
+                return int(best.center[0]), int(best.center[1]), f"{best.kind} next to {label[2]}"
+        return label
+
+    def do_type_text(self, text, into=""):
+        if into:
+            try:
+                hit = self._field_at(into)
+            except RuntimeError as e:
+                return f"error: {e}"
+            if not hit:
+                return f"error: nothing was typed: could not find the field '{into}'. Use look to see the fields."
+            cur = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(cur))
+            _glide(cur.x, cur.y, hit[0], hit[1])
+            time.sleep(0.02)
+            user32.mouse_event(2, 0, 0, 0, 0)
+            time.sleep(0.015)
+            user32.mouse_event(4, 0, 0, 0, 0)
+            time.sleep(0.08)
+            self._view = None
+            time.sleep(0.05)
+            type_unicode(text)
+            return f"clicked {hit[2]} and typed {len(text)} characters into it (typing is not repeated: check the screen for it)"
+        time.sleep(0.05)
         type_unicode(text)
-        return f"typed {len(text)} characters"
+        return f"typed {len(text)} characters into the focused field (typing is not repeated: check the screen for it)"
 
     def do_press_keys(self, keys):
         press(keys)

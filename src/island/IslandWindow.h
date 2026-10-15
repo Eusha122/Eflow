@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 #include "core/Gfx.h"
@@ -12,9 +13,17 @@
 #include "mascot/Mascot.h"
 #include "services/AudioDevices.h"
 #include "services/CameraService.h"
+#include "services/LyricsService.h"
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
+#include "core/Activity.h"
+#include "services/AgentMonitor.h"
+#include "services/ShelfStore.h"
+
+#include <oleidl.h>
+#include <set>
+#include <unordered_map>
 #include "services/SoluService.h"
 #include "services/SystemMonitor.h"
 
@@ -22,7 +31,7 @@ namespace eflow {
 
 class MascotRenderer;
 
-inline constexpr int kSectionCount = 5;   // Music, Notifications, Messages, AI Requests, System
+inline constexpr int kSectionCount = 6;   // Music, Notifications, Solu AI, Agents, System, Shelf
 inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
@@ -31,7 +40,7 @@ inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 // inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
-    enum class Section { Music, Notifications, Solu, Ai, System };
+    enum class Section { Music, Notifications, Solu, Ai, System, Shelf };
 
     // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
     // may be null, in which case the island runs without the mascot.
@@ -50,6 +59,9 @@ public:
     void OnNotification();                       // opens briefly on the Notifications tab
     void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
     void SetMedia(const MediaInfo& media);
+    void SetLyrics(const Lyrics& lyrics);
+    void SetLyricsOn(bool on);
+    void SetLyricsHandler(std::function<void(bool)> handler) { lyricsHandler_ = std::move(handler); }
     void SetMediaHandler(std::function<void(MediaCommand, double)> handler) { mediaHandler_ = std::move(handler); }
     void SetNotifications(const NotificationSnapshot& snapshot);
     void SetNotificationHandlers(std::function<void(uint32_t)> dismiss, std::function<void()> clearAll) {
@@ -70,7 +82,34 @@ public:
     void SetCamera(const CameraSnapshot& snapshot);
     void SetSolu(const SoluSnapshot& snapshot);
     void PostClickAway();                        // called by the global mouse hook
-    void ShowForSolu();                          // the hotkey was pressed: open so the conversation is visible
+    void ShowForSolu();
+    // The Agents tab: Claude Code and Codex sessions, what they are doing, and a box to send them a prompt.
+    void SetAgents(const AgentSnapshot& snapshot);
+    void SetAgentHandlers(std::function<bool(AgentTool, const std::wstring&, const std::wstring&, const std::wstring&, bool, std::wstring&)> send,
+                          std::function<void(AgentTool)> connect) {
+        agentSend_ = std::move(send);
+        agentConnect_ = std::move(connect);
+    }
+    // The file shelf: drop files on the island to hold them, drag them out again into any folder, app or web page.
+    void SetShelf(const ShelfSnapshot& snapshot);
+    void SetShelfHandlers(std::function<void(const std::vector<std::wstring>&)> add, std::function<void(const std::wstring&)> remove,
+                          std::function<void()> clear) {
+        shelfAdd_ = std::move(add);
+        shelfRemove_ = std::move(remove);
+        shelfClear_ = std::move(clear);
+    }
+    DWORD ShelfDragEnter(IDataObject* data);                     // called by the OLE drop target (in IslandWindow.cpp)
+    DWORD ShelfDragOver();
+    void ShelfDragLeave();
+    DWORD ShelfDrop(IDataObject* data);
+    void SetTaskHandler(std::function<void(const std::string&, const std::string&)> handler) { taskHandler_ = std::move(handler); }
+    void SetAgentOpen(std::function<void(const AgentSession&, bool)> open) { agentOpen_ = std::move(open); }
+    void FocusAgentPrompt();                     // Ctrl+Alt+A: open on the Agents tab with the cursor in the prompt box
+    // Live pills on the thin bar (downloads, copies, focus timer, research, nudges), most important first.
+    void SetActivities(const std::vector<Activity>& items);
+    void SetActivityDismiss(std::function<void(const std::wstring&)> dismiss) { activityDismiss_ = std::move(dismiss); }
+    void SetMood(Mascot::Mood mood) { if (mascot_) mascot_->SetMood(mood); }
+    void Cheer() { if (mascot_) { mascot_->Cheer(); Animate(); } }                          // the hotkey was pressed: open so the conversation is visible
     void SetSoluHandlers(std::function<void(bool)> enable, std::function<void()> talk, std::function<void(const std::wstring&)> voice,
                          std::function<void(bool)> headphones, std::function<void()> stop, std::function<void(bool)> captions,
                          std::function<void(bool)> screen) {
@@ -84,6 +123,7 @@ public:
     }
 #ifndef NDEBUG
     void DebugOpenTab(int section);              // scripted tests: open on a tab and keep it open (-1 releases)
+    std::string DebugLayout() const;             // the shoot director: where the buttons are, in screen pixels (JSON)
 #endif
     // Called with true while the System tab is on screen (so the monitor samples), false otherwise.
     void SetSystemWatchHandler(std::function<void(bool)> handler) { systemWatchHandler_ = std::move(handler); }
@@ -237,10 +277,16 @@ private:
     Spring w_, h_;
     Spring tabX_, tabW_;                         // selection pill
     std::array<float, kSectionCount> tabHover_{};            // 0..1 hover highlight per tab
-    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0, 0}; // cross-fade between sections
+    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0, 0, 0}; // cross-fade between sections
     Section section_ = Section::Music;
 
     MediaInfo media_;
+    Lyrics lyrics_;
+    bool lyricsOn_ = true;
+    int lyricLine_ = -1, lyricPrev_ = -1;        // the line being sung, and the one fading out
+    float lyricT_ = 1.0f;                        // 0 -> 1: the change from lyricPrev_ to lyricLine_
+    float lyricsHover_ = 0.0f;                   // the lyrics button in the Music tab
+    std::function<void(bool)> lyricsHandler_;
     std::function<void(MediaCommand, double)> mediaHandler_;
     bool seeking_ = false;                       // the progress bar is being dragged
     float seekFraction_ = 0, seekHover_ = 0;
@@ -270,7 +316,80 @@ private:
     float captionEndHover_ = 0;                  // the "End" pill of the live view
     bool clickAwayOn_ = false;
     void UpdateClickAway();                      // watch for clicks outside the island only while the live view is up
-    bool captionsYielded_ = false;               // the user picked a tab / menu during a conversation: the live view steps aside until it ends
+    bool captionsYielded_ = false;
+    // ---- Shelf tab
+    ShelfSnapshot shelf_;
+    std::function<void(const std::vector<std::wstring>&)> shelfAdd_;
+    std::function<void(const std::wstring&)> shelfRemove_;
+    std::function<void()> shelfClear_;
+    std::set<std::wstring> shelfSel_;                            // selected items (paths)
+    std::unordered_map<std::wstring, Com<ID2D1Bitmap1>> shelfBitmaps_;
+    std::unordered_map<std::wstring, float> shelfPop_;           // 0 -> 1 as an item appears
+    std::set<std::wstring> shelfSeen_;
+    std::vector<float> shelfHover_;
+    float shelfScroll_ = 0, dragT_ = 0;
+    bool dragOver_ = false, dragOpened_ = false, shelfDragging_ = false;
+    int shelfPressed_ = -1, shelfLastItem_ = -1;
+    POINT shelfPressPt_{};
+    ULONGLONG shelfLastClick_ = 0;
+    IDropTarget* dropTarget_ = nullptr;
+    D2D1_RECT_F ShelfCard(const D2D1_RECT_F& island, int index) const;
+    D2D1_RECT_F ShelfArea(const D2D1_RECT_F& island) const;
+    void DrawShelf(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    ID2D1Bitmap1* ShelfBitmap(const ShelfItem& item);
+    void StartShelfDrag(int index);
+    void ShelfAddFiles();
+    void OpenShelfItem(int index, bool reveal);
+    // ---- Agents tab
+    AgentSnapshot agents_;
+    AgentTool agentTool_ = AgentTool::Claude;
+    std::wstring agentSession_;                  // chosen session id ("" = the best one of that agent)
+    bool agentAuto_ = true;                      // follow whichever agent is working until the user picks one
+    int agentScroll_ = 0;                        // feed rows scrolled up from the newest
+    std::wstring prompt_, agentError_;
+    size_t caret_ = 0;
+    float promptScroll_ = 0;
+    bool promptFocus_ = false, newChat_ = false;
+    HWND prevForeground_ = nullptr;
+    uint32_t agentVersionSeen_ = 0;
+    std::function<bool(AgentTool, const std::wstring&, const std::wstring&, const std::wstring&, bool, std::wstring&)> agentSend_;
+    std::function<void(AgentTool)> agentConnect_;
+    std::function<void(const AgentSession&, bool)> agentOpen_;
+    std::function<void(const std::string&, const std::string&)> taskHandler_;
+    int SoluTaskRows() const;                    // how many task rows the Solu AI tab shows
+    Com<ID2D1Bitmap1> logoClaude_, logoCodex_;
+    struct AgentsLayout {
+        D2D1_RECT_F tool[2], connect, prev, next, header, feed, newBtn, box, send;
+        int rows = 0;
+    };
+    AgentsLayout AgentsGeometry(const D2D1_RECT_F& island) const;
+    const AgentSession* CurrentSession() const;
+    std::vector<const AgentSession*> SessionsOf(AgentTool tool) const;
+    void AutoPickAgent();
+    void DrawAgents(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    ID2D1Bitmap1* Logo(AgentTool tool);
+    void FocusPrompt();
+    void BlurPrompt(bool restoreWindow);
+    void SendPrompt();
+    void PromptInsert(const std::wstring& text);
+    void OnKey(WPARAM vk);
+    void OnChar(wchar_t ch);
+    void UpdateAgentTimer();
+    std::vector<Activity> activities_;
+    std::function<void(const std::wstring&)> activityDismiss_;
+    bool Live() const { return !activities_.empty(); }
+    bool LyricsReady() const;                    // synced lyrics for the playing song, and lyrics are on
+    bool LyricsPill() const;                     // the closed island shows the line being sung
+    float LyricShift() const;                    // how much lower the Music tab's bar and buttons sit for the lyric lines
+    void UpdateLyricLine();                      // which line is being sung now; schedules the next change
+    void RefreshCollapsed();                     // the closed island's size follows what it shows
+    D2D1_POINT_2F LyricsButton(const D2D1_RECT_F& island) const;
+    void DrawLyricPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float alpha);
+    void DrawLyricLines(ID2D1DeviceContext* dc, float x0, float x1, float top, float alpha);
+    float CollapsedW() const;                    // the idle bar, or the wider live pill
+    float CollapsedH() const;
+    D2D1_RECT_F LiveClose(const D2D1_RECT_F& pill) const;
+    void DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float alpha);               // the user picked a tab / menu during a conversation: the live view steps aside until it ends
     std::function<void()> soluTalk_, soluStop_;
     std::function<void(const std::wstring&)> soluVoice_;
     int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices

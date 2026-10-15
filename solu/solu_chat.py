@@ -33,9 +33,12 @@ from kokoro_onnx import Kokoro  # noqa: E402
 
 from voice_presets import PRESETS, speak  # noqa: E402
 import screen as screen_mod  # noqa: E402
-import actions  # noqa: E402
+import actions
+import gpu  # noqa: E402
 import memory as memory_mod  # noqa: E402
 import research as research_mod  # noqa: E402
+import tasks as tasks_mod  # noqa: E402
+import skills  # noqa: E402
 
 OLLAMA = "http://127.0.0.1:11434/api/chat"
 BRAIN = "qwen3:8b"
@@ -46,6 +49,14 @@ SCREEN_NOTE = (
     "Answer their question directly in one to three spoken sentences. Quote only the few words that matter. "
     "Do not mention OCR, screenshots or extracted text: talk as if you are looking at their screen. "
     "If what you can see does not contain the answer, say what you can see and ask what they want to know."
+)
+TRANSLATE_NOTE = (
+    " The user wants a translation of what is on their screen. Translate the visible text {target}. Give only the translation, "
+    "complete and faithful, keeping names and numbers; skip menus, buttons and other interface text. No comments before or after."
+)
+CODE_NOTE = (
+    " The user is stuck on an error or a problem in code on their screen. In two to four spoken sentences: say what the error means, "
+    "the most likely cause, and the concrete fix (the exact change or command). If the screen doesn't show enough, say what you need."
 )
 SCREEN_ONLY_LOOK = ("Describe what is on my screen in a sentence or two, and point out anything important, "
                     "like an error, a question, or something I need to answer.")
@@ -72,6 +83,8 @@ AGENT_NOTE = (
     "empty 'to'; it then opens as a Gmail draft where the user adds the address. "
     "Answer only what the user just said: don't bring up old topics or look at the screen unless they ask. "
     "Don't create or change files unless the user asked for a file. "
+    "For a goal that needs many separate actions over minutes (about four or more steps, or 'in the background', 'keep working', "
+    "'by yourself'), call start_task with the goal in the user's words instead of doing it step by step here; the plan is shown for approval. "
     "For a quick question about a topic, use research and answer out loud. When they want deep or in-depth research, a report or a "
     "document, call deep_research once: it works in the background and opens the report in Chrome, so just tell them you're on it. "
     "Don't talk while calling tools; when everything is done, say in one short sentence what you did, or what went wrong. "
@@ -139,10 +152,47 @@ def find_device(kind, friendly):
     return None
 
 
+def live_default_input():
+    """Name of the microphone Windows uses as its default RIGHT NOW (cut to 31 characters, like PortAudio's), or None.
+    PortAudio decides its own default once, when it starts, and never updates it: a mic that was plugged in or made the
+    default afterwards (or a phone-webcam mic that grabbed the default earlier) would be heard instead. Windows' mapper
+    device is asked live, so Solu always agrees with the island."""
+    try:
+        winmm = ctypes.WinDLL("winmm")
+
+        class Caps(ctypes.Structure):
+            _fields_ = [("m", ctypes.c_ushort), ("p", ctypes.c_ushort), ("v", ctypes.c_uint), ("name", ctypes.c_wchar * 32),
+                        ("f", ctypes.c_uint), ("ch", ctypes.c_ushort), ("r", ctypes.c_ushort)]
+
+        dev, flags = ctypes.c_uint(), ctypes.c_uint()
+        if winmm.waveInMessage(ctypes.c_void_p(0xFFFFFFFF), 0x2015, ctypes.byref(dev), ctypes.byref(flags)) != 0 or dev.value == 0xFFFFFFFF:
+            return None
+        caps = Caps()
+        if winmm.waveInGetDevCapsW(dev.value, ctypes.byref(caps), ctypes.sizeof(caps)) != 0:
+            return None
+        return caps.name or None
+    except Exception:                                                         # noqa: BLE001
+        return None
+
+
+def mapper_index(kind):
+    """PortAudio index of Windows' sound mapper: opening it picks whatever the Windows default is at that moment."""
+    import sounddevice as sd
+    channels = "max_input_channels" if kind == "input" else "max_output_channels"
+    for i, d in enumerate(sd.query_devices()):
+        if d["hostapi"] == 0 and d[channels] > 0 and "Sound Mapper" in d["name"]:
+            return i
+    return None
+
+
 class Solu:
     def __init__(self, args):
         self.args = args
         self.in_dev = self.out_dev = None                                    # PortAudio indexes (None = system default)
+        self.live_default = None                                             # the default microphone Windows reported last
+        self.in_epoch = 0                                                    # bumped whenever the microphone must be reopened
+        self.need_pa_refresh = False                                         # PortAudio's device list is out of date (a device was plugged in)
+        self._pa_refreshed_for = None
         self.status = {"input": ("", True), "output": ("", True)}            # (device name, connected)
         self.mic_level = 0.0
         self.cfg_mtime = None
@@ -152,6 +202,18 @@ class Solu:
         self.memory = memory_mod.Memory()                                    # lasting facts about the user
         self.conversation_from = 0                                           # where the current conversation starts in the history
         self.jobs = []                                                       # research running in the background
+        self.chat_priority_until = 0.0                                       # the user is talking: background work keeps out of the model's way
+        self.tasks = None                                                    # long tasks (the task runner starts with the service)
+        self.clipboard = skills.ClipboardHistory()                           # what was copied lately (memory only, never on disk)
+        self.routines = skills.Routines()                                    # "when I say study mode, ..."
+        self.quiz = None                                                     # the study buddy, while a quiz runs
+        self.notes = None                                                    # lecture / meeting notes, while recording
+        self.context = {}                                                    # what Eflow shares: notification senders and counts
+        self.paused = False                                                  # privacy key: the microphone is closed
+        self.stt_lock = threading.Lock()                                     # Whisper is shared by the mic and the note taker
+        if getattr(args, "service", False):
+            self.tasks = tasks_mod.TaskRunner(self, OLLAMA, BRAIN, CTX)          # long goals, done in the background
+            skills.Nudges(self).start()                                      # rare, quiet pills (battery, tomorrow's plans, breaks)
         self.approvals = {}                                                  # approval id -> {"event", "answer"}
         self.pending_approval = None                                         # an approval card is waiting for the user
         self._approval_seq = 0
@@ -171,7 +233,8 @@ class Solu:
                 threading.Thread(target=self.title_loop, daemon=True).start()
         print("loading models...")
         self.vad = Vad()
-        self.stt = WhisperModel("small", device="cuda", compute_type="float16")
+        on_cpu = os.environ.get("SOLU_STT_CPU") == "1"                         # tests: a second copy must not take more of the graphics card
+        self.stt = WhisperModel("small", device="cpu" if on_cpu else "cuda", compute_type="int8" if on_cpu else "float16")
         self.tts = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
         speak(self.tts, args.voice, "Hi.")                                   # warm up
         list(self.stt.transcribe(np.zeros(16000, np.float32), language="en")[0])
@@ -190,6 +253,11 @@ class Solu:
     def check_devices(self, force=False):
         """Follow the microphone and speaker picked on the island's Voice tab (re-read whenever the file changes)."""
         import sounddevice as sd
+        live = live_default_input()
+        if live != self.live_default:                                         # Windows' default microphone changed: follow it
+            self.live_default = live
+            self.in_epoch += 1
+            force = True
         try:
             mtime = os.path.getmtime(VOICE_CONFIG)
         except OSError:
@@ -199,16 +267,26 @@ class Solu:
         self.cfg_mtime = mtime
         cfg = read_voice_config()
         for kind in ("input", "output"):
-            wanted, index, connected = cfg[kind], None, True
+            wanted, index, connected, following = cfg[kind], None, True, False
             if kind == "input" and self.args.mic is not None:
                 index = self.args.mic                                         # --mic overrides the island
             elif wanted:
                 index = find_device(kind, wanted)
                 connected = index is not None                                 # picked but not plugged in: use the default meanwhile
+                if index is None and kind == "input":
+                    if self._pa_refreshed_for != wanted:                      # plugged in after Solu started: PortAudio's list is stale
+                        self._pa_refreshed_for = wanted
+                        self.need_pa_refresh = True
+                        self.in_epoch += 1
+                    index, following = mapper_index("input"), True            # meanwhile: the live Windows default, not a frozen one
+            elif kind == "input":
+                index, following = mapper_index("input"), True                # no pick: follow Windows' default, live
             try:
                 name = sd.query_devices(index, kind)["name"] if index is not None else sd.query_devices(kind=kind)["name"]
             except Exception:                                                 # noqa: BLE001
                 name, connected = wanted or "no device", False
+            if following and live and not wanted:
+                name = live                                                   # what Windows really uses now, not "Sound Mapper"
             if wanted:
                 name = wanted                                                 # the island's full name, not PortAudio's cut-off one
             previous = self.status[kind]
@@ -356,13 +434,11 @@ class Solu:
             self.history.append({"role": "user", "content": f"{user_text}\n[Screen: {where}: {screen['text'][:1200]}]"})   # kept short for follow-ups
             if screen["vlm"]:
                 message = {"role": "user", "content": asked, "images": [screen["image"]]}
-                body = {"model": VISION, "stream": True, "think": False, "keep_alive": 0,          # free the GPU for the brain right after
-                        "options": {"num_ctx": 4096, "temperature": 0.4},
-                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + before[-4:] + [message]}
+                body = gpu.body(VISION, {"num_ctx": 4096, "temperature": 0.4}, keep=0, stream=True, think=False,   # free the GPU right after
+                                messages=[{"role": "system", "content": SYSTEM + screen.get("note", SCREEN_NOTE)}] + before[-4:] + [message])
             else:
-                body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
-                        "options": {"num_ctx": CTX, "temperature": 0.4},
-                        "messages": [{"role": "system", "content": SYSTEM + SCREEN_NOTE}] + before + [{"role": "user", "content": asked}]}
+                body = gpu.body(BRAIN, {"num_ctx": CTX, "temperature": 0.4}, stream=True, think=False,
+                                messages=[{"role": "system", "content": SYSTEM + screen.get("note", SCREEN_NOTE)}] + before + [{"role": "user", "content": asked}])
         reply, _, first_token = self._stream(body)
         print(f"   solu: {reply.strip()}   (brain first token {1000 * (first_token or 0):.0f} ms)")
         self.history.append({"role": "assistant", "content": reply.strip()})
@@ -440,7 +516,8 @@ class Solu:
         turn = [{"role": "user", "content": user_text}]                       # this request, with its real tool calls and results
         self.request_text = user_text
         said, did, t0, nudges, done, repeats = [], [], time.perf_counter(), 0, {}, 0
-        self.allow_all = False                                                # "yes to all": the rest of this request needs no cards
+        self.allow_all = getattr(self, "allow_all_next", False)              # "yes to all" (or a routine): no cards for safe steps
+        self.allow_all_next = False
         follow_up = len(user_text.split()) <= 8 and re.search(r"\b(it|that|this|them|again|do it|send|go ahead|now|too|also)\b", user_text.lower())
         tools = actions.pick_tools(user_text, getattr(self, "last_tools", ()) if follow_up else ())
         self.last_tools = [t["function"]["name"] for t in tools]
@@ -456,13 +533,13 @@ class Solu:
         if any(t["function"]["name"] == "system_info" for t in tools):        # time, date, battery, disks: fetched, never guessed
             known += f"\nRight now (real, use these exact values): {self.hands.run('system_info', {})}"
             tools = [t for t in tools if t["function"]["name"] != "system_info"]
+        forced = False                                                        # it said "one moment" over and over: made to answer once
         for _ in range(14):                                                   # enough steps for a longer task
             if repeats >= 2:
                 break
             past = self.recent(14) if tools else self.recent(14, plain=True)   # no tools: no old tool calls in sight to imitate
             messages = [{"role": "system", "content": SYSTEM + (AGENT_NOTE if tools else "") + known}] + past + turn
-            body = {"model": BRAIN, "stream": True, "think": False, "keep_alive": "30m",
-                    "options": {"num_ctx": CTX, "temperature": 0.5}, "messages": messages}
+            body = gpu.body(BRAIN, {"num_ctx": CTX, "temperature": 0.5}, stream=True, think=False, messages=messages)
             if tools:
                 body["tools"] = tools                                         # only what this request asks for; plain chat gets none
             reply, calls, first_token = self._stream(body)
@@ -479,7 +556,7 @@ class Solu:
                 break
             if not calls:
                 # "I'll check that for you..." and then nothing: words don't do anything, so push it to act once.
-                if nudges < 3 and PROMISE.search(reply.lower()):
+                if nudges < 3 and not forced and PROMISE.search(reply.lower()):
                     nudges += 1
                     turn += [{"role": "assistant", "content": reply},
                              {"role": "user", "content": "(Eflow: nothing has happened yet. Call the tool now, without commenting on this note.)"}]
@@ -524,6 +601,11 @@ class Solu:
                 turn.append({"role": "assistant", "content": text})
                 break
             if not fresh and reply.strip():                                   # it answered and only repeated itself: the answer stands
+                if PROMISE.search(reply.lower()) and not forced:              # ... unless that "answer" is only "one moment, I'm looking": make it answer now
+                    forced, tools, repeats = True, [], 0
+                    turn.append({"role": "user", "content": "(Eflow: you already have what the tool showed. Answer the user now in one or two plain "
+                                                            "sentences. Do not call a tool and do not say you are still looking.)"})
+                    continue
                 break
         text = re.sub(r"(\s+[?.!,]+)+$", "", " ".join(said).strip())
         if said and said[-1] in ("Okay, I won't.", "Okay, I'll leave it for now.") and len(said) > 1:
@@ -560,9 +642,12 @@ class Solu:
         self.event("action", tool=name)
         return self.hands.run(name, args)
 
-    def ask_permission(self, name, args):
-        """Show the approval card and wait for a tap (or a spoken yes / no). Returns allow, always, deny or timeout."""
+    def ask_permission(self, name, args, background=False):
+        """Show the approval card and wait for a tap (or a spoken yes / no). Returns allow, always, deny or timeout.
+        background: asked by a task, not in the middle of a conversation turn: it waits for the conversation, leaves its flags alone."""
         action, detail, risky, can_always = actions.describe(name, args)
+        if background:
+            return self._ask_permission_background(name, action, detail, risky, can_always)
         self._wait_for_playback()                                             # let Solu finish its sentence first
         self._approval_seq += 1
         aid = self._approval_seq
@@ -588,6 +673,32 @@ class Solu:
         self._speaking_reported = False
         self.speaking.set()
         self.event("state", state="thinking")
+        print(f"   [approval {aid}] {answer}")
+        return answer
+
+    def _ask_permission_background(self, name, action, detail, risky, can_always):
+        t0 = time.monotonic()
+        while self.chat_busy() and time.monotonic() - t0 < 120:               # not on top of what is being said
+            time.sleep(0.3)
+        self._approval_seq += 1
+        aid = self._approval_seq
+        waiter = threading.Event()
+        self.approvals[aid] = {"event": waiter, "answer": None}
+        self.event("approve", id=aid, action=action, detail=detail, risky=risky, always=can_always)
+        what = "run this task" if name == "run_task" else action
+        question = f"Can I {what}? Tap Approve on the island, or just say yes." if not self._told_about_card else f"Can I {what}?"
+        self._told_about_card = True
+        print(f"   [approval {aid}] {action}: {detail[:100]}{'  (RISKY)' if risky else ''} -- waiting for the user (task)")
+        self.pending_approval = aid
+        self.start_conversation()                                             # so a plain "yes" is heard without the name
+        self.respond_text(question)
+        deadline = time.monotonic() + 15 * 60
+        while not waiter.wait(0.3) and time.monotonic() < deadline:
+            if self.tasks and self.tasks.cancelled():
+                break
+        self.pending_approval = None
+        answer = self.approvals.pop(aid, {}).get("answer") or "timeout"
+        self.event("resolved", id=aid)
         print(f"   [approval {aid}] {answer}")
         return answer
 
@@ -617,9 +728,8 @@ class Solu:
 
     def _ask(self, prompt, as_json=False):
         """One non-streamed answer from the brain (background work: memory, research)."""
-        body = {"model": BRAIN, "stream": False, "think": False, "keep_alive": "30m",
-                "options": {"num_ctx": CTX, "temperature": 0.1 if as_json else 0.4, "num_predict": 2500},
-                "messages": [{"role": "user", "content": prompt}]}
+        body = gpu.body(BRAIN, {"num_ctx": CTX, "temperature": 0.1 if as_json else 0.4, "num_predict": 2500}, stream=False, think=False,
+                        messages=[{"role": "user", "content": prompt}])
         if as_json:
             body["format"] = "json"
         req = urllib.request.Request(OLLAMA, json.dumps(body).encode(), {"Content-Type": "application/json"})
@@ -634,15 +744,41 @@ class Solu:
         job = research_mod.Job(topic, depth, self._ask, self._wait_idle, self._research_done)
         self.jobs = (self.jobs + [job])[-5:]
         job.start()
+
+        def follow():                                                         # the island shows it while it works
+            while job.is_alive():
+                self.event("activity", id="research", title="Researching", detail=f"{job.topic} · {job.status}",
+                           progress=round(max(0.03, job.progress), 2))
+                time.sleep(2)
+        threading.Thread(target=follow, daemon=True).start()
         minutes = "3 to 6" if job.depth == "deep" else "1 to 3"
         return (f"started {job.depth} research on '{job.topic}' in the background (about {minutes} minutes). Tell the user you're on it, "
                 f"that they can keep talking to you, and that the report will open in Chrome when it's ready.")
+
+    def chat_busy(self):
+        """True while Solu talks, the user talks, or a card waits for an answer: background work must not use the model then."""
+        return self.speaking.is_set() or time.monotonic() < self.chat_priority_until or self.pending_approval is not None
+
+    def task_cancelled(self):
+        return bool(self.tasks and self.tasks.in_task() and self.tasks.cancelled())
+
+    def task_say(self, text, listen=False):
+        """A task says something (a question, the result): after whatever is being said now. listen: the next sentence is the answer."""
+        if not text:
+            return
+        t0 = time.monotonic()
+        while self.chat_busy() and time.monotonic() - t0 < 120:
+            time.sleep(0.3)
+        if listen:
+            self.start_conversation()
+        self.respond_text(text)
 
     def _wait_idle(self):
         while self.speaking.is_set():                                         # the conversation always goes first
             time.sleep(0.3)
 
     def _research_done(self, job):
+        self.event("activity_end", id="research", done=not job.error, title="Research ready", detail=job.title)
         if job.error:
             text = f"Sorry, the research on {job.topic} didn't work out. {job.error[:80]}"
         else:
@@ -685,7 +821,7 @@ class Solu:
 
     def _load_brain(self):
         try:
-            req = urllib.request.Request(OLLAMA.replace("/chat", "/generate"), json.dumps({"model": BRAIN, "prompt": "", "keep_alive": "30m", "options": {"num_ctx": CTX}}).encode(),
+            req = urllib.request.Request(OLLAMA.replace("/chat", "/generate"), json.dumps(gpu.body(BRAIN, {"num_ctx": CTX}, prompt="")).encode(),
                                          {"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=120).read()
         except Exception:                                                     # noqa: BLE001
@@ -701,6 +837,10 @@ class Solu:
         if not t:
             return False
         if re.match(r"^(look|have a look|take a look)\b(?!\s+(up|for|after|out|forward)\b)", t):
+            return True
+        if re.search(r"\bwhy (is|does|did) (this|it|my (code|build|program|app))( keep)? (fail|failing|crash|crashing|break|breaking|not work)|"
+                     r"\bfix (this|the) (error|bug|problem)\b|\bwhat('?s| is) wrong with (this|my) (code|build|program)\b|"
+                     r"\btranslate (this|that|it|the (page|text|screen|message|email))\b", t):
             return True
         if re.search(r"\b(what am i looking at|can you see (this|my screen|it|that)|what('?s| is) on my screen|what('?s| is) happening on my screen|help me with this|what('?s| is) wrong (with )?(this|here)|what does (this|that|it) (say|mean))\b", t):
             return True
@@ -723,13 +863,27 @@ class Solu:
         look = screen_mod.look_at_foreground(whole)
         if look.blocked:
             return self.respond_text(look.blocked)
+        self._answer_look(look, text)
+
+    def _answer_look(self, look, text, mode=None):
+        """Answer `text` about a captured window or area: explain, translate, help with an error."""
+        t = " ".join(re.findall(r"[a-z0-9']+", text.lower()))
         self.event("looking", title=look.title, app=look.app, scope=look.scope, thumb=screen_mod.thumbnail_b64(look))
         ocr = screen_mod.read_text(look)
-        question = text
+        question, note = text, SCREEN_NOTE
         if re.fullmatch(r"(look( at (this|that|it|my screen|the screen))?|take a look|have a look|see this|what('?s| is) on my screen|can you see (this|it|that|my screen))", t):
             question = SCREEN_ONLY_LOOK
-        vlm = self.needs_vision(question, ocr)
-        screen = {"title": look.title, "app": look.app, "scope": look.scope, "text": ocr, "vlm": vlm,
+        if mode == "translate" or re.search(r"\btranslat", t):
+            to = re.search(r"\b(?:to|into)\s+(bangla|bengali|english|hindi|urdu|arabic|spanish|french|german|chinese|japanese|korean)\b", t)
+            target = f"into {to.group(1).capitalize()}" if to else "into English (or into Bangla if the text is already English)"
+            question, note = f"Translate the text on this screen {target}.", TRANSLATE_NOTE.format(target=target)
+        elif mode == "explain" and t in ("", "explain this", "look at this"):
+            question = "Explain what this part of the screen shows and anything important in it."
+        elif re.search(r"\b(error|bug|fail|failing|crash|exception|not working|broken|fix)\b", t):
+            note = CODE_NOTE
+        translating = question.startswith("Translate the text")
+        vlm = self.needs_vision(question, ocr) and not translating
+        screen = {"title": look.title, "app": look.app, "scope": look.scope, "text": ocr, "vlm": vlm, "note": note,
                   "image": screen_mod.picture_b64(look) if vlm else None}
         print(f"   looking at: {look.app} \u2014 {look.title!r} ({len(ocr)} characters read, {'picture' if vlm else 'text'} mode)")
         if vlm:
@@ -745,12 +899,315 @@ class Solu:
         finally:
             self._after_speaking()
 
+    # ---- quick capture --------------------------------------------------------------------------------------------------
+    def respond_region(self, x, y, w, h, mode="explain"):
+        from PIL import ImageGrab
+        try:
+            self.cancel.clear()
+            image = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).convert("RGB")
+            look = screen_mod.Look("the area you selected", "screen", image, "region")
+            look.origin = (x, y)
+            question = "Translate this." if mode == "translate" else "Explain this."
+            self.start_conversation()
+            self.event("heard", text="(the area you showed me)")
+            self.event("state", state="thinking")
+            self._answer_look(look, question, mode)
+        except Exception as e:                                                # noqa: BLE001
+            print(f"   (region failed: {e})")
+            self.respond_text("Sorry, I couldn't read that part of the screen.")
+
+    # ---- skills that are not a single tool call --------------------------------------------------------------------------
+    def special(self, target):
+        """A request that a skill handles itself (routines, quiz answers, the briefing, quick capture). A callable, or None."""
+        t = " ".join(re.findall(r"[a-z0-9']+", target.lower()))
+        task = self._task_skill(target, t)
+        if task:
+            return task
+        if self.quiz:                                                        # a quiz is running: this is the answer
+            if re.search(r"\b(stop|end|quit|finish|cancel)\b.*\bquiz\b|\b(stop|enough|that's enough)\b$", t):
+                return self.end_quiz
+            return lambda: self.quiz_answer(target)
+        if re.search(r"\b(stop|end|finish|done|that's it)\b.*\b(taking )?(notes?|recording|transcri\w*)\b|\bstop (the )?(lecture|meeting)\b|\bnotes? (are )?(done|finished)\b", t):
+            return lambda: self.respond_text(self._notes_stop_line())
+        m = re.search(r"\b(?:start|begin|take|record|make|write)\b.*\b(?:notes?|transcri\w*)\b", t) or re.fullmatch(r"(lecture|meeting|class|video) notes?( please)?", t)
+        if m and not self.notes and re.search(r"\b(lecture|meeting|video|class|call|this|notes?)\b", t) and not re.search(r"\b(stop|end|my notes|open|read)\b", t):
+            kind = "meeting" if re.search(r"\b(meeting|call|zoom|meet)\b", t) else "video" if "video" in t else "lecture"
+            return lambda: self.respond_text(self._notes_start_line(kind))
+        defined = self.routines.define(target)
+        if defined:
+            name, steps = defined
+            mine = steps.rstrip(".")
+            for a, b in ((r"\bme\b", "you"), (r"\bmy\b", "your"), (r"\bI\b", "you"), (r"\bmine\b", "yours")):   # "tell me" -> "tell you"
+                mine = re.sub(a, b, mine)
+            return lambda: self.respond_text(f"Okay. Whenever you say {name}, I'll {mine}.")
+        name = self.routines.match(target)
+        if name:
+            return lambda: self.run_routine(name)
+        if re.search(r"\b(list|what are) (my |the )?routines\b", t):
+            names = list(self.routines.items)
+            return lambda: self.respond_text(("Your routines are: " + ", ".join(names) + ".") if names else "You don't have any routines yet.")
+        m = re.search(r"\b(?:delete|remove|forget) (?:the |my )?routine (?:called )?(.+)$", t)
+        if m:
+            gone = self.routines.delete(m.group(1))
+            return lambda: self.respond_text(f"Deleted the {gone} routine." if gone else "I don't have a routine like that.")
+        if re.search(r"^(good morning|morning( solu)?|morning briefing|brief me|give me (my|a) briefing|what('s| is) (my day|on today|up today))\b", t):
+            return self.briefing
+        if re.search(r"\b(let me show you|i'll show you|i will show you|look at this (part|area|bit)|translate this (part|area|bit))\b", t):
+            mode = "translate" if "translat" in t else "explain"
+            return lambda: (self.event("capture", mode=mode), self.respond_text("Okay, drag over the part you mean."))
+        return None
+
+    def _task_skill(self, target, t):
+        """Starting, steering and answering long tasks by voice. A callable, or None."""
+        runner = self.tasks
+        if runner is None:
+            return None
+        say = lambda text: (lambda: self.respond_text(text))
+        live = any(x.status in ("planning", "running", "waiting", "paused") for x in runner.tasks)
+        if runner.waiting_question():                                         # the task asked something: this is the answer
+            if re.search(r"\b(stop|cancel|abort)\b.*\btask\b", t):
+                return lambda: self.respond_text(runner.control("cancel"))
+            return lambda: (runner.answer(target), self.respond_text("Okay."))
+        sched = tasks_mod.parse_schedule(target)
+        if sched:
+            goal, at, days = sched
+            runner.add_schedule(goal, at, days)
+            when = "every day" if len(days) == 7 else "on weekdays" if days == [0, 1, 2, 3, 4] else "weekly"
+            return say(f"Okay. {when.capitalize()} at {at} I'll {goal.rstrip('.')}.")
+        if re.search(r"\b(what('s| is| are)|list|show)\b.*\b(scheduled|schedules|recurring)\b", t):
+            return say("Scheduled: " + runner.list_schedules() + ".")
+        m = re.match(r"^(?:please )?(?:stop|cancel|remove|delete) (?:doing |the schedule for )?(.+?) every (?:day|morning|evening|night|weekday|week)", t)
+        if m:
+            gone = runner.remove_schedule(m.group(1))
+            return say(f"Okay, I won't do that every day any more." if gone else "I don't have a schedule like that.")
+        if live and re.search(r"\b(pause|hold off|freeze)\b.*\b(task|work|that)\b|\bpause the task\b", t):
+            return lambda: self.respond_text(runner.control("pause"))
+        if re.search(r"\b(resume|continue|carry on|keep going)\b.*\b(task|work)\b|^(continue|carry on|resume) (the )?task", t) and \
+                any(x.status == "paused" for x in runner.tasks):
+            return lambda: self.respond_text(runner.control("resume"))
+        if live and re.search(r"\b(stop|cancel|abort|kill|end)\b.*\b(task|that work|the work)\b|\bstop working on (it|that|this)\b", t):
+            return lambda: self.respond_text(runner.control("cancel"))
+        if re.search(r"\b(clear|remove|delete|forget)\b.*\b(finished|done|old|completed) tasks?\b", t):
+            return lambda: ([runner.control("remove", x.id) for x in list(runner.tasks) if x.status in ("done", "failed", "cancelled")],
+                            self.respond_text("Cleared the finished tasks."))
+        if re.search(r"\b(list|show|what)\b.*\btasks\b", t):
+            return lambda: self.respond_text(runner.list_text() + ".")
+        if runner.tasks and (re.search(r"\btask\b.*\b(status|going|progress|doing|done yet)\b|\bhow('s| is) the task\b|\bwhat are you (working on|doing)\b|\bany progress\b", t)):
+            return lambda: self.respond_text(runner.status_text())
+        m = re.match(r"^(?:please )?(?:start|begin|run|create|set up|give you|do)(?: a| the| this)?(?: long| big| background)? task[:,]?\s+(.{8,})$", target.strip(), re.I) or \
+            re.match(r"^(?:your )?(?:task|goal) (?:is|:)\s*(.{8,})$", target.strip(), re.I) or \
+            re.match(r"^(?:i want you to|i need you to|can you|could you) (?:go and |now )?(?:work on|take care of|figure out|handle) (.{8,}?)(?: (?:by yourself|on your own|in the background))?$", target.strip(), re.I)
+        if m:
+            goal = m.group(1).strip().rstrip(".")
+            return lambda: (runner.submit(goal), self.respond_text("Okay, I'll plan that and show you the plan to approve."))
+        return None
+
+    def run_routine(self, name):
+        steps = self.routines.items[name]
+        print(f"   [routine] {name}: {steps}")
+        self.respond_routine = True
+        try:
+            self.cancel.clear()
+            self._speaking_reported = False
+            self.speaking.set()
+            self.allow_all_next = True                                      # the user wrote this routine: its safe steps need no cards
+            self._agent(f"Do all of these now, one after another: {steps}")
+        finally:
+            self._after_speaking()
+
+    # ---- study buddy ------------------------------------------------------------------------------------------------------
+    def start_quiz_from(self, source=""):
+        src = (source or "").strip()
+        text, where = "", ""
+        if src and not re.search(r"\b(this|screen|page|pdf|document|window|it)\b", src.lower()):
+            text, where = actions.research(src), src                         # a topic: learn it from the web first
+        else:
+            look = screen_mod.look_at_foreground()
+            if look.blocked:
+                return "error: " + look.blocked
+            path = None
+            if look.title.lower().split(" - ")[0].strip().endswith(".pdf"):  # a PDF reader: read the whole file, not just the page
+                name = look.title.split(" - ")[0].strip()
+                found = actions.search_files(name).splitlines()
+                path = next((ln.replace("[folder] ", "") for ln in found if ln.lower().endswith(".pdf")), None)
+            if path and os.path.exists(path):
+                text, where = skills.pdf_text(path), os.path.basename(path)
+            else:
+                text, where = screen_mod.read_text(look), look.title
+        if len(text) < 200:
+            return "error: there isn't enough text to make a quiz from; open the page or PDF first, or name a topic"
+        data = json.loads(self._ask(skills.QUIZ.format(n=5, text=text[:9000]), True))
+        questions = [q for q in data.get("questions", []) if q.get("q") and q.get("a")][:5]
+        if not questions:
+            return "error: I couldn't make questions from that"
+        self.quiz = skills.Quiz(questions, data.get("topic") or where)
+        return (f"Quiz ready on {self.quiz.topic}: {len(questions)} questions. Tell the user you'll quiz them, then ask question 1 "
+                f"exactly as written: {questions[0]['q']}")
+
+    def quiz_answer(self, answer):
+        quiz = self.quiz
+        q = quiz.current
+        if not q:
+            return self.end_quiz()
+        try:
+            verdict = json.loads(self._ask(skills.GRADE.format(q=q["q"], a=q["a"], answer=answer), True))
+        except Exception:                                                     # noqa: BLE001
+            verdict = {"correct": False, "feedback": f"The answer was: {q['a']}"}
+        if verdict.get("correct"):
+            quiz.score += 1
+        else:
+            quiz.missed.append(q.get("point") or q["q"])
+        quiz.index += 1
+        line = verdict.get("feedback", "")
+        if quiz.current:
+            line += f" Question {quiz.index + 1}: {quiz.current['q']}"
+            self.respond_text(line)
+        else:
+            self.respond_text(line)
+            self.end_quiz()
+
+    def end_quiz(self):
+        quiz, self.quiz = self.quiz, None
+        if not quiz:
+            return
+        asked = max(1, quiz.index)
+        text = f"That's the quiz! You got {quiz.score} out of {asked}."
+        if quiz.missed:
+            text += " Worth reviewing: " + ", ".join(quiz.missed[:3]) + "."
+            self.memory.add(f"In a quiz on {quiz.topic}, the user found these hard: {', '.join(quiz.missed[:3])}.", "plan", "learned")
+        else:
+            text += " Perfect, nice work!"
+            self.event("cheer")
+        self.respond_text(text)
+
+    # ---- lecture / meeting notes ----------------------------------------------------------------------------------------------
+    def notes_start(self, kind="lecture"):
+        if self.notes and self.notes.is_alive():
+            return "error: I'm already taking notes; say stop taking notes when it's over"
+        self.notes = skills.NoteTaker(self, kind)
+        self.notes.start()
+        self.event("activity", id="notes", title="Taking notes", detail=f"{kind} · listening to your PC")
+        return f"started taking notes of the {kind} from the PC's sound. Tell the user you're listening and they should tell you when it's over."
+
+    def _notes_start_line(self, kind):
+        result = self.notes_start(kind)
+        if result.startswith("error"):
+            return "I'm already taking notes."
+        return f"Okay, I'm listening to the {kind} on your PC. Tell me when it's over."      # no quoted phrase for the echo filter to trip on
+
+    def _notes_stop_line(self):
+        if not self.notes:
+            return "I'm not taking notes right now."
+        self.notes_stop()
+        return "Okay, writing your notes now. They'll open in Chrome in a minute."
+
+    def notes_stop(self):
+        if not self.notes:
+            return "error: I'm not taking notes right now"
+        notes, self.notes = self.notes, None
+
+        def finish():
+            try:
+                path, title, markdown = notes.finish()
+                self.event("activity_end", id="notes", done=True, title="Notes ready", detail=title)
+                self._wait_idle()
+                self.respond_text(f"Your notes on {title} are ready. I've opened them in Chrome.")
+                self.jobs.append(type("Done", (), {"status": "done", "title": title, "markdown": markdown, "path": path,
+                                                  "started": time.time(), "is_alive": lambda self: False})())
+            except Exception as e:                                            # noqa: BLE001
+                self.event("activity_end", id="notes")
+                self._wait_idle()
+                self.respond_text(f"Sorry, I couldn't write the notes: {str(e)[:100]}")
+        threading.Thread(target=finish, daemon=True).start()
+        return "stopped recording; the notes are being written and will open in Chrome in a minute. Tell the user that."
+
+    # ---- morning briefing ------------------------------------------------------------------------------------------------------
+    def briefing(self):
+        self.cancel.clear()
+        self._speaking_reported = False
+        self.speaking.set()
+        try:
+            facts = [time.strftime("It is %A %d %B, %I:%M %p")]                # (not uptime or memory: that's no briefing)
+            w = skills.weather()
+            if w:
+                facts.append("Weather: " + w)
+            unread = skills.unread_summary(self.context)
+            if unread:
+                facts.append("Notifications waiting: " + unread)
+            plans = [m["text"] for m in self.memory.items if m["kind"] == "plan" or skills.dates_in(m["text"])]
+            if plans:
+                facts.append("Plans the user mentioned: " + "; ".join(plans[-5:]))
+            title, _, _ = self.latest_job()
+            if title:
+                try:
+                    news = actions.search_results(f"{title} news")[:1]
+                    if news:
+                        facts.append(f"A recent headline about something they researched ({title}): {news[0][0]} - {news[0][2][:200]}")
+                except Exception:                                             # noqa: BLE001
+                    pass
+            name = self._user_name()
+            prompt = ("Give the user a warm, short spoken briefing (4 to 6 sentences) from these facts. Greet them for the time of day"
+                      + (f" by name ({name})" if name else " without using any name (you don't know it)") +
+                      "; mention the weather, anything waiting for them and their plans; end with one encouraging line. "
+                      "Only mention rain if the chance is above 40%. Use only these facts:\n- " + "\n- ".join(facts) +
+                      "\nWhat you know about the user:\n- " + "\n- ".join(self.memory.relevant("plans today")))
+            self.history.append({"role": "user", "content": "Good morning! Brief me."})
+            text = self._ask(prompt).strip()
+            self.history.append({"role": "assistant", "content": text})
+        except Exception as e:                                                # noqa: BLE001
+            text = f"Good morning! I couldn't put the whole briefing together just now ({str(e)[:60]})."
+        finally:
+            self.speaking.clear()
+        self.respond_text(text)
+
+    # ---- smart messaging ----------------------------------------------------------------------------------------------------
+    def smart_send(self, to, message, app=""):
+        """Find the person (memory, WhatsApp search or Gmail's suggestions), show the card, then send."""
+        to, app = to.strip(), (app or "").lower()
+        address = actions.email_address(to)
+        known = " ".join(self.memory.relevant(to))
+        if not address and app != "whatsapp":                                 # an email address remembered for this person?
+            m = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-.]+\.[A-Za-z]{2,}", known) if to.lower().split()[0] in known.lower() else None
+            if m:
+                address = m.group(0)
+        if not app:
+            app = "email" if address or "email" in known.lower() or "gmail" in known.lower() else "whatsapp"
+        if app in ("email", "gmail", "mail"):
+            if not address:
+                address, note = skills.gmail_lookup(to)
+                if not address:
+                    return f"error: {note}. Ask the user for {to}'s email address."
+            subject = message.split(".")[0][:60] if len(message) > 80 else "Message from " + (self._user_name() or "me")
+            answer = self.ask_permission("send_email", {"to": address, "subject": subject, "body": message})
+            if answer not in ("allow", "always", "all"):
+                return "the user said no. Do not send it; just say okay."
+            result = actions.send_gmail(address, subject, message)
+            self.memory.add(f"{to.title()}'s email address is {address}.", "person", "learned")
+            return result
+        chat, note = skills.whatsapp_open_chat(to)
+        if not chat:
+            return f"error: {note}"
+        answer = self.ask_permission("whatsapp", {"to": chat, "text": message})
+        if answer not in ("allow", "always", "all"):
+            return "the user said no. Do not send it; just say okay."
+        skills.whatsapp_type_and_send(message)
+        self.memory.add(f"The user messages {chat} on WhatsApp.", "person", "learned")
+        return f"sent to {chat} on WhatsApp"
+
+    def _user_name(self):
+        for m in self.memory.items:
+            if m["kind"] == "name":
+                return m["text"].rsplit(" ", 1)[-1].rstrip(".")
+        return ""
+
     # ---- listening ----------------------------------------------------------------------------
     def is_echo(self, text):
         norm = lambda t: " ".join("".join(c if c.isalnum() or c == " " else " " for c in t.lower()).split())
         heard = norm(text)
         if not heard:
             return False
+        if re.search(r"\b(stop|end|finish|done)\b.*\b(notes?|recording|quiz|research|timer)\b|^(stop|enough|cancel|yes|no)\b", heard):
+            return False                                                      # a command is never "my own voice", even if I just quoted it
         for reply in self.spoken:
             said = norm(reply)
             if heard in said:                                                 # a piece of what we just said
@@ -917,12 +1374,19 @@ class Solu:
         return None
 
     def transcribe(self, audio):
-        segs, _ = self.stt.transcribe(audio, language=self.args.lang, beam_size=1, vad_filter=False,
-                                      condition_on_previous_text=False, initial_prompt="Hey Solu.")
-        segs = list(segs)
+        with self.stt_lock:
+            segs, _ = self.stt.transcribe(audio, language=self.args.lang, beam_size=1, vad_filter=False,
+                                          condition_on_previous_text=False, initial_prompt="Hey Solu.")
+            segs = list(segs)
         if not segs or max(s.no_speech_prob for s in segs) > 0.6:
             return ""
         return " ".join(s.text.strip() for s in segs).strip()
+
+    def transcribe_long(self, audio):
+        """A stretch of a lecture or meeting (any language Whisper knows), for the note taker."""
+        with self.stt_lock:
+            segs, _ = self.stt.transcribe(audio, beam_size=1, vad_filter=True, condition_on_previous_text=True)
+            return " ".join(s.text.strip() for s in segs if s.no_speech_prob < 0.7).strip()
 
     def frames(self, stop=None):
         if self.args.wav:
@@ -935,7 +1399,22 @@ class Solu:
         else:
             import sounddevice as sd
             while True:                                                       # reopen whenever the island switches the microphone
-                device, q = self.in_dev, queue.Queue()
+                if self.need_pa_refresh:                                      # a device appeared since PortAudio started: re-read the list
+                    self.need_pa_refresh = False
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                        self.audio_generation += 1                            # the speaker stream died with it: the player opens a new one
+                    except Exception as e:                                    # noqa: BLE001
+                        print(f"   (could not refresh the audio devices: {str(e)[:80]})")
+                    self.check_devices(force=True)
+                if self.paused:                                               # privacy key: the microphone stays closed
+                    self.mic_level = 0.0
+                    if stop and stop():
+                        return
+                    time.sleep(0.3)
+                    continue
+                device, q, epoch = self.in_dev, queue.Queue(), self.in_epoch
                 try:
                     stream = sd.InputStream(samplerate=SR_IN, channels=1, dtype="float32", blocksize=FRAME, device=device,
                                             callback=lambda x, *_: q.put(x[:, 0].copy()))
@@ -949,7 +1428,7 @@ class Solu:
                     continue
                 try:
                     count = 0
-                    while device == self.in_dev:
+                    while device == self.in_dev and epoch == self.in_epoch and not self.paused:
                         if stop and stop():
                             return
                         try:
@@ -974,7 +1453,7 @@ class Solu:
         last_activity = time.monotonic()
         last_mic_event = 0.0
         for frame in self.frames(stop):
-            if idle_timeout and self.in_conversation and not self.speaking.is_set() and not talking and (worker is None or not worker.is_alive()):
+            if idle_timeout and self.in_conversation and not self.quiz and not self.speaking.is_set() and not talking and (worker is None or not worker.is_alive()):
                 if time.monotonic() - last_activity > idle_timeout:
                     self.event("idle")                                        # nobody said anything for a while: end the conversation
                     if self.wake_mode:
@@ -989,6 +1468,8 @@ class Solu:
                 self.vad.reset()
                 continue
             p = self.vad.prob(frame)
+            if p > 0.5:
+                self.chat_priority_until = time.monotonic() + 2.0              # somebody talks: tasks leave the model alone
             if p > 0.5 and time.monotonic() - last_mic_event > 0.07:         # somebody is talking: the thin bar reacts to it
                 last_mic_event = time.monotonic()
                 self.event("mic", v=round(min(1.0, float(np.sqrt(np.mean(frame ** 2))) * 9.0), 3))
@@ -1055,6 +1536,11 @@ class Solu:
                     print(f"you: {target}   (speech-to-text {stt_ms:.0f} ms)")
                     self.event("heard", text=target)
                     self.event("state", state="thinking")
+                    skill = self.special(target)
+                    if skill:
+                        worker = threading.Thread(target=skill, daemon=True)
+                        worker.start()
+                        continue
                     if self.is_screen_request(target):
                         worker = threading.Thread(target=self.respond_screen, args=(target,), daemon=True)
                         worker.start()

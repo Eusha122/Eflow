@@ -16,6 +16,7 @@ class Mascot {
 public:
     enum class State { Idle, Music, Notify, Permission };
     enum class Talk { None, Listening, Thinking, Speaking };   // Solu, the voice assistant
+    enum class Mood { Normal, Sleepy, Worried };               // the cat's day: late at night / focus break, a struggling PC
 
     explicit Mascot(std::shared_ptr<const MascotAsset> asset);
 
@@ -29,6 +30,9 @@ public:
     // listening, a thoughtful look while thinking, and while speaking the cat bobs and its mouth follows `level`.
     void SetTalk(Talk talk);
     void SetTalkLevel(float level) { talkLevel_ = level; }
+    void SetMood(Mood mood) { mood_ = mood; }
+    Mood mood() const { return mood_; }
+    void Cheer();                                // a happy hop: something finished (a download, a focus session, research)
     Talk talk() const { return talk_; }
     State state() const { return state_; }       // what is showing right now
     State baseState() const { return base_; }    // the ambient mood underneath
@@ -71,6 +75,8 @@ private:
     bool secondBlink_ = false;
     int badge_ = 0;
     Talk talk_ = Talk::None;
+    Mood mood_ = Mood::Normal;
+    bool cheering_ = false;
     float talkLevel_ = 0, mouthHold_ = 0;
     bool mouthOpen_ = false;
     std::mt19937 rng_{std::random_device{}()};

@@ -2,6 +2,10 @@
 
 #include <d2d1effects.h>
 #include <shellapi.h>
+#include <oleidl.h>
+#include <commdlg.h>
+#include <shobjidl.h>
+#include <shlobj.h>
 #include <shellscalingapi.h>
 #include <windowsx.h>
 
@@ -79,6 +83,27 @@ constexpr int kHitPopSwitch = 1020;                         // the mute / block 
 constexpr float kAudioBtn = 30.0f;                          // round button diameter
 constexpr float kPopHeaderH = 30.0f, kPopRowH = 42.0f, kPopFooterH = 38.0f, kMenuPad = 10.0f;   // the device menu, inside the island
 constexpr int kPopMaxRows = 4;                              // rows visible at once (the wheel scrolls the rest)
+constexpr int kHitLive = 90, kHitLiveClose = 91;               // the live pill on the thin bar, and its close button
+constexpr UINT_PTR kLiveTimer = 7;                          // repaints a live pill (countdown, shimmer)
+constexpr float kLiveW = 352.0f, kLiveH = 32.0f;
+constexpr int kHitAgentTool = 3000;                         // + 0 Claude, + 1 Codex
+constexpr int kHitAgentPrev = 3010, kHitAgentNext = 3011;    // flip between an agent's sessions
+constexpr int kHitAgentGo = 3030;                           // the session header: go to the window where it runs
+constexpr int kHitPrompt = 3020, kHitSend = 3021, kHitNewChat = 3022, kHitConnect = 3023;
+constexpr UINT_PTR kAgentTimer = 8;
+constexpr UINT_PTR kLyricsTimer = 9;                         // fires when the next lyric line starts
+constexpr int kHitLyrics = 18;                               // the lyrics button in the Music tab
+constexpr float kLyricPillH = 28.0f;                         // the closed island while a lyric line shows
+constexpr float kLyricLinesH = 36.0f;                        // the two lyric lines in the Music tab                          // spinner and caret
+constexpr float kAgentsH = 322.0f;                           // height of the island on the Agents tab
+constexpr int kNotifIdsEnd = 2999;
+constexpr int kHitTaskPause = 3400, kHitTaskStop = 3410;     // + row: pause / resume, stop / remove
+constexpr float kSoluTasksH = 236.0f;
+constexpr int kHitShelfItem = 3100;                          // + item index
+constexpr int kHitShelfRemove = 3200;                        // + item index: its x button
+constexpr int kHitShelfClear = 3300, kHitShelfAdd = 3301;
+constexpr float kShelfH = 206.0f;
+constexpr float kCardW = 76.0f, kCardH = 98.0f, kCardGap = 9.0f;
 constexpr int kHitNotifClear = 30;                          // "Clear all"
 constexpr int kHitNotifClose = 100;                         // + notification index: its dismiss button
 constexpr float kNotifRowH = 44.0f;
@@ -88,14 +113,15 @@ constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
 
-const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"AI Requests", L"System"};
+const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"Agents", L"System", L"Shelf"};
 const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No new messages",
-                                                   L"No pending requests", L""};
+                                                   L"No pending requests", L"", L""};
 const wchar_t* const kEmptyBody[kSectionCount] = {
     L"Play something in Spotify, YouTube or your browser",
     L"New notifications will show up here",
     L"WhatsApp messages will show up here",
     L"Requests from Solu, Claude Code and Codex appear here",
+    L"",
     L"",
 };
 
@@ -314,12 +340,56 @@ IslandWindow::IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_p
     tabX_.damping = tabW_.damping = 42;
 }
 
+// The OLE drop target: files dragged from Explorer (or anywhere) onto the island. It only forwards to the window.
+class ShelfDropTarget final : public IDropTarget {
+public:
+    explicit ShelfDropTarget(IslandWindow* window) : window_(window) {}
+    void Detach() { window_ = nullptr; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) { *out = static_cast<IDropTarget*>(this); AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --refs_;
+        if (!n) delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
+        *effect = window_ ? window_->ShelfDragEnter(data) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
+        *effect = window_ ? window_->ShelfDragOver() : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        if (window_) window_->ShelfDragLeave();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
+        *effect = window_ ? window_->ShelfDrop(data) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+private:
+    IslandWindow* window_;
+    ULONG refs_ = 1;
+};
+
 IslandWindow::~IslandWindow() {
     captionsYielded_ = true;
     UpdateClickAway();
     if (watching_ && systemWatchHandler_) systemWatchHandler_(false);
     if (audioWatching_ && audioWatchHandler_) audioWatchHandler_(false);
     if (hwnd_) {
+        RevokeDragDrop(hwnd_);
+        if (dropTarget_) {
+            static_cast<ShelfDropTarget*>(dropTarget_)->Detach();
+            dropTarget_->Release();
+            dropTarget_ = nullptr;
+        }
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);
     }
@@ -351,6 +421,8 @@ bool IslandWindow::Create() {
     tabW_.Snap(tabs[0].right - tabs[0].left);
 
     SetHitRegion(false);
+    dropTarget_ = new ShelfDropTarget(this);                           // files can be dropped on the island
+    if (FAILED(RegisterDragDrop(hwnd_, dropTarget_))) Log("island: drag and drop is unavailable");
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     Animate();
     return true;
@@ -407,6 +479,67 @@ void IslandWindow::DebugOpenTab(int section) {
     }
     Animate();
 }
+
+std::string IslandWindow::DebugLayout() const {
+    // Where things are once the panel has settled, in physical screen pixels (the shoot director clicks these).
+    RECT wr;
+    GetWindowRect(hwnd_, &wr);
+    const float winW = pxW_ / scale_;
+    const D2D1_RECT_F open = D2D1::RectF((winW - kExpandedW) / 2.0f, TopInset(), (winW + kExpandedW) / 2.0f, TopInset() + h_.target);
+    const D2D1_RECT_F bar = D2D1::RectF((winW - w_.target) / 2.0f, TopInset(), (winW + w_.target) / 2.0f, TopInset() + (expanded_ ? kCollapsedH : h_.target));
+    std::string out = "{";
+    auto pt = [&](const char* name, float x, float y) {
+        char buf[128];
+        sprintf_s(buf, "\"%s\":[%d,%d],", name, static_cast<int>(wr.left + x * scale_), static_cast<int>(wr.top + y * scale_));
+        out += buf;
+    };
+    auto rc = [&](const char* name, const D2D1_RECT_F& r) { pt(name, (r.left + r.right) / 2, (r.top + r.bottom) / 2); };
+    char name[32];
+    rc("panel", open);
+    rc("bar", bar);
+    const auto tabs = TabRects(open);
+    for (int i = 0; i < kSectionCount; ++i) { sprintf_s(name, "tab%d", i); rc(name, tabs[i]); }
+    for (int i = 0; i < 4; ++i) { sprintf_s(name, "side%d", i); rc(name, AudioButton(open, i)); }
+    const auto ctl = ControlCenters(open);
+    pt("prev", ctl[0].x, ctl[0].y);
+    pt("play", ctl[1].x, ctl[1].y);
+    pt("next", ctl[2].x, ctl[2].y);
+    const SeekBar seek = SeekGeometry(open);
+    pt("seek0", seek.x0, seek.y);
+    pt("seek1", seek.x1, seek.y);
+    const D2D1_POINT_2F lyr = LyricsButton(open);
+    pt("lyrics", lyr.x, lyr.y);
+    rc("output", OutputChipRect(open, MediaOutput()));
+    const auto perm = PermissionButtons(open);
+    rc("reject", perm[0]);
+    rc("approve", perm[1]);
+    rc("defer", perm[2]);
+    for (int i = 0; i < kMetricCount; ++i) { sprintf_s(name, "ring%d", i); rc(name, RingCell(open, i)); }
+    for (size_t i = 0; i < notifications_.items.size() && i < 3; ++i) {
+        sprintf_s(name, "notif%zu", i);
+        rc(name, NotificationRow(open, i));
+        sprintf_s(name, "notifx%zu", i);
+        rc(name, NotificationClose(NotificationRow(open, i)));
+    }
+    if (popover_ >= 0) {
+        const PopoverLayout g = PopoverGeometry(open);
+        rc("mute", MuteSwitch(g));
+        rc("test", TestPill(g, popover_));
+        for (int i = 0; i < g.shown; ++i) {
+            sprintf_s(name, "row%d", i);
+            pt(name, (g.card.left + g.card.right) / 2, g.rowsTop + (i + 0.5f) * kPopRowH);
+        }
+    }
+    const AgentsLayout ag = AgentsGeometry(open);
+    rc("claude", ag.tool[0]);
+    rc("codex", ag.tool[1]);
+    rc("box", ag.box);
+    rc("send", ag.send);
+    rc("newchat", ag.newBtn);
+    rc("shelf", ShelfArea(open));
+    out.back() = '}';
+    return out;
+}
 #endif
 
 namespace {
@@ -438,7 +571,7 @@ void IslandWindow::UpdateClickAway() {
 
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
-    return debugPinned_ || pressed_ >= 0 || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
+    return debugPinned_ || pressed_ >= 0 || promptFocus_ || dragOver_ || shelfDragging_ || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
            (soluWake_ && solu_.state == SoluState::Loading);
 }
 
@@ -494,9 +627,9 @@ void IslandWindow::SetHitRegion(bool full) {
         rgn = CreateRectRgn(0, 0, static_cast<int>(pxW_), height);
     } else {
         const float winW = pxW_ / scale_;
-        const float x0 = (winW - kCollapsedW) / 2.0f - kHotSlackX;
-        const float x1 = x0 + kCollapsedW + 2 * kHotSlackX;
-        const float y1 = TopInset() + kCollapsedH + kHotSlackY;
+        const float x0 = (winW - CollapsedW()) / 2.0f - kHotSlackX;
+        const float x1 = x0 + CollapsedW() + 2 * kHotSlackX;
+        const float y1 = TopInset() + CollapsedH() + kHotSlackY;
         auto px = [&](float v) { return static_cast<int>(std::lround(v * scale_)); };
         rgn = CreateRectRgn(px(x0), 0, px(x1), px(y1));
     }
@@ -508,6 +641,7 @@ void IslandWindow::SetHitRegion(bool full) {
 void IslandWindow::Expand() {
     if (expanded_ || suppressed_) return;
     expanded_ = true;
+    AutoPickAgent();
     captionsYielded_ = false;                    // opening again during a conversation shows the live view again
     KillTimer(hwnd_, kCloseTimer);
     UpdateSystemWatch();
@@ -522,6 +656,12 @@ void IslandWindow::Expand() {
 
 void IslandWindow::Collapse() {
     if (!expanded_) return;
+    BlurPrompt(true);
+    dragOver_ = dragOpened_ = false;
+    shelfScroll_ = 0;
+    agentAuto_ = true;                           // next time it opens on whichever agent is busy
+    agentSession_.clear();
+    agentScroll_ = 0;
     expanded_ = false;
     hover_ = pressed_ = -1;
     StopRunningTest();
@@ -533,8 +673,8 @@ void IslandWindow::Collapse() {
     autoClosePending_ = false;
     if (mascot_) mascot_->ClearBadge();        // the panel was open: the user has seen it
     SetCloseSprings(w_, h_);
-    w_.target = kCollapsedW;
-    h_.target = kCollapsedH;
+    w_.target = CollapsedW();
+    h_.target = CollapsedH();
     UpdateClickAway();
     Animate();
 }
@@ -617,6 +757,8 @@ void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     }
     ApplyHeightTarget();                                               // the live view grows with the answer
     UpdateClickAway();
+    RefreshCollapsed();                                                // a conversation hides the lyric pill, and brings it back after
+    if (!expanded_ && (Live() || LyricsPill()) && solu_.state == before) return;   // a pill covers the bar: its voice meter is not on screen
     Animate();
 }
 
@@ -791,6 +933,19 @@ void IslandWindow::OnWheel(int delta) {
         Animate();
         return;
     }
+    if (expanded_ && section_ == Section::Shelf) {                          // slide along the shelf
+        const D2D1_RECT_F area = ShelfArea(IslandRect());
+        const float total = (static_cast<float>(shelf_.items.size()) + 1) * (kCardW + kCardGap);
+        shelfScroll_ = std::clamp(shelfScroll_ - (delta > 0 ? 1.0f : -1.0f) * (kCardW + kCardGap) * 1.5f, 0.0f, std::max(0.0f, total - (area.right - area.left)));
+        Animate();
+        return;
+    }
+    if (expanded_ && section_ == Section::Ai && permissions_.empty()) {      // scroll the agent's feed
+        if (const AgentSession* s = CurrentSession())
+            agentScroll_ = std::clamp(agentScroll_ + (delta > 0 ? 1 : -1), 0, std::max(0, static_cast<int>(s->feed.size()) - 1));
+        Animate();
+        return;
+    }
     if (!expanded_ || section_ != Section::Notifications) return;
     const float maxTop = std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows);
     notifScrollTarget_ = std::clamp(std::round(notifScrollTarget_) - (delta > 0 ? 1.0f : -1.0f), 0.0f, maxTop);
@@ -815,6 +970,17 @@ void IslandWindow::SetPermissionPending(bool pending) {
 }
 
 int IslandWindow::HitTest(D2D1_POINT_2F p) const {
+    if (!expanded_ && Live()) {                                       // the live pill: its close button, or open the island
+        const D2D1_RECT_F r = IslandRect();
+        const D2D1_RECT_F x = LiveClose(r);
+        if (activities_.front().dismissible && p.x >= x.left && p.x <= x.right && p.y >= x.top - 4 && p.y <= x.bottom + 4) return kHitLiveClose;
+        if (p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom + 4) return kHitLive;
+        return -1;
+    }
+    if (!expanded_ && LyricsPill()) {                               // the lyric pill: open on the Music tab
+        const D2D1_RECT_F r = IslandRect();
+        return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom + 4 ? kHitLive : -1;
+    }
     if (!expanded_ || h_.x < kExpandedH * 0.85f) return -1;
     const D2D1_RECT_F island = IslandRect();
     const auto tabs = TabRects(island);
@@ -855,6 +1021,55 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
             if (p.x >= cell.left && p.x <= cell.right && p.y >= cell.top && p.y <= cell.bottom) return kHitRing + i;
         }
     }
+    if (section_ == Section::Solu && SoluTaskRows() > 0 && !CaptionsShown()) {
+        const float right = island.left + kExpandedW - kMascotLane;
+        for (int i = 0; i < SoluTaskRows(); ++i) {
+            const float top = island.top + kTabTop + kTabH + 14.0f + 56.0f + i * 40.0f;
+            if (p.y < top || p.y > top + 38) continue;
+            const SoluTask& t = solu_.tasks[static_cast<size_t>(i)];
+            const bool live = t.status == L"running" || t.status == L"waiting" || t.status == L"planning" || t.status == L"paused";
+            if (p.x >= right - 30 && p.x <= right + 4) return kHitTaskStop + i;
+            if (live && p.x >= right - 62 && p.x < right - 32) return kHitTaskPause + i;
+        }
+    }
+    if (section_ == Section::Shelf) {
+        const D2D1_RECT_F area = ShelfArea(island);
+        if (p.y < area.top - 4 && p.y > island.top + 50) {                 // the header row: "Clear"
+            if (!shelf_.items.empty() && p.x > area.right - 60 && p.y < area.top - 4) return kHitShelfClear;
+            return -1;
+        }
+        if (p.x < area.left || p.x > area.right || p.y < area.top || p.y > area.bottom) return -1;
+        const int n = static_cast<int>(shelf_.items.size());
+        for (int i = 0; i <= n; ++i) {
+            const D2D1_RECT_F c = ShelfCard(island, i);
+            if (c.right < area.left || c.left > area.right) continue;
+            if (p.x < c.left || p.x > c.right || p.y < c.top || p.y > c.bottom) continue;
+            if (i == n) return kHitShelfAdd;
+            if (p.x > c.right - 22 && p.y < c.top + 22) return kHitShelfRemove + i;
+            return kHitShelfItem + i;
+        }
+        if (n == 0) return kHitShelfAdd;                                   // the whole empty drop zone
+        return -1;
+    }
+    if (section_ == Section::Ai && permissions_.empty()) {          // the agents panel
+        const AgentsLayout g = AgentsGeometry(island);
+        auto in = [&](const D2D1_RECT_F& r) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; };
+        for (int i = 0; i < 2; ++i)
+            if (in(g.tool[i])) return kHitAgentTool + i;
+        const auto mine = SessionsOf(agentTool_);
+        if (mine.size() > 1) {
+            if (in(g.prev)) return kHitAgentPrev;
+            if (in(g.next)) return kHitAgentNext;
+        }
+        const bool hooked = agentTool_ == AgentTool::Claude ? agents_.claudeHooked : agents_.codexHooked;
+        if (!hooked && in(g.connect)) return kHitConnect;
+        if (CurrentSession() && p.x >= g.header.left && p.x <= g.header.right - 150 && p.y >= g.header.top - 2 && p.y <= g.header.bottom + 2)
+            return kHitAgentGo;
+        if (in(g.newBtn)) return kHitNewChat;
+        if (in(g.send)) return kHitSend;
+        if (in(g.box)) return kHitPrompt;
+        return -1;
+    }
     if (section_ == Section::Ai && !permissions_.empty()) {
         const auto buttons = PermissionButtons(island);
         for (int i = 0; i < 3; ++i)
@@ -877,6 +1092,8 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
         if (p.x >= bar.x0 - 6 && p.x <= bar.x1 + 6 && p.y >= bar.y - 9 && p.y <= bar.y + 10) return kHitSeek;
     }
     if (section_ == Section::Music && media_.hasSession) {
+        const D2D1_POINT_2F lb = LyricsButton(island);
+        if ((p.x - lb.x) * (p.x - lb.x) + (p.y - lb.y) * (p.y - lb.y) <= 16.0f * 16.0f) return kHitLyrics;
         const auto extra = ExtraControlCenters(island);
         for (int i = 0; i < 2; ++i) {
             const float dx = p.x - extra[i].x, dy = p.y - extra[i].y;
@@ -903,7 +1120,7 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
     if (!expanded_) {
         if (!openPending_) {
             openPending_ = true;
-            SetTimer(hwnd_, kOpenTimer, kOpenDelayMs, nullptr);
+            SetTimer(hwnd_, kOpenTimer, Live() || LyricsPill() ? 800 : kOpenDelayMs, nullptr);   // a live pill can be clicked (or closed) first
         }
         return;
     }
@@ -920,6 +1137,105 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitTaskPause && id < kHitTaskStop + 10) {
+        const bool stop = id >= kHitTaskStop;
+        const size_t i = static_cast<size_t>(id - (stop ? kHitTaskStop : kHitTaskPause));
+        if (i < solu_.tasks.size() && taskHandler_) {
+            const SoluTask& t = solu_.tasks[i];
+            const bool live = t.status == L"running" || t.status == L"waiting" || t.status == L"planning" || t.status == L"paused";
+            taskHandler_(stop ? (live ? "cancel" : "remove") : (t.status == L"paused" ? "resume" : "pause"), t.id);
+        }
+        hover_ = -1;
+        Animate();
+        return;
+    }
+    if (id >= kHitShelfItem && id <= kHitShelfAdd) {
+        const int n = static_cast<int>(shelf_.items.size());
+        if (id >= kHitShelfItem && id < kHitShelfItem + 100) {
+            const int i = id - kHitShelfItem;
+            if (i < n) {
+                const std::wstring& path = shelf_.items[static_cast<size_t>(i)].path;
+                const ULONGLONG now = GetTickCount64();
+                if (shelfLastItem_ == i && now - shelfLastClick_ < GetDoubleClickTime()) {   // a double click opens it
+                    OpenShelfItem(i, false);
+                    shelfLastItem_ = -1;
+                } else if (GetKeyState(VK_CONTROL) & 0x8000) {
+                    if (!shelfSel_.erase(path)) shelfSel_.insert(path);
+                    shelfLastItem_ = i, shelfLastClick_ = now;
+                } else {
+                    const bool only = shelfSel_.size() == 1 && shelfSel_.count(path);
+                    shelfSel_.clear();
+                    if (!only) shelfSel_.insert(path);
+                    shelfLastItem_ = i, shelfLastClick_ = now;
+                }
+            }
+        } else if (id >= kHitShelfRemove && id < kHitShelfRemove + 100) {
+            const int i = id - kHitShelfRemove;
+            if (i < n && shelfRemove_) {
+                shelfSel_.erase(shelf_.items[static_cast<size_t>(i)].path);
+                shelfRemove_(shelf_.items[static_cast<size_t>(i)].path);
+            }
+        } else if (id == kHitShelfClear && shelfClear_) {
+            shelfSel_.clear();
+            shelfClear_();
+        } else if (id == kHitShelfAdd) {
+            ShelfAddFiles();
+        }
+        hover_ = -1;
+        Animate();
+        return;
+    }
+    if (id >= kHitAgentTool && id < kHitAgentTool + 40) {
+        if (id < kHitAgentTool + 2) {
+            agentTool_ = id == kHitAgentTool ? AgentTool::Claude : AgentTool::Codex;
+            agentAuto_ = false;
+            agentSession_.clear();
+            agentScroll_ = 0;
+        } else if (id == kHitAgentPrev || id == kHitAgentNext) {
+            const auto mine = SessionsOf(agentTool_);
+            if (!mine.empty()) {
+                size_t at = 0;
+                for (size_t i = 0; i < mine.size(); ++i)
+                    if (mine[i]->id == (agentSession_.empty() ? mine[0]->id : agentSession_)) at = i;
+                at = (at + (id == kHitAgentNext ? 1 : mine.size() - 1)) % mine.size();
+                agentSession_ = mine[at]->id;
+                agentAuto_ = false;
+                agentScroll_ = 0;
+            }
+        } else if (id == kHitAgentGo) {
+            if (const AgentSession* s = CurrentSession(); s && agentOpen_) agentOpen_(*s, (GetKeyState(VK_CONTROL) & 0x8000) != 0);   // Ctrl: also reload the chat
+        } else if (id == kHitPrompt) {
+            FocusPrompt();
+        } else if (id == kHitSend) {
+            SendPrompt();
+        } else if (id == kHitNewChat) {
+            newChat_ = !newChat_;
+        } else if (id == kHitConnect && agentConnect_) {
+            agentConnect_(agentTool_);
+        }
+        Animate();
+        return;
+    }
+    if (id == kHitLive) {
+        KillTimer(hwnd_, kOpenTimer);
+        openPending_ = false;
+        const bool agent = !activities_.empty() && activities_.front().id.rfind(L"agent", 0) == 0;
+        const bool task = !activities_.empty() && activities_.front().id.rfind(L"task", 0) == 0;
+        Expand();
+        if (agent) OnClick(static_cast<int>(Section::Ai));             // a pill about an agent: straight to its tab
+        else if (task) OnClick(static_cast<int>(Section::Solu));       // a task: the Solu tab lists it
+        else if (activities_.empty()) OnClick(static_cast<int>(Section::Music));   // the lyric pill: the song
+        return;
+    }
+    if (id == kHitLiveClose) {
+        if (!activities_.empty()) {
+            const std::wstring gone = activities_.front().id;
+            std::vector<Activity> rest(activities_.begin() + 1, activities_.end());
+            if (activityDismiss_) activityDismiss_(gone);
+            SetActivities(rest);
+        }
+        return;
+    }
     if ((id >= 0 && id < kSectionCount) || (id >= kHitAudioButton && id < kHitAudioButton + 4)) {
         captionsYielded_ = true;                                  // tabs and the round buttons always work, even mid-conversation
         Log("island: live view yielded (click id %d)", id);
@@ -1024,8 +1340,9 @@ void IslandWindow::OnClick(int id) {
         const PermissionDecision d = id == kHitApprove ? PermissionDecision::Allow
                                    : id == kHitReject  ? PermissionDecision::Deny
                                                        : PermissionDecision::Defer;
-        permissionHandler_(permissions_.front().id, d);
+        const uint64_t answered = permissions_.front().id;
         permissions_.erase(permissions_.begin());     // the server confirms with a fresh list right away
+        permissionHandler_(answered, d);              // (after the erase: that list may arrive inside this call)
         hover_ = -1;
         if (permissions_.empty()) SetPermissionPending(false);
         Animate();
@@ -1039,12 +1356,21 @@ void IslandWindow::OnClick(int id) {
             notifications_.items.clear();
         } else if (const size_t i = static_cast<size_t>(id - kHitNotifClose); i < notifications_.items.size()) {
             Log("notifications: dismiss id=%u", notifications_.items[i].id);
-            dismissHandler_(notifications_.items[i].id);
+            const uint32_t gone = notifications_.items[i].id;
             notifications_.items.erase(notifications_.items.begin() + static_cast<std::ptrdiff_t>(i));
+            dismissHandler_(gone);                 // after the erase: the handler may hand us a fresh list at once
         }
         notifScrollTarget_ = std::clamp(notifScrollTarget_, 0.0f,
                                         std::max(0.0f, static_cast<float>(notifications_.items.size()) - kNotifRows));
         hover_ = -1;
+        Animate();
+        return;
+    }
+    if (id == kHitLyrics) {
+        lyricsOn_ = !lyricsOn_;
+        if (lyricsHandler_) lyricsHandler_(lyricsOn_);
+        UpdateLyricLine();
+        ApplyHeightTarget();
         Animate();
         return;
     }
@@ -1085,6 +1411,7 @@ void IslandWindow::OnClick(int id) {
     popover_ = -1;                               // switching tabs dismisses an open menu
     UpdateSystemWatch();
     UpdateAudioWatch();
+    UpdateAgentTimer();
     ApplyHeightTarget();
     const auto tabs = TabRects(D2D1::RectF(0, 0, kExpandedW, kExpandedH));
     tabX_.target = tabs[id].left;
@@ -1153,6 +1480,18 @@ bool IslandWindow::StepAnimation(float dt) {
         moving |= Approach(controlHover_[i], hover_ == kHitPrev + i ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(permissionHover_[i], hover_ == kHitReject + i ? 1.0f : 0.0f, dt, 22.0f);
     }
+    moving |= Approach(dragT_, dragOver_ ? 1.0f : 0.0f, dt, 14.0f);
+    if (expanded_ && section_ == Section::Shelf) {
+        shelfHover_.resize(shelf_.items.size(), 0.0f);
+        for (size_t i = 0; i < shelf_.items.size(); ++i) {
+            const int hv = hover_;
+            const bool on = hv == kHitShelfItem + static_cast<int>(i) || hv == kHitShelfRemove + static_cast<int>(i);
+            moving |= Approach(shelfHover_[i], on ? 1.0f : 0.0f, dt, 20.0f);
+            float& pop = shelfPop_[shelf_.items[i].path];
+            moving |= Approach(pop, 1.0f, dt, 12.0f);
+        }
+        if (dragOver_) moving = true;                                         // the "+" breathes while files hover
+    }
     for (int i = 0; i < kSectionCount; ++i) {
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(sectionAlpha_[i], i == static_cast<int>(section_) ? 1.0f : 0.0f, dt, 16.0f);
@@ -1195,6 +1534,8 @@ bool IslandWindow::StepAnimation(float dt) {
     moving |= Approach(popFooterHover_, hover_ == kHitPopFooter ? 1.0f : 0.0f, dt, 22.0f);
     moving |= Approach(testHover_, hover_ == kHitPopTest ? 1.0f : 0.0f, dt, 22.0f);
     for (int i = 0; i < 3; ++i) moving |= Approach(extraHover_[i], hover_ == (i == 2 ? kHitOutput : kHitShuffle + i) ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(lyricsHover_, hover_ == kHitLyrics ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(lyricT_, 1.0f, dt, 9.0f);                  // a lyric line rises in (~0.35 s), then no more frames
     moving |= Approach(seekHover_, (seeking_ || hover_ == kHitSeek) ? 1.0f : 0.0f, dt, 22.0f);
     moving |= Approach(notifScroll_, notifScrollTarget_, dt, 16.0f);
     moving |= Approach(notifClearHover_, hover_ == kHitNotifClear ? 1.0f : 0.0f, dt, 22.0f);
@@ -1310,7 +1651,14 @@ void IslandWindow::DrawIsland(ID2D1DeviceContext* dc, float progress) {
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.06f + 0.04f * progress));
     dc->DrawRoundedRectangle(edge, brush_.Get(), 1.0f);
 
-    if (progress < 0.34f) DrawSoluBar(dc, r, 1.0f - progress / 0.34f);           // Solu is awake: the bar shows it
+    if (progress < 0.34f) {
+        const float liveIn = Clamp01((h_.x - kCollapsedH) / (kLiveH - kCollapsedH));
+        if (Live() && !expanded_) DrawLive(dc, r, liveIn * (1.0f - progress / 0.34f));
+        else if (Live() && expanded_ && progress < 0.2f) DrawLive(dc, r, (1.0f - progress / 0.2f) * liveIn);
+        else if (LyricsPill() && !expanded_)
+            DrawLyricPill(dc, r, Clamp01((h_.x - kCollapsedH) / (kLyricPillH - kCollapsedH)) * (1.0f - progress / 0.34f));
+        else DrawSoluBar(dc, r, 1.0f - progress / 0.34f);                        // Solu is awake: the bar shows it
+    }
     const float contentAlpha = SmoothStep(0.62f, 1.0f, progress);
     if (contentAlpha > 0.003f) {
         dc->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -1382,6 +1730,14 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             DrawPermission(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
         }
+        if (i == static_cast<int>(Section::Shelf)) {
+            DrawShelf(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
+            continue;
+        }
+        if (i == static_cast<int>(Section::Ai)) {
+            DrawAgents(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Solu)) {
             DrawSolu(dc, D2D1::RectF(base.left, base.top + slide, base.right, base.bottom + slide), a);
             continue;
@@ -1427,7 +1783,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
 
 IslandWindow::SeekBar IslandWindow::SeekGeometry(const D2D1_RECT_F& panel) const {
     // The same numbers DrawMusic uses: left edge after the artwork, right edge before the mascot's lane.
-    return {panel.left + 24 + kArtSize + 18, panel.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f), panel.top + 113 + 1.5f};
+    return {panel.left + 24 + kArtSize + 18, panel.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f), panel.top + 113 + LyricShift() + 1.5f};
 }
 
 float IslandWindow::SeekFractionAt(float x, const D2D1_RECT_F& panel) const {
@@ -1437,6 +1793,7 @@ float IslandWindow::SeekFractionAt(float x, const D2D1_RECT_F& panel) const {
 
 void IslandWindow::SetMedia(const MediaInfo& media) {
     media_ = media;
+    UpdateLyricLine();
     Animate();
 }
 
@@ -1475,7 +1832,7 @@ D2D1_RECT_F IslandWindow::OutputChipRect(const D2D1_RECT_F& base, const OutputIn
 std::array<D2D1_POINT_2F, 3> IslandWindow::ControlCenters(const D2D1_RECT_F& island) const {
     const float x0 = island.left + 24 + kArtSize + 18;
     const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
-    const float cx = (x0 + x1) / 2.0f, cy = island.top + kControlsY;
+    const float cx = (x0 + x1) / 2.0f, cy = island.top + kControlsY + LyricShift();
     return {D2D1::Point2F(cx - 46, cy), D2D1::Point2F(cx, cy), D2D1::Point2F(cx + 46, cy)};
 }
 
@@ -1554,7 +1911,8 @@ void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alp
              D2D1::RectF(x0, base.top + 84, subtitleRight, base.top + 102), WithAlpha(kTextDim, alpha));
 
     // Progress. When the app allows seeking the bar thickens on hover and shows a handle you can drag.
-    const float barY = base.top + 113;
+    if (LyricShift() > 0) DrawLyricLines(dc, x0, x1, base.top + 106, alpha);
+    const float barY = base.top + 113 + LyricShift();
     const bool seekable = media_.canSeek && media_.duration > 0;
     const float grow = seekable ? seekHover_ : 0.0f;
     const float thick = 3.0f + 2.5f * grow, top = barY + 1.5f - thick / 2;
@@ -1617,6 +1975,21 @@ void IslandWindow::DrawMusic(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alp
                  WithAlpha(tint, (!extraEnabled[i] ? 0.22f : extraOn[i] ? 0.98f : 0.55f + 0.3f * hoverA) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
         if (extraOn[i] && extraEnabled[i]) {
             brush_->SetColor(D2D1::ColorF(kGreen.r, kGreen.g, kGreen.b, 0.95f * alpha));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x, c.y + 13), 1.7f, 1.7f), brush_.Get());
+        }
+    }
+    {                                                                // lyrics: green when showing, quiet when this song has none
+        const D2D1_POINT_2F c = LyricsButton(D2D1::RectF(base.left, base.top, base.right, base.bottom));
+        if (lyricsHover_ > 0) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.08f * lyricsHover_ * alpha));
+            dc->FillEllipse(D2D1::Ellipse(c, 14, 14), brush_.Get());
+        }
+        const bool showing = LyricsReady();
+        const float level = showing ? 0.98f : lyricsOn_ ? 0.45f : 0.30f;
+        DrawText(dc, L"\uE8BD", smallIcons, D2D1::RectF(c.x - 14, c.y - 14, c.x + 14, c.y + 14),
+                 WithAlpha(showing ? kGreen : kText, std::min(1.0f, level + 0.3f * lyricsHover_) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (lyricsOn_) {
+            brush_->SetColor(WithAlpha(showing ? kGreen : kText, (showing ? 0.95f : 0.35f) * alpha));
             dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x, c.y + 13), 1.7f, 1.7f), brush_.Get());
         }
     }
@@ -1805,6 +2178,9 @@ float IslandWindow::TargetHeight() const {
     if (popover_ >= 0) return std::clamp(MenuHeight(popover_), kExpandedH, kMaxPanelH);
     if (section_ == Section::Ai && !permissions_.empty())         // a long approval card (an email) makes the island taller
         return std::clamp(96.0f + PermissionDetailH() + 6.0f + 28.0f + 14.0f, kExpandedH, kMaxPanelH);
+    if (section_ == Section::Ai) return kAgentsH;                  // the agents panel
+    if (section_ == Section::Shelf) return kShelfH;
+    if (section_ == Section::Solu && SoluTaskRows() > 0 && !CaptionsShown()) return kSoluTasksH;
     if (CaptionsShown() && !solu_.said.empty()) {                // the live view grows so the whole answer fits
         const float width = kExpandedW - 22.0f - (mascot_ ? kMascotLane : 22.0f);
         float top = kTabTop + kTabH + 8.0f + 24.0f;
@@ -1812,6 +2188,7 @@ float IslandWindow::TargetHeight() const {
         const float text = gfx_.MeasureHeight(solu_.said.c_str(), gfx_.Wrapped(15.0f, DWRITE_FONT_WEIGHT_NORMAL), width);
         return std::clamp(top + text + 16.0f, kExpandedH, kMaxPanelH);
     }
+    if (section_ == Section::Music) return kExpandedH + LyricShift();
     return kExpandedH;
 }
 
@@ -2465,6 +2842,10 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
 
 // ---- the Solu AI tab -------------------------------------------------------------------------------------
 
+int IslandWindow::SoluTaskRows() const {
+    return std::min<int>(3, static_cast<int>(solu_.tasks.size()));
+}
+
 void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha) {
     const float left = base.left + 26, right = base.left + kExpandedW - (mascot_ ? kMascotLane : 26.0f);
     float y = base.top + kTabTop + kTabH + 14.0f;
@@ -2488,6 +2869,48 @@ void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
     DrawText(dc, sub.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(left + 18, y + 22, right, y + 40), WithAlpha(kTextDim, alpha));
     y += 52.0f;
 
+    if (const int rows = SoluTaskRows(); rows > 0) {                  // long tasks: what Solu is working on, with controls
+        IDWriteTextFormat* name = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        IDWriteTextFormat* detail = gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
+        const float now = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
+        for (int i = 0; i < rows; ++i) {
+            const SoluTask& t = solu_.tasks[static_cast<size_t>(i)];
+            const float top = y + i * 40.0f;
+            const bool live = t.status == L"running" || t.status == L"waiting" || t.status == L"planning" || t.status == L"paused";
+            D2D1_COLOR_F c = t.status == L"done" ? kGreen : t.status == L"failed" ? kRed : t.status == L"waiting" ? Rgba(0.75f, 0.60f, 1.0f, 1.0f)
+                           : t.status == L"paused" || t.status == L"cancelled" ? kNeutral : kAmber;
+            const float pulse = t.status == L"running" || t.status == L"planning" ? 0.6f + 0.4f * std::sin(now * 5.0f) : 1.0f;
+            brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, pulse * alpha));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(left + 4, top + 11), 3.6f, 3.6f), brush_.Get());
+            std::wstring line;
+            if (t.status == L"waiting") line = t.question;
+            else if (t.status == L"paused") line = L"Paused \u00B7 step " + std::to_wstring(t.done + 1) + L" of " + std::to_wstring(t.total);
+            else if (t.status == L"planning") line = L"Planning\u2026";
+            else if (t.status == L"running") line = L"Step " + std::to_wstring(std::min(t.done + 1, t.total)) + L" of " + std::to_wstring(t.total) + L" \u00B7 " + t.step;
+            else if (!t.result.empty()) line = t.result;
+            else line = t.status == L"cancelled" ? L"Stopped" : t.status == L"failed" ? L"Couldn’t finish" : L"Done";
+            DrawText(dc, t.title.c_str(), name, D2D1::RectF(left + 16, top, right - 68, top + 18), WithAlpha(kText, alpha));
+            DrawText(dc, line.c_str(), detail, D2D1::RectF(left + 16, top + 18, right - 68, top + 36), WithAlpha(t.status == L"waiting" ? c : kTextDim, 1.15f * alpha));
+            if (live && t.total > 0) {                                  // a thin progress line
+                const float x0 = left + 16, x1 = right - 68;
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * alpha));
+                dc->FillRectangle(D2D1::RectF(x0, top + 36, x1, top + 37.5f), brush_.Get());
+                brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, 0.9f * alpha));
+                dc->FillRectangle(D2D1::RectF(x0, top + 36, x0 + (x1 - x0) * static_cast<float>(t.done) / static_cast<float>(t.total), top + 37.5f), brush_.Get());
+            }
+            // buttons: pause / resume, and stop (or remove when it is over)
+            auto button = [&](float cx, const wchar_t* glyph, int id) {
+                const bool hot = hover_ == id;
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, (hot ? 0.18f : 0.07f) * alpha));
+                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, top + 14), 12.0f, 12.0f), brush_.Get());
+                DrawText(dc, glyph, gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(cx - 12, top + 2, cx + 12, top + 26),
+                         WithAlpha(kText, (hot ? 1.0f : 0.8f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+            };
+            if (live) button(right - 47, t.status == L"paused" ? L"\uE768" : L"\uE769", kHitTaskPause + i);
+            button(right - 15, live ? L"\uE71A" : L"\uE711", kHitTaskStop + i);
+        }
+        return;
+    }
     if (!solu_.history.empty()) {                                    // the last exchange
         const SoluExchange& ex = solu_.history.back();
         DrawText(dc, ex.heard.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(left, y, right, y + 18), WithAlpha(kTextDim, 1.2f * alpha));
@@ -2511,6 +2934,951 @@ void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
 }
 
 // ---- the thin bar: Solu is awake, and it reacts to voices ---------------------------------------------------
+
+// ---- the file shelf -----------------------------------------------------------------------------
+
+namespace {
+bool HasFiles(IDataObject* data) {
+    FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    return data && data->QueryGetData(&fmt) == S_OK;
+}
+} // namespace
+
+DWORD IslandWindow::ShelfDragEnter(IDataObject* data) {
+    if (shelfDragging_ || suppressed_ || !HasFiles(data)) return DROPEFFECT_NONE;      // not files, or our own drag coming back
+    dragOver_ = true;
+    dragOpened_ = !expanded_;
+    KillTimer(hwnd_, kCloseTimer);
+    KillTimer(hwnd_, kAutoCloseTimer);
+    Expand();
+    if (section_ != Section::Shelf) OnClick(static_cast<int>(Section::Shelf));
+    Animate();
+    return DROPEFFECT_COPY;
+}
+
+DWORD IslandWindow::ShelfDragOver() {
+    if (!dragOver_) return DROPEFFECT_NONE;
+    KillTimer(hwnd_, kCloseTimer);
+    return DROPEFFECT_COPY;
+}
+
+void IslandWindow::ShelfDragLeave() {
+    if (!dragOver_) return;
+    dragOver_ = false;
+    if (dragOpened_ && expanded_) SetTimer(hwnd_, kCloseTimer, 700, nullptr);             // it opened for the drag: close again
+    Animate();
+}
+
+DWORD IslandWindow::ShelfDrop(IDataObject* data) {
+    dragOver_ = false;
+    std::vector<std::wstring> paths;
+    FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (data && data->GetData(&fmt, &medium) == S_OK) {
+        if (HDROP drop = static_cast<HDROP>(GlobalLock(medium.hGlobal))) {
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                wchar_t path[MAX_PATH * 4];
+                if (DragQueryFileW(drop, i, path, ARRAYSIZE(path))) paths.emplace_back(path);
+            }
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    if (!paths.empty() && shelfAdd_) shelfAdd_(paths);
+    SetTimer(hwnd_, kAutoCloseTimer, 3200, nullptr);                  // it stays a moment, so you can see it landed
+    autoClosePending_ = dragOpened_;
+    Animate();
+    return paths.empty() ? DROPEFFECT_NONE : DROPEFFECT_COPY;
+}
+
+void IslandWindow::SetShelf(const ShelfSnapshot& snapshot) {
+    const bool first = shelfSeen_.empty() && shelf_.items.empty();
+    shelf_ = snapshot;
+    std::set<std::wstring> now;
+    for (const ShelfItem& i : shelf_.items) {
+        now.insert(i.path);
+        if (!shelfSeen_.count(i.path)) shelfPop_[i.path] = first ? 1.0f : 0.0f;       // new ones pop in
+    }
+    shelfSeen_ = now;
+    for (auto it = shelfSel_.begin(); it != shelfSel_.end();)
+        it = now.count(*it) ? std::next(it) : shelfSel_.erase(it);
+    for (auto it = shelfBitmaps_.begin(); it != shelfBitmaps_.end();)
+        it = now.count(it->first) ? std::next(it) : shelfBitmaps_.erase(it);
+    for (auto it = shelfPop_.begin(); it != shelfPop_.end();)
+        it = now.count(it->first) ? std::next(it) : shelfPop_.erase(it);
+    shelfHover_.resize(shelf_.items.size(), 0.0f);
+    if (expanded_ && section_ == Section::Shelf) Animate();
+}
+
+D2D1_RECT_F IslandWindow::ShelfArea(const D2D1_RECT_F& island) const {
+    return D2D1::RectF(island.left + 22, island.top + 84, island.left + kExpandedW - kMascotLane + 6, island.top + 84 + kCardH + 4);
+}
+
+D2D1_RECT_F IslandWindow::ShelfCard(const D2D1_RECT_F& island, int index) const {
+    const D2D1_RECT_F area = ShelfArea(island);
+    const float x = area.left - shelfScroll_ + static_cast<float>(index) * (kCardW + kCardGap);
+    return D2D1::RectF(x, area.top, x + kCardW, area.top + kCardH);
+}
+
+ID2D1Bitmap1* IslandWindow::ShelfBitmap(const ShelfItem& item) {
+    auto it = shelfBitmaps_.find(item.path);
+    if (it != shelfBitmaps_.end()) return it->second.Get();
+    if (!item.icon || item.icon->empty() || item.icon->width < 2) return nullptr;
+    Com<ID2D1Bitmap1> bitmap;
+    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(dc_->CreateBitmap(D2D1::SizeU(item.icon->width, item.icon->height), item.icon->pixels.data(), item.icon->width * 4, &props, &bitmap))) return nullptr;
+    return shelfBitmaps_.emplace(item.path, std::move(bitmap)).first->second.Get();
+}
+
+void IslandWindow::DrawShelf(ID2D1DeviceContext* dc, D2D1_RECT_F base, float a) {
+    const D2D1_RECT_F area = ShelfArea(base);
+    const int n = static_cast<int>(shelf_.items.size());
+    const float now = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
+    IDWriteTextFormat* head = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* dim = gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
+
+    // ---- header
+    std::wstring title = n == 0 ? L"Your shelf" : n == 1 ? L"1 item held" : std::to_wstring(n) + L" items held";
+    DrawText(dc, title.c_str(), head, D2D1::RectF(area.left, base.top + 56, area.left + 220, base.top + 78), WithAlpha(kText, a));
+    if (n > 0) {
+        DrawText(dc, L"Drag them out into any folder, app or web page", dim, D2D1::RectF(area.left + 110, base.top + 57, area.right - 56, base.top + 78),
+                 WithAlpha(kTextDim, 1.05f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        const bool hot = hover_ == kHitShelfClear;
+        DrawText(dc, L"Clear", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(area.right - 50, base.top + 56, area.right, base.top + 78),
+                 WithAlpha(hot ? kAccent : kTextDim, (hot ? 1.0f : 1.2f) * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // ---- the cards
+    dc->PushAxisAlignedClip(D2D1::RectF(area.left - 4, area.top - 6, area.right + 4, area.bottom + 6), D2D1_ANTIALIAS_MODE_ALIASED);
+    if (n == 0) {                                                       // empty: one big drop zone
+        const D2D1_RECT_F zone = D2D1::RectF(area.left, area.top, area.right, area.bottom - 4);
+        const bool hot = hover_ == kHitShelfAdd;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (hot ? 0.10f : 0.055f) * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{zone, 16, 16}, brush_.Get());
+        const D2D1_POINT_2F c = D2D1::Point2F((zone.left + zone.right) / 2, zone.top + 34);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.55f * a));
+        dc->DrawLine(D2D1::Point2F(c.x - 9, c.y), D2D1::Point2F(c.x + 9, c.y), brush_.Get(), 2.2f, roundStroke_.Get());
+        dc->DrawLine(D2D1::Point2F(c.x, c.y - 9), D2D1::Point2F(c.x, c.y + 9), brush_.Get(), 2.2f, roundStroke_.Get());
+        DrawText(dc, L"Drop files here to hold them", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                 D2D1::RectF(zone.left, zone.top + 52, zone.right, zone.top + 72), WithAlpha(kText, 0.95f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(dc, L"then drag them to any folder, app or website  ·  or click to choose", dim,
+                 D2D1::RectF(zone.left, zone.top + 72, zone.right, zone.top + 90), WithAlpha(kTextDim, 1.1f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    for (int i = 0; i < n; ++i) {
+        const ShelfItem& item = shelf_.items[static_cast<size_t>(i)];
+        D2D1_RECT_F c = ShelfCard(base, i);
+        if (c.right < area.left - 4 || c.left > area.right + 4) continue;
+        const float pop = shelfPop_.count(item.path) ? shelfPop_[item.path] : 1.0f;
+        const float hv = i < static_cast<int>(shelfHover_.size()) ? shelfHover_[static_cast<size_t>(i)] : 0.0f;
+        const bool selected = shelfSel_.count(item.path) != 0;
+        const float grow = (0.82f + 0.18f * pop) * (1.0f + 0.03f * hv);           // pops in, lifts on hover
+        const float cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2 - 2.0f * hv;
+        const float hw = kCardW / 2 * grow, hh = kCardH / 2 * grow;
+        c = D2D1::RectF(cx - hw, cy - hh, cx + hw, cy + hh);
+        const float alpha = a * std::min(1.0f, pop * 1.4f);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (selected ? 0.16f : 0.065f + 0.075f * hv) * alpha));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{c, 14, 14}, brush_.Get());
+        if (selected) {
+            brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.9f * alpha));
+            dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(c.left + 0.75f, c.top + 0.75f, c.right - 0.75f, c.bottom - 0.75f), 14, 14}, brush_.Get(), 1.5f);
+        }
+        // picture: a thumbnail or the file's icon, fitted into a 54 px box
+        const D2D1_RECT_F box = D2D1::RectF(cx - 27 * grow, c.top + 9 * grow, cx + 27 * grow, c.top + 63 * grow);
+        if (ID2D1Bitmap1* bmp = ShelfBitmap(item)) {
+            const D2D1_SIZE_F sz = bmp->GetSize();
+            const float fit = std::min((box.right - box.left) / sz.width, (box.bottom - box.top) / sz.height);
+            const float w = sz.width * fit, h = sz.height * fit, bx = (box.left + box.right) / 2, by = (box.top + box.bottom) / 2;
+            dc->DrawBitmap(bmp, D2D1::RectF(bx - w / 2, by - h / 2, bx + w / 2, by + h / 2), (item.missing ? 0.35f : 1.0f) * alpha, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        } else {                                                          // not loaded yet: a soft placeholder
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.08f + 0.05f * std::sin(now * 5.0f + i)) * alpha));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(box.left + 6, box.top + 6, box.right - 6, box.bottom - 6), 8, 8}, brush_.Get());
+        }
+        DrawText(dc, item.name.c_str(), gfx_.Wrapped(10.5f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(c.left + 5, c.top + 66 * grow, c.right - 5, c.bottom - 3),
+                 WithAlpha(kText, (item.missing ? 0.45f : 0.92f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        if (hv > 0.02f) {                                                  // x: take it off the shelf (the file itself is untouched)
+            const D2D1_POINT_2F xc = D2D1::Point2F(c.right - 11, c.top + 11);
+            const bool hot = hover_ == kHitShelfRemove + i;
+            brush_->SetColor(D2D1::ColorF(hot ? 0.95f : 0.18f, hot ? 0.35f : 0.18f, hot ? 0.33f : 0.20f, 0.96f * hv * alpha));
+            dc->FillEllipse(D2D1::Ellipse(xc, 8.0f, 8.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.95f * hv * alpha));
+            dc->DrawLine(D2D1::Point2F(xc.x - 2.7f, xc.y - 2.7f), D2D1::Point2F(xc.x + 2.7f, xc.y + 2.7f), brush_.Get(), 1.4f, roundStroke_.Get());
+            dc->DrawLine(D2D1::Point2F(xc.x + 2.7f, xc.y - 2.7f), D2D1::Point2F(xc.x - 2.7f, xc.y + 2.7f), brush_.Get(), 1.4f, roundStroke_.Get());
+        }
+    }
+    if (n > 0 && n < 60) {                                                // the "add more" card
+        const D2D1_RECT_F c = ShelfCard(base, n);
+        const bool hot = hover_ == kHitShelfAdd;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (hot ? 0.10f : 0.045f) * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{c, 14, 14}, brush_.Get());
+        const D2D1_POINT_2F m = D2D1::Point2F((c.left + c.right) / 2, (c.top + c.bottom) / 2);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, (hot ? 0.9f : 0.5f) * a));
+        dc->DrawLine(D2D1::Point2F(m.x - 8, m.y), D2D1::Point2F(m.x + 8, m.y), brush_.Get(), 2.0f, roundStroke_.Get());
+        dc->DrawLine(D2D1::Point2F(m.x, m.y - 8), D2D1::Point2F(m.x, m.y + 8), brush_.Get(), 2.0f, roundStroke_.Get());
+    }
+    dc->PopAxisAlignedClip();
+
+    // ---- files are hovering over the island: a big, breathing drop target covers the shelf
+    if (dragT_ > 0.01f) {
+        const float t = dragT_;
+        const float breathe = 1.0f + 0.05f * std::sin(now * 6.0f);
+        const D2D1_RECT_F z = D2D1::RectF(area.left - 6, base.top + 52, area.right + 6, area.bottom + 6);
+        brush_->SetColor(D2D1::ColorF(kIslandFill.r, kIslandFill.g, kIslandFill.b, t));          // opaque: what is underneath must not show through
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{z, 18, 18}, brush_.Get());
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, (0.18f + 0.07f * std::sin(now * 6.0f)) * t));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{z, 18, 18}, brush_.Get());
+        Com<ID2D1StrokeStyle> dashed;                                       // a dashed accent outline
+        D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.0f,
+                                                                      D2D1_DASH_STYLE_DASH, 0.0f);
+        gfx_.d2dFactory()->CreateStrokeStyle(sp, nullptr, 0, &dashed);
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.95f * t));
+        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(z.left + 6, z.top + 6, z.right - 6, z.bottom - 6), 14, 14}, brush_.Get(), 1.8f, dashed.Get());
+        const D2D1_POINT_2F c = D2D1::Point2F((z.left + z.right) / 2, (z.top + z.bottom) / 2 - 12);
+        const float r = 21.0f * breathe;
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.30f * t));
+        dc->FillEllipse(D2D1::Ellipse(c, r + 5, r + 5), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0.04f, 0.47f, 1.0f, t));
+        dc->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, t));
+        dc->DrawLine(D2D1::Point2F(c.x - 8, c.y), D2D1::Point2F(c.x + 8, c.y), brush_.Get(), 2.6f, roundStroke_.Get());
+        dc->DrawLine(D2D1::Point2F(c.x, c.y - 8), D2D1::Point2F(c.x, c.y + 8), brush_.Get(), 2.6f, roundStroke_.Get());
+        DrawText(dc, L"Drop to hold on the shelf", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                 D2D1::RectF(z.left, c.y + 28, z.right, c.y + 50), WithAlpha(kText, t), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+}
+
+void IslandWindow::OpenShelfItem(int index, bool reveal) {
+    if (index < 0 || index >= static_cast<int>(shelf_.items.size())) return;
+    const std::wstring& path = shelf_.items[static_cast<size_t>(index)].path;
+    if (reveal) ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+    else ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void IslandWindow::ShelfAddFiles() {
+    std::vector<wchar_t> buffer(64 * 1024, L'\0');
+    OPENFILENAMEW ofn{sizeof(ofn)};
+    ofn.lpstrFile = buffer.data();
+    ofn.nMaxFile = static_cast<DWORD>(buffer.size());
+    ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle = L"Add files to the shelf";
+    if (!GetOpenFileNameW(&ofn)) return;
+    std::vector<std::wstring> paths;
+    const std::wstring first = buffer.data();
+    const wchar_t* next = buffer.data() + first.size() + 1;
+    if (*next == L'\0') {
+        paths.push_back(first);                                           // a single file: the full path
+    } else {
+        for (; *next; next += wcslen(next) + 1) paths.push_back(first + L"\\" + next);
+    }
+    if (shelfAdd_) shelfAdd_(paths);
+}
+
+// Pull one or several items off the shelf into another app, folder or web page: a real shell drag of the files.
+void IslandWindow::StartShelfDrag(int index) {
+    if (index < 0 || index >= static_cast<int>(shelf_.items.size())) return;
+    const std::wstring& pressed = shelf_.items[static_cast<size_t>(index)].path;
+    if (!shelfSel_.count(pressed)) shelfSel_ = {pressed};               // grabbing an unselected item drags just that one
+    std::vector<std::wstring> paths;
+    for (const ShelfItem& i : shelf_.items)
+        if (shelfSel_.count(i.path) && !i.missing) paths.push_back(i.path);
+    if (paths.empty()) return;
+    std::vector<PIDLIST_ABSOLUTE> pidls;
+    std::vector<PCUITEMID_CHILD> items;                                // absolute PIDLs: no parent folder is given
+    for (const std::wstring& p : paths) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
+            pidls.push_back(pidl);
+            items.push_back(reinterpret_cast<PCUITEMID_CHILD>(pidl));
+        }
+    }
+    IDataObject* data = nullptr;
+    std::vector<PCIDLIST_ABSOLUTE> constPidls(pidls.begin(), pidls.end());
+    if (!pidls.empty()) {                                               // a shell item array makes the full set of file formats (file list, IDList, names)
+        IShellItemArray* array = nullptr;
+        if (SUCCEEDED(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(constPidls.size()), constPidls.data(), &array)) && array) {
+            array->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data));
+            array->Release();
+        }
+    }
+    if (data) {
+        pressed_ = -1;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        shelfDragging_ = true;                                          // the island stays open while the drag lasts
+        KillTimer(hwnd_, kCloseTimer);
+        DWORD effect = DROPEFFECT_NONE;
+        SHDoDragDrop(hwnd_, data, nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+        shelfDragging_ = false;
+        data->Release();
+        Log("shelf: dragged %zu item(s) out (effect %lu)", paths.size(), static_cast<unsigned long>(effect));
+    }
+    for (PIDLIST_ABSOLUTE pidl : pidls) CoTaskMemFree(pidl);
+    hover_ = -1;
+    if (expanded_ && !Pinned() && !CursorInIsland(kLeaveSlack)) SetTimer(hwnd_, kCloseTimer, 900, nullptr);
+    Animate();
+}
+
+// ---- the Agents tab ----------------------------------------------------------------------------
+
+namespace {
+std::wstring AgoText(ULONGLONG unixMs) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const ULONGLONG now = ((static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) / 10000 - 11644473600000ull;
+    const ULONGLONG sec = now > unixMs ? (now - unixMs) / 1000 : 0;
+    if (sec < 20) return L"just now";
+    if (sec < 90) return L"a minute ago";
+    if (sec < 3600) return std::to_wstring(sec / 60) + L" min ago";
+    if (sec < 86400) return std::to_wstring(sec / 3600) + L" h ago";
+    return std::to_wstring(sec / 86400) + L" d ago";
+}
+} // namespace
+
+std::vector<const AgentSession*> IslandWindow::SessionsOf(AgentTool tool) const {
+    std::vector<const AgentSession*> out;
+    for (const AgentSession& s : agents_.sessions)
+        if (s.tool == tool) out.push_back(&s);
+    return out;
+}
+
+const AgentSession* IslandWindow::CurrentSession() const {
+    const auto mine = SessionsOf(agentTool_);
+    if (mine.empty()) return nullptr;
+    for (const AgentSession* s : mine)
+        if (!agentSession_.empty() && s->id == agentSession_) return s;
+    return mine.front();
+}
+
+void IslandWindow::AutoPickAgent() {
+    if (!agentAuto_ || agents_.sessions.empty()) return;
+    const AgentSession& best = agents_.sessions.front();                  // working first, then the most recent
+    if (best.tool != agentTool_) agentSession_.clear();
+    agentTool_ = best.tool;
+}
+
+void IslandWindow::SetAgents(const AgentSnapshot& snapshot) {
+    agents_ = snapshot;
+    if (!snapshot.justStarted.empty()) {                                // a prompt from here started a new session: go to it
+        for (const AgentSession& s : agents_.sessions)
+            if (s.id == snapshot.justStarted) {
+                agentTool_ = s.tool;
+                agentSession_ = s.id;
+                agentScroll_ = 0;
+                newChat_ = false;
+            }
+    } else {
+        AutoPickAgent();
+    }
+    if (!snapshot.sendError.empty()) agentError_ = snapshot.sendError;
+    UpdateAgentTimer();
+    if (expanded_ && section_ == Section::Ai) Animate();
+}
+
+void IslandWindow::UpdateAgentTimer() {
+    KillTimer(hwnd_, kAgentTimer);
+    if (!expanded_ || section_ != Section::Ai) return;
+    bool busy = agents_.sending || promptFocus_;
+    for (const AgentSession& s : agents_.sessions)
+        if (s.status == AgentStatus::Working) busy = true;
+    if (busy) SetTimer(hwnd_, kAgentTimer, promptFocus_ ? 260 : 120, nullptr);
+}
+
+IslandWindow::AgentsLayout IslandWindow::AgentsGeometry(const D2D1_RECT_F& island) const {
+    AgentsLayout g{};
+    const float x0 = island.left + 22, x1 = island.left + kExpandedW - kMascotLane + 6, top = island.top;
+    const float bottom = island.bottom - 14;
+    g.tool[0] = D2D1::RectF(x0, top + 56, x0 + 152, top + 90);
+    g.tool[1] = D2D1::RectF(x0 + 158, top + 56, x0 + 310, top + 90);
+    g.connect = D2D1::RectF(x0 + 316, top + 56, x1, top + 90);
+    g.header = D2D1::RectF(x0, top + 98, x1 - 50, top + 120);
+    g.prev = D2D1::RectF(x1 - 46, top + 96, x1 - 24, top + 122);
+    g.next = D2D1::RectF(x1 - 22, top + 96, x1, top + 122);
+    g.send = D2D1::RectF(x1 - 32, bottom - 32, x1, bottom);
+    g.box = D2D1::RectF(x0 + 38, bottom - 32, x1 - 38, bottom);
+    g.newBtn = D2D1::RectF(x0, bottom - 32, x0 + 32, bottom);
+    g.feed = D2D1::RectF(x0, top + 126, x1, bottom - 40);
+    g.rows = std::max(1, static_cast<int>((g.feed.bottom - g.feed.top) / 21.0f));
+    return g;
+}
+
+ID2D1Bitmap1* IslandWindow::Logo(AgentTool tool) {
+    Com<ID2D1Bitmap1>& slot = tool == AgentTool::Claude ? logoClaude_ : logoCodex_;
+    if (slot) return slot.Get();
+    wchar_t exe[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    std::wstring path(exe, n);
+    path = path.substr(0, path.find_last_of(L'\\')) + (tool == AgentTool::Claude ? L"\\assets\\agents\\claude.png" : L"\\assets\\agents\\codex.png");
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    std::vector<uint8_t> bytes(GetFileSize(f, nullptr));
+    DWORD got = 0;
+    ReadFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr);
+    CloseHandle(f);
+    ImageBGRA img;
+    if (!DecodeImage(bytes.data(), got, 1.0f, 128, img)) return nullptr;
+    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    dc_->CreateBitmap(D2D1::SizeU(img.width, img.height), img.pixels.data(), img.width * 4, &props, &slot);
+    return slot.Get();
+}
+
+void IslandWindow::DrawAgents(ID2D1DeviceContext* dc, D2D1_RECT_F base, float a) {
+    const AgentsLayout g = AgentsGeometry(base);
+    const uint64_t now = GetTickCount64();
+    const AgentSession* cur = CurrentSession();
+    IDWriteTextFormat* name = gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* caption = gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* body = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* bold = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    const D2D1_COLOR_F kViolet = Rgba(0.75f, 0.60f, 1.0f, 1.0f);
+
+    // ---- the two agents: logo, name, and what each is doing
+    const wchar_t* names[2] = {L"Claude Code", L"Codex"};
+    for (int i = 0; i < 2; ++i) {
+        const AgentTool tool = i == 0 ? AgentTool::Claude : AgentTool::Codex;
+        const bool selected = agentTool_ == tool;
+        const bool hot = hover_ == kHitAgentTool + i;
+        const D2D1_RECT_F r = g.tool[i];
+        if (selected || hot) {
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (selected ? 0.12f : 0.07f) * a));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{r, 17, 17}, brush_.Get());
+        }
+        const D2D1_RECT_F logo = D2D1::RectF(r.left + 8, (r.top + r.bottom) / 2 - 11, r.left + 30, (r.top + r.bottom) / 2 + 11);
+        if (ID2D1Bitmap1* bmp = Logo(tool)) dc->DrawBitmap(bmp, logo, (selected ? 1.0f : 0.72f) * a, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        DrawText(dc, names[i], name, D2D1::RectF(logo.right + 8, r.top, r.right - 24, r.bottom), WithAlpha(kText, (selected ? 1.0f : 0.72f) * a));
+        // a dot: amber and pulsing while it works, green when idle recently, grey when nothing was seen
+        const auto mine = SessionsOf(tool);
+        bool working = false;
+        for (const AgentSession* s : mine) working |= s->status == AgentStatus::Working;
+        const D2D1_COLOR_F dot = working ? kAmber : mine.empty() ? Rgba(1, 1, 1, 0.28f) : kGreen;
+        const float pulse = working ? 0.55f + 0.45f * std::sin(static_cast<float>(now % 1200) / 1200.0f * 6.2831853f) : 1.0f;
+        brush_->SetColor(D2D1::ColorF(dot.r, dot.g, dot.b, dot.a * pulse * a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.right - 14, (r.top + r.bottom) / 2), 3.5f, 3.5f), brush_.Get());
+    }
+    const bool hooked = agentTool_ == AgentTool::Claude ? agents_.claudeHooked : agents_.codexHooked;
+    if (!hooked) {                                                        // approvals from your editor need the hook (prompts from here never do)
+        const bool hot = hover_ == kHitConnect;
+        DrawText(dc, L"Connect approvals", caption, g.connect, WithAlpha(hot ? kText : kTextDim, 1.1f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // ---- the session: project, title, and its state
+    const auto mine = SessionsOf(agentTool_);
+    if (!cur) {
+        const bool found = agentTool_ == AgentTool::Claude ? agents_.claudeFound : agents_.codexFound;
+        DrawText(dc, found ? L"Nothing running right now" : L"Not installed on this PC", gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                 D2D1::RectF(g.header.left, g.feed.top + 6, g.send.right, g.feed.top + 30), WithAlpha(kText, 0.95f * a));
+        DrawText(dc, found ? L"Send a prompt below to start a new chat" : L"Install its VS Code extension to send prompts from here", caption,
+                 D2D1::RectF(g.header.left, g.feed.top + 32, g.send.right, g.feed.top + 52), WithAlpha(kTextDim, 1.1f * a));
+    } else {
+        D2D1_COLOR_F tint = cur->status == AgentStatus::Working ? kAmber : cur->status == AgentStatus::Waiting ? kViolet : kGreen;
+        brush_->SetColor(D2D1::ColorF(tint.r, tint.g, tint.b, a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(g.header.left + 4, g.header.top + 11), 3.2f, 3.2f), brush_.Get());
+        const std::wstring state = cur->status == AgentStatus::Working ? cur->doing
+                                 : cur->status == AgentStatus::Waiting ? L"Waiting for you" : L"Done · " + AgoText(cur->lastActivity);
+        const float stateW = std::min(std::ceil(gfx_.MeasureWidth(state.c_str(), caption)) + 4, 200.0f);
+        const float nameW = std::ceil(gfx_.MeasureWidth(cur->project.c_str(), bold));
+        const bool go = hover_ == kHitAgentGo;
+        const float titleLeft = g.header.left + 14 + nameW + 24;
+        DrawText(dc, cur->project.c_str(), bold, D2D1::RectF(g.header.left + 14, g.header.top, g.header.left + 14 + nameW + 2, g.header.bottom),
+                 go ? WithAlpha(kAccent, a) : WithAlpha(kText, a));
+        DrawText(dc, L"\uE8A7", gfx_.Text(9.5f, DWRITE_FONT_WEIGHT_NORMAL, true),                 // "open in a new window"
+                 D2D1::RectF(g.header.left + 16 + nameW, g.header.top + 1, g.header.left + 30 + nameW, g.header.bottom),
+                 go ? WithAlpha(kAccent, a) : WithAlpha(kTextDim, 1.1f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (go) {
+            brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.7f * a));
+            dc->DrawLine(D2D1::Point2F(g.header.left + 14, g.header.bottom - 1.5f), D2D1::Point2F(g.header.left + 14 + nameW, g.header.bottom - 1.5f), brush_.Get(), 1.0f);
+        }
+        DrawText(dc, cur->title.c_str(), caption, D2D1::RectF(titleLeft, g.header.top + 1, g.header.right - stateW - 8, g.header.bottom),
+                 WithAlpha(kTextDim, 1.15f * a));
+        DrawText(dc, state.c_str(), caption, D2D1::RectF(g.header.right - stateW, g.header.top + 1, g.header.right + (mine.size() > 1 ? 0.0f : 48.0f), g.header.bottom),
+                 WithAlpha(cur->status == AgentStatus::Working ? tint : kTextDim, 1.15f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (mine.size() > 1) {                                            // flip between this agent's sessions
+            for (int k = 0; k < 2; ++k) {
+                const D2D1_RECT_F r = k == 0 ? g.prev : g.next;
+                const bool hot = hover_ == (k == 0 ? kHitAgentPrev : kHitAgentNext);
+                const float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, d = k == 0 ? -1.0f : 1.0f;
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, (hot ? 0.95f : 0.55f) * a));
+                dc->DrawLine(D2D1::Point2F(cx - 2.5f * d, cy - 4.5f), D2D1::Point2F(cx + 2.5f * d, cy), brush_.Get(), 1.7f, roundStroke_.Get());
+                dc->DrawLine(D2D1::Point2F(cx + 2.5f * d, cy), D2D1::Point2F(cx - 2.5f * d, cy + 4.5f), brush_.Get(), 1.7f, roundStroke_.Get());
+            }
+        }
+
+        // ---- the feed: the last things it said and did, newest at the bottom. Replies wrap onto several lines (the final
+        //      answer gets the most), everything else is one line.
+        dc->PushAxisAlignedClip(g.feed, D2D1_ANTIALIAS_MODE_ALIASED);
+        const int total = static_cast<int>(cur->feed.size());
+        const int last = total - agentScroll_;                           // one past the newest row shown
+        int finalReply = -1;                                              // the agent's last message: the answer
+        for (int k = total - 1; k >= 0; --k)
+            if (cur->feed[static_cast<size_t>(k)].kind == AgentEvent::Kind::Said) { finalReply = k; break; }
+        const float textW = g.feed.right - g.feed.left - 22;
+        auto rowHeight = [&](int k, int& lines) {
+            const AgentEvent& e = cur->feed[static_cast<size_t>(k)];
+            lines = 1;
+            if (e.kind == AgentEvent::Kind::Said || e.kind == AgentEvent::Kind::You) {
+                const int cap = k == finalReply ? 6 : 2;
+                const float h = gfx_.MeasureHeight(e.text.c_str(), gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL), textW);
+                lines = std::clamp(static_cast<int>(std::ceil(h / 16.5f)), 1, cap);
+            }
+            return std::max(21.0f, lines * 16.5f + 5.0f);
+        };
+        struct Row { int k; float h; int lines; };
+        std::vector<Row> rows;
+        float used = 0;
+        const float avail = g.feed.bottom - g.feed.top;
+        for (int k = last - 1; k >= 0; --k) {
+            int lines;
+            float h = rowHeight(k, lines);
+            if (!rows.empty() && used + h > avail) {                       // too tall: show as much of it as fits, rather than nothing
+                if (avail - used >= 38) rows.push_back({k, avail - used, lines}), used = avail;
+                break;
+            }
+            rows.push_back({k, h, lines});
+            used += h;
+        }
+        float y = g.feed.bottom - used;
+        for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
+            const AgentEvent& e = cur->feed[static_cast<size_t>(it->k)];
+            const float rowH = it->h;
+            const D2D1_RECT_F row = D2D1::RectF(g.feed.left, y, g.feed.right, y + rowH);
+            const float tx = row.left + 22;
+            const D2D1_RECT_F textRect = D2D1::RectF(tx, y + 2, row.right, y + rowH);
+            if (e.kind == AgentEvent::Kind::You) {
+                DrawText(dc, L"", gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(row.left, y, row.left + 18, y + 21),
+                         WithAlpha(kAccent, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawText(dc, e.text.c_str(), gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL), textRect, WithAlpha(kAccent, 1.0f * a),
+                         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            } else if (e.kind == AgentEvent::Kind::Said) {
+                const bool answer = it->k == finalReply;
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, (answer ? 0.8f : 0.45f) * a));
+                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(row.left + 9, y + 11), answer ? 2.8f : 2.2f, answer ? 2.8f : 2.2f), brush_.Get());
+                DrawText(dc, e.text.c_str(), gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL), textRect, WithAlpha(kText, (answer ? 0.98f : 0.8f) * a),
+                         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            } else if (e.kind == AgentEvent::Kind::Tool) {
+                if (e.running) {                                          // three dots chasing each other
+                    for (int d = 0; d < 3; ++d) {
+                        const float ph = 0.5f + 0.5f * std::sin(static_cast<float>(now % 100000) / 1000.0f * 7.0f - d * 0.9f);
+                        brush_->SetColor(D2D1::ColorF(kAmber.r, kAmber.g, kAmber.b, (0.3f + 0.7f * ph) * a));
+                        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(row.left + 3 + d * 5.5f, y + 11), 1.9f, 1.9f), brush_.Get());
+                    }
+                } else {
+                    DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(row.left, y, row.left + 18, y + 21),
+                             WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+                }
+                const float verbW = std::ceil(gfx_.MeasureWidth(e.text.c_str(), bold));
+                DrawText(dc, e.text.c_str(), bold, D2D1::RectF(tx, y + 1, tx + verbW + 2, y + 21), WithAlpha(e.running ? kAmber : kText, (e.running ? 1.0f : 0.8f) * a));
+                DrawText(dc, e.detail.c_str(), body, D2D1::RectF(tx + verbW + 8, y + 1, row.right, y + 21), WithAlpha(kTextDim, 1.2f * a));
+            } else if (e.kind == AgentEvent::Kind::Done) {
+                DrawText(dc, L"", gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(row.left, y, row.left + 18, y + 21),
+                         WithAlpha(kGreen, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawText(dc, e.text.c_str(), bold, D2D1::RectF(tx, y + 1, row.right, y + 21), WithAlpha(kGreen, a));
+            } else {
+                DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(row.left, y, row.left + 18, y + 21),
+                         WithAlpha(D2D1::ColorF(1.0f, 0.45f, 0.40f, 1.0f), a), DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawText(dc, e.text.c_str(), body, D2D1::RectF(tx, y + 1, row.right, y + 21), WithAlpha(D2D1::ColorF(1.0f, 0.55f, 0.50f, 1.0f), a));
+            }
+            y += rowH;
+        }
+        dc->PopAxisAlignedClip();
+        if (agentScroll_ > 0)                                             // there is newer stuff below
+            DrawText(dc, L"↓ newer", caption, D2D1::RectF(g.feed.right - 70, g.feed.bottom - 18, g.feed.right, g.feed.bottom), WithAlpha(kTextDim, 1.2f * a),
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // ---- the prompt box: type like you would to the agent in your editor
+    const bool sendingHere = agents_.sending && agents_.sendingTool == agentTool_;
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (newChat_ ? 0.20f : hover_ == kHitNewChat ? 0.14f : 0.08f) * a));
+    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F((g.newBtn.left + g.newBtn.right) / 2, (g.newBtn.top + g.newBtn.bottom) / 2), 16.0f, 16.0f), brush_.Get());
+    DrawText(dc, newChat_ ? L"" : L"", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL, true), g.newBtn, WithAlpha(kText, (newChat_ ? 1.0f : 0.8f) * a),
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (promptFocus_ ? 0.13f : 0.075f) * a));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{g.box, 16, 16}, brush_.Get());
+    if (promptFocus_) {
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.85f * a));
+        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(g.box.left + 0.5f, g.box.top + 0.5f, g.box.right - 0.5f, g.box.bottom - 0.5f), 16, 16}, brush_.Get(), 1.2f);
+    }
+    IDWriteTextFormat* input = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    const float textLeft = g.box.left + 14, textRight = g.box.right - 12, boxW = textRight - textLeft;
+    if (prompt_.empty()) {
+        std::wstring hint = sendingHere ? L"Sending…" : newChat_ ? (agentTool_ == AgentTool::Claude ? L"Start a new chat with Claude Code…" : L"Start a new chat with Codex…")
+                          : (agentTool_ == AgentTool::Claude ? L"Message Claude Code…" : L"Message Codex…");
+        DrawText(dc, hint.c_str(), input, D2D1::RectF(textLeft, g.box.top, textRight, g.box.bottom), WithAlpha(kTextDim, 1.1f * a));
+    } else {
+        std::wstring shown = prompt_;
+        for (wchar_t& c : shown)
+            if (c == L'\n') c = L'⏎';
+        const float caretX = std::ceil(gfx_.MeasureWidth(shown.substr(0, caret_).c_str(), input));
+        if (caretX - promptScroll_ > boxW - 6) promptScroll_ = caretX - (boxW - 6);
+        if (caretX < promptScroll_) promptScroll_ = caretX;
+        if (promptScroll_ < 0) promptScroll_ = 0;
+        dc->PushAxisAlignedClip(D2D1::RectF(textLeft, g.box.top, textRight, g.box.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+        const float full = std::ceil(gfx_.MeasureWidth(shown.c_str(), input)) + 40;
+        DrawText(dc, shown.c_str(), input, D2D1::RectF(textLeft - promptScroll_, g.box.top, textLeft - promptScroll_ + full, g.box.bottom), WithAlpha(kText, a));
+        dc->PopAxisAlignedClip();
+    }
+    if (promptFocus_ && (now / 530) % 2 == 0) {                         // the caret
+        const std::wstring head = prompt_.substr(0, caret_);
+        std::wstring shownHead = head;
+        for (wchar_t& c : shownHead)
+            if (c == L'\n') c = L'⏎';
+        const float cx = textLeft + std::ceil(gfx_.MeasureWidth(shownHead.c_str(), input)) - promptScroll_;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.95f * a));
+        dc->FillRectangle(D2D1::RectF(cx, g.box.top + 8, cx + 1.3f, g.box.bottom - 8), brush_.Get());
+    }
+    const bool canSend = !prompt_.empty() && !sendingHere;
+    brush_->SetColor(D2D1::ColorF(0.04f + (hover_ == kHitSend && canSend ? 0.06f : 0.0f), 0.47f, 1.0f, (canSend ? 1.0f : 0.32f) * a));
+    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F((g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2), 16.0f, 16.0f), brush_.Get());
+    DrawText(dc, L"", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL, true), g.send, WithAlpha(D2D1::ColorF(1, 1, 1, 1), (canSend ? 1.0f : 0.6f) * a),
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (!agentError_.empty())                                            // the last prompt could not be delivered
+        DrawText(dc, agentError_.c_str(), caption, D2D1::RectF(g.box.left, g.box.top - 18, g.send.right, g.box.top - 2),
+                 WithAlpha(D2D1::ColorF(1.0f, 0.55f, 0.50f, 1.0f), a));
+}
+
+// ---- typing -----------------------------------------------------------------------------------
+
+void IslandWindow::FocusAgentPrompt() {
+    if (suppressed_) return;
+    Expand();
+    OnClick(static_cast<int>(Section::Ai));
+    KillTimer(hwnd_, kCloseTimer);
+    FocusPrompt();
+    Animate();
+}
+
+void IslandWindow::FocusPrompt() {
+    if (promptFocus_) return;
+    prevForeground_ = GetForegroundWindow();
+    if (prevForeground_ == hwnd_) prevForeground_ = nullptr;
+    promptFocus_ = true;
+    KillTimer(hwnd_, kCloseTimer);
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE));
+    SetForegroundWindow(hwnd_);
+    SetFocus(hwnd_);
+    UpdateAgentTimer();
+}
+
+void IslandWindow::BlurPrompt(bool restoreWindow) {
+    if (!promptFocus_) return;
+    promptFocus_ = false;
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+    if (restoreWindow && prevForeground_ && IsWindow(prevForeground_)) SetForegroundWindow(prevForeground_);   // back to what you were doing
+    prevForeground_ = nullptr;
+    UpdateAgentTimer();
+    if (expanded_ && !Pinned() && !CursorInIsland(kLeaveSlack)) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
+    Animate();
+}
+
+void IslandWindow::PromptInsert(const std::wstring& text) {
+    prompt_.insert(caret_, text);
+    caret_ += text.size();
+    agentError_.clear();
+}
+
+void IslandWindow::OnChar(wchar_t ch) {
+    if (!promptFocus_) return;
+    if (ch == L'\r') {
+        if (GetKeyState(VK_SHIFT) & 0x8000) PromptInsert(L"\n");
+        else SendPrompt();
+    } else if (ch == L'\b') {
+        if (caret_ > 0) prompt_.erase(--caret_, 1);
+    } else if (ch == 0x7F) {                                            // Ctrl+Backspace: the word before the caret
+        size_t at = caret_;
+        while (at > 0 && prompt_[at - 1] == L' ') --at;
+        while (at > 0 && prompt_[at - 1] != L' ') --at;
+        prompt_.erase(at, caret_ - at);
+        caret_ = at;
+    } else if (ch == 0x1B) {                                            // Esc: leave the box, back to your editor
+        BlurPrompt(true);
+    } else if (ch >= 0x20) {
+        PromptInsert(std::wstring(1, ch));
+    }
+    Animate();
+}
+
+void IslandWindow::OnKey(WPARAM vk) {
+    if (!promptFocus_) return;
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (vk == VK_LEFT) {
+        if (ctrl) { while (caret_ > 0 && prompt_[caret_ - 1] == L' ') --caret_; while (caret_ > 0 && prompt_[caret_ - 1] != L' ') --caret_; }
+        else if (caret_ > 0) --caret_;
+    } else if (vk == VK_RIGHT) {
+        if (ctrl) { while (caret_ < prompt_.size() && prompt_[caret_] == L' ') ++caret_; while (caret_ < prompt_.size() && prompt_[caret_] != L' ') ++caret_; }
+        else if (caret_ < prompt_.size()) ++caret_;
+    } else if (vk == VK_HOME) {
+        caret_ = 0;
+    } else if (vk == VK_END) {
+        caret_ = prompt_.size();
+    } else if (vk == VK_DELETE) {
+        if (caret_ < prompt_.size()) prompt_.erase(caret_, 1);
+    } else if (vk == VK_UP || vk == VK_DOWN) {                          // scroll through what the agent did
+        if (const AgentSession* s = CurrentSession())
+            agentScroll_ = std::clamp(agentScroll_ + (vk == VK_UP ? 1 : -1), 0, std::max(0, static_cast<int>(s->feed.size()) - 1));
+    } else if (ctrl && vk == 'V') {
+        if (OpenClipboard(hwnd_)) {
+            if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+                if (const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(data))) {
+                    std::wstring pasted = text;
+                    GlobalUnlock(data);
+                    pasted.erase(std::remove(pasted.begin(), pasted.end(), L'\r'), pasted.end());
+                    if (pasted.size() > 8000) pasted.resize(8000);
+                    PromptInsert(pasted);
+                }
+            }
+            CloseClipboard();
+        }
+    } else if (ctrl && vk == 'A') {
+        caret_ = prompt_.size();
+    }
+    Animate();
+}
+
+void IslandWindow::SendPrompt() {
+    std::wstring text = prompt_;
+    while (!text.empty() && (text.back() == L' ' || text.back() == L'\n')) text.pop_back();
+    if (text.empty() || !agentSend_ || (agents_.sending && agents_.sendingTool == agentTool_)) return;
+    const AgentSession* s = CurrentSession();
+    std::wstring cwd = s ? s->cwd : L"";
+    if (cwd.empty() && !agents_.sessions.empty()) cwd = agents_.sessions.front().cwd;          // a new chat: where you worked last
+    std::wstring error;
+    if (agentSend_(agentTool_, newChat_ || !s ? L"" : s->id, cwd, text, newChat_ || !s, error)) {
+        prompt_.clear();
+        caret_ = 0;
+        promptScroll_ = 0;
+        agentError_.clear();
+        agentScroll_ = 0;
+        newChat_ = false;
+        agents_.sending = true;                                          // shown at once; the monitor confirms
+        agents_.sendingTool = agentTool_;
+    } else {
+        agentError_ = error;
+    }
+    Animate();
+}
+
+// ---- live pills ------------------------------------------------------------------------------
+
+float IslandWindow::CollapsedW() const {
+    if (Live()) return kLiveW;
+    if (LyricsPill()) {                                              // as wide as the line, within reason
+        const std::wstring& text = lyrics_.lines[static_cast<size_t>(lyricLine_)].text;
+        const float w = text.empty() ? 40.0f : gfx_.MeasureWidth(text.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD));
+        return std::clamp(std::ceil(w) + 64.0f, 150.0f, 460.0f);
+    }
+    return kCollapsedW;
+}
+float IslandWindow::CollapsedH() const { return Live() ? kLiveH : LyricsPill() ? kLyricPillH : kCollapsedH; }
+
+// ---- live lyrics ----------------------------------------------------------------------------
+
+bool IslandWindow::LyricsReady() const {
+    return lyricsOn_ && media_.hasSession && lyrics_.status == Lyrics::Status::Found && !lyrics_.lines.empty();
+}
+
+bool IslandWindow::LyricsPill() const {
+    return LyricsReady() && media_.playing && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size()) && !Live() &&
+           !SoluActive();                                            // a conversation, a live pill: they come first
+}
+
+float IslandWindow::LyricShift() const { return section_ == Section::Music && LyricsReady() ? kLyricLinesH : 0.0f; }
+
+void IslandWindow::RefreshCollapsed() {
+    if (expanded_) return;
+    const float w = CollapsedW(), h = CollapsedH();
+    if (w == w_.target && h == h_.target) return;
+    SetOpenSprings(w_, h_);                                         // the pill morphs to the new line's width
+    w_.target = w;
+    h_.target = h;
+    SetHitRegion(false);
+    Animate();
+}
+
+void IslandWindow::UpdateLyricLine() {
+    KillTimer(hwnd_, kLyricsTimer);
+    constexpr double kLead = 0.15;                                  // a line appears a moment before it is sung
+    const double pos = media_.PositionNow() + kLead;
+    const int line = LyricsReady() ? lyrics_.LineAt(pos) : -1;
+    if (line != lyricLine_) {
+        lyricPrev_ = lyricLine_;
+        lyricLine_ = line;
+        lyricT_ = 0.0f;
+        Animate();
+    }
+    RefreshCollapsed();
+    if (LyricsReady() && media_.playing && line + 1 < static_cast<int>(lyrics_.lines.size())) {   // wake exactly for the next line
+        const double wait = lyrics_.lines[static_cast<size_t>(line + 1)].at - pos;
+        SetTimer(hwnd_, kLyricsTimer, static_cast<UINT>(std::clamp(wait * 1000.0, 15.0, 60000.0)), nullptr);
+    }
+}
+
+void IslandWindow::SetLyrics(const Lyrics& lyrics) {
+    const bool same = lyrics.key == lyrics_.key && lyrics.status == lyrics_.status && lyrics.lines.size() == lyrics_.lines.size();
+    lyrics_ = lyrics;
+    if (!same) lyricLine_ = lyricPrev_ = -1;
+    UpdateLyricLine();
+    ApplyHeightTarget();
+    Animate();
+}
+
+void IslandWindow::SetLyricsOn(bool on) {
+    if (lyricsOn_ == on) return;
+    lyricsOn_ = on;
+    UpdateLyricLine();
+    ApplyHeightTarget();
+    Animate();
+}
+
+D2D1_POINT_2F IslandWindow::LyricsButton(const D2D1_RECT_F& island) const {
+    const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
+    return D2D1::Point2F(x1 - 10.0f, island.top + kControlsY + LyricShift());
+}
+
+// The closed island as a slim pill with the line being sung: the old line drifts up and out, the new one rises in.
+void IslandWindow::DrawLyricPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float a) {
+    if (a < 0.01f || lyricLine_ < 0) return;
+    const float cy = (r.top + r.bottom) / 2;
+    DrawText(dc, L"\u266A", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left + 10, cy - 9, r.left + 28, cy + 9),
+             WithAlpha(kGreen, 0.9f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat* font = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    const D2D1_RECT_F box = D2D1::RectF(r.left + 30, r.top, r.right - 16, r.bottom);
+    const float t = SmoothStep(0.0f, 1.0f, lyricT_);
+    auto line = [&](int i) -> std::wstring {
+        if (i < 0 || i >= static_cast<int>(lyrics_.lines.size())) return {};
+        const std::wstring& s = lyrics_.lines[static_cast<size_t>(i)].text;
+        return s.empty() ? L"\u266A \u266A \u266A" : s;
+    };
+    dc->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (t < 1.0f && lyricPrev_ >= 0) {
+        const std::wstring old = line(lyricPrev_);
+        DrawText(dc, old.c_str(), font, D2D1::RectF(box.left, cy - 9 - 8 * t, box.right, cy + 9 - 8 * t), WithAlpha(kText, (1 - t) * a),
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    const std::wstring now = line(lyricLine_);
+    DrawText(dc, now.c_str(), font, D2D1::RectF(box.left, cy - 9 + 8 * (1 - t), box.right, cy + 9 + 8 * (1 - t)), WithAlpha(kText, t * a),
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->PopAxisAlignedClip();
+}
+
+// The Music tab: the line being sung, bright, and the next one, quiet. The same rise as the pill when a line changes.
+void IslandWindow::DrawLyricLines(ID2D1DeviceContext* dc, float x0, float x1, float top, float a) {
+    const int n = static_cast<int>(lyrics_.lines.size());
+    auto line = [&](int i) -> std::wstring {
+        if (i < 0) return L"\u266A";                                 // before the singing starts
+        if (i >= n) return {};
+        const std::wstring& s = lyrics_.lines[static_cast<size_t>(i)].text;
+        return s.empty() ? L"\u266A \u266A \u266A" : s;
+    };
+    const float t = SmoothStep(0.0f, 1.0f, lyricT_);
+    IDWriteTextFormat* nextFont = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    auto fit = [&](const std::wstring& s) {                            // a long line steps down a size before it is cut short
+        IDWriteTextFormat* f = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        return gfx_.MeasureWidth(s.c_str(), f) <= x1 - x0 ? f : gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    };
+    dc->PushAxisAlignedClip(D2D1::RectF(x0 - 2, top - 2, x1 + 2, top + kLyricLinesH), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (t < 1.0f && lyricPrev_ != lyricLine_) {
+        const std::wstring old = line(lyricPrev_);
+        DrawText(dc, old.c_str(), fit(old), D2D1::RectF(x0, top - 10 * t, x1, top + 19 - 10 * t), WithAlpha(kText, (1 - t) * a));
+    }
+    const std::wstring now = line(lyricLine_), next = line(lyricLine_ + 1);
+    DrawText(dc, now.c_str(), fit(now), D2D1::RectF(x0, top + 18 * (1 - t), x1, top + 19 + 18 * (1 - t)),
+             WithAlpha(kText, (lyricLine_ < 0 ? 0.5f : 1.0f) * (0.45f + 0.55f * t) * a));
+    DrawText(dc, next.c_str(), nextFont, D2D1::RectF(x0, top + 20, x1, top + 35), WithAlpha(kTextDim, 1.05f * t * a));
+    dc->PopAxisAlignedClip();
+}
+
+D2D1_RECT_F IslandWindow::LiveClose(const D2D1_RECT_F& pill) const {
+    const float cy = (pill.top + pill.bottom) / 2;
+    return D2D1::RectF(pill.right - 30, cy - 11, pill.right - 8, cy + 11);
+}
+
+void IslandWindow::SetActivities(const std::vector<Activity>& items) {
+    const bool was = Live();
+    activities_ = items;
+    if (!expanded_ && was != Live()) {                                   // grow into the pill, or shrink back to the bar
+        SetOpenSprings(w_, h_);
+        w_.target = CollapsedW();
+        h_.target = CollapsedH();
+        SetHitRegion(false);
+    }
+    KillTimer(hwnd_, kLiveTimer);
+    if (Live()) {
+        const Activity& a = activities_.front();
+        const bool moving = a.kind == Activity::Kind::Progress && a.progress < 0;    // the indeterminate shimmer
+        SetTimer(hwnd_, kLiveTimer, moving ? 50 : 1000, nullptr);
+    }
+    Animate();
+}
+
+void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float a) {
+    if (a < 0.01f || activities_.empty()) return;
+    const Activity& act = activities_.front();
+    const D2D1_COLOR_F accent = D2D1::ColorF(((act.accent >> 16) & 0xFF) / 255.0f, ((act.accent >> 8) & 0xFF) / 255.0f,
+                                             (act.accent & 0xFF) / 255.0f, 1.0f);
+    const float cy = (r.top + r.bottom) / 2;
+    const uint64_t now = GetTickCount64();
+
+    // Icon in a soft accent circle.
+    brush_->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.22f * a));
+    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 19, cy), 10.5f, 10.5f), brush_.Get());
+    DrawText(dc, act.glyph.c_str(), gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(r.left + 8, cy - 9, r.left + 30, cy + 9),
+             WithAlpha(accent, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // Right side: countdown ring, percentage, or a close button.
+    float right = r.right - 12;
+    if (act.kind == Activity::Kind::Timer && act.length) {
+        const float left = act.endsAt > now ? static_cast<float>(act.endsAt - now) : 0.0f;
+        const int secs = static_cast<int>((left + 999) / 1000);
+        wchar_t clock[16];
+        swprintf_s(clock, L"%d:%02d", secs / 60, secs % 60);
+        const D2D1_POINT_2F c = D2D1::Point2F(r.right - 20, cy);
+        DrawRing(dc, c, 8.0f, 2.2f, 1.0f - left / static_cast<float>(act.length), accent, a, 0.18f);
+        DrawText(dc, clock, gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.right - 92, cy - 9, r.right - 34, cy + 9),
+                 WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        right = r.right - 96;
+    } else if (act.dismissible) {
+        const D2D1_RECT_F x = LiveClose(r);
+        DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        right = x.left - 4;
+    } else if (act.progress >= 0) {
+        wchar_t pct[8];
+        swprintf_s(pct, L"%d%%", static_cast<int>(act.progress * 100 + 0.5f));
+        DrawText(dc, pct, gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.right - 60, cy - 9, r.right - 14, cy + 9),
+                 WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        right = r.right - 64;
+    }
+    if (activities_.size() > 1) {                                        // more going on: "+2"
+        const std::wstring more = L"+" + std::to_wstring(activities_.size() - 1);
+        DrawText(dc, more.c_str(), gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(right - 26, cy - 9, right, cy + 9),
+                 WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        right -= 30;
+    }
+
+    // Title and detail on one line.
+    IDWriteTextFormat* strong = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    const float titleW = std::ceil(gfx_.MeasureWidth(act.title.c_str(), strong));
+    const float textLeft = r.left + 36;
+    DrawText(dc, act.title.c_str(), strong, D2D1::RectF(textLeft, cy - 9, std::min(right, textLeft + titleW + 2), cy + 9), WithAlpha(kText, a));
+    if (!act.detail.empty() && textLeft + titleW + 10 < right)
+        DrawText(dc, act.detail.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(textLeft + titleW + 8, cy - 9, right, cy + 9),
+                 WithAlpha(kTextDim, 1.15f * a));
+
+    // A thin progress line along the bottom (a moving shimmer when the size is unknown).
+    if (act.kind == Activity::Kind::Progress) {
+        const float x0 = r.left + 16, x1 = r.right - 16, y = r.bottom - 3.0f;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x0, y - 1, x1, y + 1), 1, 1}, brush_.Get());
+        brush_->SetColor(WithAlpha(accent, 0.95f * a));
+        if (act.progress >= 0) {
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(x0, y - 1, x0 + (x1 - x0) * Clamp01(act.progress), y + 1), 1, 1}, brush_.Get());
+        } else {
+            const float phase = static_cast<float>(now % 1400) / 1400.0f, w = (x1 - x0) * 0.28f;
+            const float s = x0 + (x1 - x0 + w) * phase - w;
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(std::max(x0, s), y - 1, std::min(x1, s + w), y + 1), 1, 1}, brush_.Get());
+        }
+    }
+    if (SoluAwake()) {                                                   // Solu is still there: a tiny green dot
+        brush_->SetColor(D2D1::ColorF(kGreen.r, kGreen.g, kGreen.b, 0.85f * a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 27, cy - 7), 2.2f, 2.2f), brush_.Get());
+    }
+}
 
 void IslandWindow::DrawSoluBar(ID2D1DeviceContext* dc, const D2D1_RECT_F& bar, float alpha) {
     if (!SoluAwake()) return;
@@ -2583,6 +3951,35 @@ void IslandWindow::DrawMascotEffects(ID2D1DeviceContext* dc, float opacity) {
                  D2D1::ColorF(0.82f, 0.78f, 1.0f, 0.95f * pop), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
+    // Moods: sleepy "z"s drifting up, a worried sweat drop, sparkles while it cheers.
+    if (mascot_->talk() == Mascot::Talk::None && mascot_->state() == State::Idle) {
+        if (mascot_->mood() == Mascot::Mood::Sleepy) {
+            const D2D1_POINT_2F from = MascotPoint(0.30f, 0.20f);
+            for (int i = 0; i < 3; ++i) {
+                const float phase = std::fmod(t * 0.28f + i / 3.0f, 1.0f);
+                const float a = std::sin(phase * 3.14159f) * 0.8f * opacity;
+                const float x = from.x + phase * 14.0f, y = from.y - phase * 24.0f;
+                DrawText(dc, L"z", gfx_.Text(9.0f + 5.0f * phase, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(x - 8, y - 9, x + 8, y + 9),
+                         D2D1::ColorF(0.80f, 0.76f, 1.0f, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+        } else if (mascot_->mood() == Mascot::Mood::Worried) {
+            const D2D1_POINT_2F at = MascotPoint(0.26f, 0.22f);
+            const float slide = std::fmod(t * 0.5f, 1.0f) * 6.0f;
+            brush_->SetColor(D2D1::ColorF(0.55f, 0.80f, 1.0f, 0.85f * opacity));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(at.x, at.y + slide), 2.6f, 3.4f), brush_.Get());
+        }
+    }
+    if (mascot_->state() == State::Notify && std::string(mascot_->Face()) == "happy") {
+        const D2D1_POINT_2F at = MascotPoint(0.0f, 0.34f);
+        for (int i = 0; i < 4; ++i) {
+            const float ang = i * 1.57f + st * 2.0f, rad = 16.0f + st * 18.0f;
+            const float a = std::max(0.0f, 1.0f - st / 1.1f) * opacity;
+            DrawText(dc, L"✦", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL),
+                     D2D1::RectF(at.x + std::cos(ang) * rad - 8, at.y + std::sin(ang) * rad * 0.6f - 8, at.x + std::cos(ang) * rad + 8,
+                                 at.y + std::sin(ang) * rad * 0.6f + 8), D2D1::ColorF(1.0f, 0.86f, 0.40f, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+
     // Thinking: three dots pulse above the head, one after another.
     if (mascot_->talk() == Mascot::Talk::Thinking && mascot_->state() != State::Permission) {
         const D2D1_POINT_2F at = MascotPoint(-0.34f, 0.30f);
@@ -2628,12 +4025,32 @@ LRESULT CALLBACK IslandWindow::WndProcThunk(HWND hwnd, UINT msg, WPARAM wp, LPAR
 LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;               // clicking the island never steals focus
+        return promptFocus_ ? MA_ACTIVATE : MA_NOACTIVATE;   // clicking the island never steals focus, except while typing in it
+    case WM_CHAR:
+        OnChar(static_cast<wchar_t>(wp));
+        return 0;
+    case WM_KEYDOWN:
+        OnKey(wp);
+        return 0;
+    case WM_KILLFOCUS:
+        if (promptFocus_) BlurPrompt(false);
+        return 0;
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS;
     case WM_MOUSEMOVE:
         if (seeking_) {                                    // dragging the progress bar: follow the pointer, even outside it
             seekFraction_ = SeekFractionAt(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}).x, IslandRect());
             Animate();
             return 0;
+        }
+        if (shelfPressed_ >= 0 && (wp & MK_LBUTTON)) {                              // pulled an item off the shelf: a real drag begins
+            const int dx = GET_X_LPARAM(lp) - shelfPressPt_.x, dy = GET_Y_LPARAM(lp) - shelfPressPt_.y;
+            if (std::abs(dx) > GetSystemMetrics(SM_CXDRAG) || std::abs(dy) > GetSystemMetrics(SM_CYDRAG)) {
+                const int index = shelfPressed_;
+                shelfPressed_ = -1;
+                StartShelfDrag(index);
+                return 0;
+            }
         }
         OnMouseMove(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
         return 0;
@@ -2660,11 +4077,17 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RBUTTONUP: {                                           // right-click a round button: quick mute / unmute
         const int hit = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+        if (expanded_ && hit >= kHitShelfItem && hit < kHitShelfItem + 100) {          // right-click a shelf item: show it in its folder
+            OpenShelfItem(hit - kHitShelfItem, true);
+            return 0;
+        }
         if (expanded_ && hit >= kHitAudioButton && hit < kHitAudioButton + 3) ToggleMute(hit - kHitAudioButton);
         return 0;
     }
     case WM_LBUTTONDOWN:
         pressed_ = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+        shelfPressed_ = pressed_ >= kHitShelfItem && pressed_ < kHitShelfItem + 100 ? pressed_ - kHitShelfItem : -1;
+        shelfPressPt_ = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (pressed_ == kHitSeek) {
             seeking_ = true;
             seekFraction_ = SeekFractionAt(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}).x, IslandRect());
@@ -2688,6 +4111,7 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         const int hit = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
         const int was = pressed_;
         pressed_ = -1;
+        shelfPressed_ = -1;
         if (GetCapture() == hwnd_) ReleaseCapture();
         if (was >= 0 && hit == was) OnClick(hit);
         return 0;
@@ -2697,9 +4121,21 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         seeking_ = false;                                  // capture lost mid-drag: cancel, don't seek
         return 0;
     case WM_SETCURSOR:
-        SetCursor(LoadCursorW(nullptr, hover_ >= 0 ? IDC_HAND : IDC_ARROW));
+        SetCursor(LoadCursorW(nullptr, hover_ == kHitPrompt ? IDC_IBEAM : hover_ >= 0 ? IDC_HAND : IDC_ARROW));
         return TRUE;
     case WM_TIMER:
+        if (wp == kAgentTimer) {
+            Animate();                                   // the spinner turns, the caret blinks
+            return 0;
+        }
+        if (wp == kLyricsTimer) {
+            UpdateLyricLine();                           // the next line starts now
+            return 0;
+        }
+        if (wp == kLiveTimer) {
+            Animate();                                   // the countdown or the shimmer moves on
+            return 0;
+        }
         if (wp == kTestTimer) {
             KillTimer(hwnd_, kTestTimer);
             Animate();                                   // the test verdict has expired: show the normal status again
@@ -2714,7 +4150,10 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == kCloseTimer || wp == kAutoCloseTimer) {
             KillTimer(hwnd_, wp);
             if (wp == kAutoCloseTimer) autoClosePending_ = false;
-            if (!Pinned() && !CursorInIsland(kLeaveSlack)) Collapse();
+            if (!Pinned()) {
+                if (!CursorInIsland(kLeaveSlack)) Collapse();
+                else if (!tracking_) SetTimer(hwnd_, kCloseTimer, 150, nullptr);   // left slowly: still at the edge, look again
+            }
         } else if (wp == kMascotTimer) {
             KillTimer(hwnd_, kMascotTimer);
             Animate();

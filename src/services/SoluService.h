@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,8 +26,25 @@ struct SoluVoice {
 };
 extern const SoluVoice kSoluVoices[5];
 
+// An event from Solu that the app itself acts on: "activity" / "activity_end" (a live pill), "nudge", "focus",
+// "capture" (the user wants to show Solu part of the screen), "cheer". Fields are the event's JSON members as text.
+struct SoluAppEvent {
+    std::string name;
+    std::map<std::string, std::wstring> fields;
+    std::wstring Get(const std::string& key) const {
+        auto it = fields.find(key);
+        return it == fields.end() ? L"" : it->second;
+    }
+};
+
 struct SoluExchange {
     std::wstring heard, said;
+};
+
+struct SoluTask {                              // a long task Solu is working on (or has finished)
+    std::string id;
+    std::wstring title, status, step, question, result;
+    int done = 0, total = 0;
 };
 
 struct SoluSnapshot {
@@ -41,6 +59,7 @@ struct SoluSnapshot {
     bool screen = true;                          // "Solu, look at this" is allowed (Solu can switch this by voice)
     std::wstring lookTitle;                      // what Solu is looking at for the current question
     std::shared_ptr<const ImageBGRA> lookImage;  // a small picture of it, shown so it is always clear what was seen
+    std::vector<SoluTask> tasks;                 // newest first
     std::vector<PermissionRequest> approvals;     // things Solu wants to do on the PC, waiting for the user
     uint32_t approvalsVersion = 0;               // grows whenever that list changes
     bool sleepRequested = false;                 // "Solu, go to sleep": the app switches Solu off
@@ -70,7 +89,13 @@ public:
     void SetCaptions(bool on);
     void SetScreen(bool on);
     void Answer(uint64_t id, PermissionDecision decision);   // the approval card: Approve / Reject / Always allow (Defer)
-    void Ask(const std::wstring& text);          // answers a typed question (tests / future text box)
+    void Ask(const std::wstring& text);
+    void TaskControl(const std::string& op, const std::string& id);   // pause / resume / cancel / remove
+    void Say(const std::wstring& text);          // Solu says this line (timers, focus sessions)
+    void SetPaused(bool paused);                 // privacy: the microphone closes and Solu goes quiet until resumed
+    void LookAtRegion(RECT screen, const std::wstring& mode);   // quick capture: explain / translate this part of the screen
+    void SendContext(const std::string& json);   // what Eflow knows that Solu may use (notification counts)
+    std::vector<SoluAppEvent> TakeAppEvents();          // answers a typed question (tests / future text box)
     SoluSnapshot Snapshot();
     std::vector<PermissionRequest> Approvals();
 
@@ -92,6 +117,7 @@ private:
     std::thread reader_;
     bool talkWhenReady_ = false;
     std::wstring pendingHeard_;
+    std::vector<SoluAppEvent> appEvents_;
     std::atomic<bool> posted_{false};
 };
 

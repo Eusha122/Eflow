@@ -13,6 +13,7 @@ commands {"cmd": "talk"}        start a hands-free conversation (the microphone 
          {"cmd": "ask", "text": "..."}         answer a typed question (no microphone needed)
          {"cmd": "approval", "id": 3, "answer": "allow" | "always" | "deny"}   the user's answer on the approval card
          (events: {"event": "approve", id, action, detail, risky, always} shows the card, {"event": "resolved", id} removes it)
+         {"cmd": "task", "op": "pause" | "resume" | "cancel" | "remove", "id": "..."}   steer a long task (events: tasks, activity)
          {"cmd": "screen", "on": true}         allow or forbid "look at this" (events: {"event": "looking", title, app, thumb})
          {"cmd": "quit"}
 The microphone is only ever open between "talk" and the end of the conversation.
@@ -30,6 +31,7 @@ sys.stdout = sys.stderr                                      # prints in solu_ch
 os.chdir(os.path.dirname(os.path.abspath(__file__)))         # models/ is relative to this folder
 
 import solu_chat  # noqa: E402
+import gpu  # noqa: E402
 
 emit_lock = threading.Lock()
 
@@ -83,6 +85,7 @@ def main():
         cmd = commands.get()
         name = cmd.get("cmd")
         if name == "quit":
+            gpu.unload(solu_chat.BRAIN)                       # Solu off or Eflow closing: give the graphics card back now
             os._exit(0)
         elif name == "talk":                                  # the hotkey: start a conversation, or end the running one
             if solu.in_conversation:
@@ -107,11 +110,33 @@ def main():
             solu.half_duplex = not bool(cmd.get("on"))
         elif name == "screen":
             solu.screen_enabled = bool(cmd.get("on"))
+        elif name == "task" and solu.tasks:                                   # pause / resume / stop / remove, from the island
+            threading.Thread(target=solu.tasks.control, args=(str(cmd.get("op", "")), cmd.get("id") or None), daemon=True).start()
+        elif name == "say" and cmd.get("text"):                               # the app has something to say (focus timer)
+            def say_when_free(text=cmd["text"]):
+                solu._wait_idle()
+                solu.respond_text(text)
+            threading.Thread(target=say_when_free, daemon=True).start()
+        elif name == "pause":                                                 # privacy key
+            solu.paused = bool(cmd.get("on"))
+            print(f"   [privacy] microphone {'closed' if solu.paused else 'open again'}")
+            if solu.paused:
+                solu.cancel.set()
+                solu.end_conversation()
+        elif name == "region":                                                # quick capture
+            threading.Thread(target=solu.respond_region, args=(int(cmd["x"]), int(cmd["y"]), int(cmd["w"]), int(cmd["h"]),
+                                                              cmd.get("mode", "explain")), daemon=True).start()
+        elif name == "context":
+            solu.context.update(cmd.get("data") or {})                        # notifications and agents arrive separately
         elif name == "approval" and cmd.get("answer") in ("allow", "always", "deny", "all"):
             solu.resolve_approval(int(cmd.get("id", 0)), cmd["answer"])
         elif name == "ask" and cmd.get("text") and not solu.speaking.is_set():
             emit("heard", text=cmd["text"])
             emit("state", state="thinking")
+            skill = solu.special(cmd["text"])
+            if skill:
+                threading.Thread(target=skill, daemon=True).start()
+                continue
             if solu.is_screen_request(cmd["text"]):
                 threading.Thread(target=solu.respond_screen, args=(cmd["text"],), daemon=True).start()
                 continue

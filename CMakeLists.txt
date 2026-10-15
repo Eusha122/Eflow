@@ -26,12 +26,14 @@ option(EFLOW_PACKAGED "Build for distribution" OFF)
 add_executable(eflow WIN32
     src/main.cpp
     src/App.cpp
+    src/AppShoot.cpp
     src/core/Gfx.cpp
     src/core/Image.cpp
     src/core/Json.cpp
     src/core/Log.cpp
     src/core/PackageIdentity.cpp
     src/island/IslandWindow.cpp
+    src/island/CaptureOverlay.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
     src/mascot/MascotRenderer.cpp
@@ -40,10 +42,14 @@ add_executable(eflow WIN32
     src/services/CameraService.cpp
     src/services/DeviceReadiness.cpp
     src/services/HookInstaller.cpp
+    src/services/LyricsService.cpp
     src/services/MediaService.cpp
     src/services/NotificationService.cpp
     src/services/PermissionServer.cpp
     src/services/SoluService.cpp
+    src/services/ActivityMonitor.cpp
+    src/services/AgentMonitor.cpp
+    src/services/ShelfStore.cpp
     src/services/SystemMonitor.cpp
     src/app.manifest
     ${SHADER_OUT}/mascot_vs.h
@@ -64,7 +70,7 @@ target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EH
 set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
     COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs windowsapp shell32 user32
-    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32)
+    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32 winhttp)
 
 # The PermissionRequest hook command run by Claude Code / Codex; lives next to eflow.exe (it verifies
 # that the pipe it talks to is served by that eflow.exe).
@@ -80,4 +86,9 @@ add_custom_command(TARGET eflow POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:eflow>/assets/mascot
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/assets/mascot/eflow.glb $<TARGET_FILE_DIR:eflow>/assets/mascot/eflow.glb
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:eflow>/assets/agents
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets/agents/claude.png $<TARGET_FILE_DIR:eflow>/assets/agents/claude.png
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets/agents/codex.png $<TARGET_FILE_DIR:eflow>/assets/agents/codex.png
     VERBATIM)

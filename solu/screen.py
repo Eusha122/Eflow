@@ -173,18 +173,25 @@ def _norm(word):
     return re.sub(r"[^\w]", "", word.lower())
 
 
+def words_of(look):
+    """The words Windows reads on the picture, with their boxes: one OCR pass per capture (reading and finding share it)."""
+    if getattr(look, "words", None) is None:
+        image, look.scale = look.image, 1.0
+        if image.width > 3840:                                         # the OCR engine has a size limit
+            look.scale = 3840 / image.width
+            image = image.resize((3840, int(image.height * look.scale)))
+        buf = io.BytesIO()
+        image.save(buf, "PNG")
+        try:
+            look.words = asyncio.run(_ocr_words(buf.getvalue()))
+        except Exception:                                              # noqa: BLE001
+            look.words = []
+    return look.words
+
+
 def find_text(look, wanted):
     """Where `wanted` is written on the captured window: (screen x, screen y, what was read there), or None."""
-    image, scale = look.image, 1.0
-    if image.width > 3840:
-        scale = 3840 / image.width
-        image = image.resize((3840, int(image.height * scale)))
-    buf = io.BytesIO()
-    image.save(buf, "PNG")
-    try:
-        lines = asyncio.run(_ocr_words(buf.getvalue()))
-    except Exception:                                                  # noqa: BLE001
-        return None
+    lines, scale = words_of(look), look.scale
     target = [_norm(w) for w in wanted.split() if _norm(w)]
     if not target:
         return None
@@ -208,16 +215,8 @@ def find_text(look, wanted):
 
 
 def read_text(look):
-    """The text on the captured picture, as Windows reads it (a few hundred milliseconds)."""
-    image = look.image
-    if image.width > 3840:                                            # the OCR engine has a size limit
-        image = image.resize((3840, int(image.height * 3840 / image.width)))
-    buf = io.BytesIO()
-    image.save(buf, "PNG")
-    try:
-        look.text = asyncio.run(_ocr(buf.getvalue())).strip()
-    except Exception:                                                  # noqa: BLE001
-        look.text = ""
+    """The text on the captured picture, as Windows reads it (a few hundred milliseconds, once per capture)."""
+    look.text = "\n".join(" ".join(w[0] for w in line) for line in words_of(look)).strip()
     return look.text
 
 

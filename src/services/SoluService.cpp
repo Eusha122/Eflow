@@ -296,6 +296,32 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                             pendingHeard_.clear();
                         }
                     }
+                } else if (ev->text == "activity" || ev->text == "activity_end" || ev->text == "nudge" || ev->text == "focus" ||
+                           ev->text == "capture" || ev->text == "cheer" || ev->text == "agent_prompt") {   // the app acts on these itself
+                    SoluAppEvent e;
+                    e.name = ev->text;
+                    for (const auto& [key, value] : root.members)
+                        e.fields[key] = value.type == json::Value::Type::Bool ? (value.boolean ? L"true" : L"false") : FromUtf8(value.text);
+                    appEvents_.push_back(std::move(e));
+                } else if (ev->text == "tasks") {                         // the task list changed
+                    snapshot_.tasks.clear();
+                    if (const json::Value* list = root.Find("list"); list && list->type == json::Value::Type::Array) {
+                        for (const json::Value& v : list->items) {
+                            if (v.type != json::Value::Type::Object) continue;
+                            auto text = [&](const char* k) { const json::Value* f = const_cast<json::Value&>(v).Find(k); return f ? f->text : std::string(); };
+                            SoluTask t;
+                            t.id = text("id");
+                            t.title = FromUtf8(text("title"));
+                            t.status = FromUtf8(text("status"));
+                            t.step = FromUtf8(text("step"));
+                            t.question = FromUtf8(text("question"));
+                            t.result = FromUtf8(text("result"));
+                            t.done = atoi(text("done").c_str());
+                            t.total = atoi(text("total").c_str());
+                            snapshot_.tasks.push_back(std::move(t));
+                        }
+                    }
+                    ++snapshot_.turn;
                 } else if (ev->text == "approve") {                       // Solu wants to do something on the PC: show the card
                     PermissionRequest r;
                     const json::Value* id = root.Find("id");
@@ -507,6 +533,26 @@ void SoluService::Answer(uint64_t id, PermissionDecision decision) {
     const char* answer = decision == PermissionDecision::Allow ? "allow" : decision == PermissionDecision::Defer ? "always" : "deny";
     Send("{\"cmd\":\"approval\",\"id\":" + std::to_string(id - kSoluApprovalBase) + ",\"answer\":\"" + answer + "\"}");
     Changed(false);
+}
+
+std::vector<SoluAppEvent> SoluService::TakeAppEvents() {
+    std::lock_guard lock(mutex_);
+    return std::exchange(appEvents_, {});
+}
+
+void SoluService::Say(const std::wstring& text) { Send("{\"cmd\":\"say\",\"text\":" + Quote(ToUtf8(text)) + "}"); }
+
+void SoluService::SetPaused(bool paused) { Send(std::string("{\"cmd\":\"pause\",\"on\":") + (paused ? "true" : "false") + "}"); }
+
+void SoluService::LookAtRegion(RECT r, const std::wstring& mode) {
+    Send("{\"cmd\":\"region\",\"x\":" + std::to_string(r.left) + ",\"y\":" + std::to_string(r.top) + ",\"w\":" +
+         std::to_string(r.right - r.left) + ",\"h\":" + std::to_string(r.bottom - r.top) + ",\"mode\":" + Quote(ToUtf8(mode)) + "}");
+}
+
+void SoluService::SendContext(const std::string& json) { Send("{\"cmd\":\"context\",\"data\":" + json + "}"); }
+
+void SoluService::TaskControl(const std::string& op, const std::string& id) {
+    Send("{\"cmd\":\"task\",\"op\":" + Quote(op) + ",\"id\":" + Quote(id) + "}");
 }
 
 void SoluService::Ask(const std::wstring& text) { Send("{\"cmd\":\"ask\",\"text\":" + Quote(ToUtf8(text)) + "}"); }

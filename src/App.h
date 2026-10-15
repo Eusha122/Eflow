@@ -2,15 +2,22 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "core/Gfx.h"
+#include "island/CaptureOverlay.h"
 #include "island/IslandWindow.h"
+#include "services/ActivityMonitor.h"
+#include "services/AgentMonitor.h"
+#include "services/ShelfStore.h"
 #include "mascot/MascotRenderer.h"
 #include "services/AudioDevices.h"
 #include "services/CameraService.h"
 #include "services/HookInstaller.h"
+#include "services/LyricsService.h"
 #include "services/MediaService.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
@@ -42,6 +49,19 @@ private:
     void OnCameraChanged();
     void OnSoluChanged();
     void OnSoluHotkey();
+    // Live activities: downloads/copies (monitor), Solu's research and nudges, the focus timer, "done" flashes.
+    void OnActivityChanged();
+    void OnAgentsChanged();
+    void OnShelfChanged();
+    void PushActivities();
+    void OnSoluAppEvent(const SoluAppEvent& e);
+    void StartFocus(int focusMinutes, int breakMinutes, int rounds);
+    void StopFocus(bool finished);
+    void TickFocus();
+    void UpdateMood();
+    void CheerAll();
+    void TogglePrivacy();
+    void StartCapture(const std::wstring& mode);
     void ToggleAiTool(AiTool tool);
     void RebuildGraphics();
     void UpdateFullscreenState();
@@ -51,6 +71,18 @@ private:
     static bool AutostartEnabled();
     static void SetAutostart(bool enable);
     static void ApplyFirstRunDefaults();
+    void OnLyricsChanged();
+    void SetLyricsOn(bool on);
+    static std::wstring LyricsSettingPath();
+    // Shoot mode (debug builds, AppShoot.cpp): scripted island content for filming the launch video.
+    void OnShootCommand(const std::string& json);
+    void ShootPushAll();
+    void ShootPushPermissions();
+    void ShootShelfAdd(const std::wstring& path);
+    void ShootDismissNotification(uint32_t id);
+    void ShootDecide(uint64_t id);
+    void ShootMute(int side, bool muted);
+    void ShootSelect(bool input, const std::wstring& id);
 
     Gfx gfx_;
     HWND msgWnd_ = nullptr;
@@ -63,6 +95,8 @@ private:
     MascotRenderer mascotRenderer_;
     bool mascotReady_ = false;
     std::unique_ptr<MediaService> media_;
+    std::unique_ptr<LyricsService> lyrics_;
+    bool lyricsOn_ = true;                         // live lyrics (the Music tab's lyrics button); kept in lyrics.json
     std::unique_ptr<PermissionServer> permissions_;
     std::unique_ptr<NotificationService> notifications_;
     std::unique_ptr<SystemMonitor> system_;
@@ -71,7 +105,42 @@ private:
     std::unique_ptr<SoluService> solu_;
     uint32_t soluApprovalsVersion_ = 0;            // last list of Solu's approval requests the islands were given
     bool hotkey_ = false;
+    std::unique_ptr<ActivityMonitor> activityMonitor_;
+    std::unique_ptr<AgentMonitor> agents_;
+    std::unique_ptr<ShelfStore> shelf_;
+    AgentSnapshot agentSnap_;
+    std::map<std::wstring, AgentStatus> agentWas_;     // per session: to notice when one finishes
+    uint64_t hookCheck_ = 0;
+    std::string lastAgentContext_;
+    bool claudeHooked_ = false, codexHooked_ = false;
+    CaptureOverlay capture_;
+    RECT captured_{};
+    std::wstring capturedMode_;
+    std::vector<Activity> soluActivities_;          // research progress and nudges, from Solu
+    std::vector<Activity> doneItems_;               // short "Downloaded ..." flashes
+    std::set<std::wstring> dismissed_;
+    struct Focus {
+        bool on = false, onBreak = false;
+        int round = 1, rounds = 4, focusMin = 25, breakMin = 5;
+        uint64_t endsAt = 0, length = 0;
+    } focus_;
+    bool privacy_ = false;
+    bool showAnswer_ = false;                       // a capture was sent: open the island when Solu starts answering
+    uint64_t cpuIdle_ = 0, cpuTotal_ = 0;
+    int busyChecks_ = 0;
+    int nudgeSeq_ = 0;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
+    bool shoot_ = false;                               // filming: the islands show only the director's content
+    uint32_t shootSeq_ = 0;
+    NotificationSnapshot shootNotifs_;
+    std::vector<PermissionRequest> shootPerms_;
+    AgentSnapshot shootAgents_;
+    SoluSnapshot shootSolu_;
+    std::vector<Activity> shootActs_;
+    ShelfSnapshot shootShelf_;
+    SystemSnapshot shootSystem_;
+    AudioSnapshot shootAudio_;
+    CameraSnapshot shootCamera_;
 };
 
 } // namespace eflow

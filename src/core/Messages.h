@@ -18,6 +18,11 @@ constexpr UINT WM_APP_AUDIO = WM_APP + 11;       // audio devices -> app: the de
 constexpr UINT WM_APP_SOLU = WM_APP + 13;        // Solu helper -> app: its state, a new line or its voice level changed
 constexpr UINT WM_APP_DEBUG_SOLU = WM_APP + 14;  // debug builds only: wParam 1 switch on, 0 off, 2 talk, 3 ask a test question
 constexpr UINT WM_APP_CLICKAWAY = WM_APP + 15;   // island: the mouse was pressed somewhere (global hook, live view only)
+constexpr UINT WM_APP_ACTIVITY = WM_APP + 16;    // activity monitor -> app: downloads / copies changed
+constexpr UINT WM_APP_CAPTURED = WM_APP + 17;    // quick capture finished (the rectangle is kept by the app)
+constexpr UINT WM_APP_AGENTS = WM_APP + 18;      // agent monitor -> app: Claude Code / Codex sessions changed
+constexpr UINT WM_APP_LYRICS = WM_APP + 20;      // lyrics service -> app: lyrics for the playing song arrived (or are missing)
+constexpr UINT WM_APP_SHELF = WM_APP + 19;       // shelf store -> app: the held files or an icon changed
 constexpr UINT WM_APP_CAMERA = WM_APP + 12;      // camera service -> app: cameras, who uses them, or the privacy switch changed
 
 } // namespace eflow

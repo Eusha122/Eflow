@@ -77,6 +77,11 @@ void Mascot::Notify() {
     Enter(State::Notify);                      // restarts the reaction even if already playing
 }
 
+void Mascot::Cheer() {
+    cheering_ = true;
+    Enter(State::Notify);                      // the same hop as a notification, but with a happy face and no badge
+}
+
 void Mascot::SetPermissionPending(bool pending) {
     permission_ = pending;
     if (state_ != State::Notify && state_ != Resting()) Enter(Resting());
@@ -108,11 +113,17 @@ void Mascot::Update(float dt) {
         const float d = asset_->clips[p.clip].duration;
         if (loop && d > 0) p.t = std::fmod(p.t, d);
     };
+    const float pace = mood_ == Mood::Sleepy && state_ != State::Notify && talk_ == Talk::None ? 0.45f : 1.0f;   // slow, sleepy breathing
+    const float realDt = dt;
+    dt *= pace;
     advance(current_, state_ != State::Notify);
     advance(previous_, true);
+    dt = realDt;
 
-    if (state_ == State::Notify && current_.clip >= 0 && current_.t >= asset_->clips[current_.clip].duration)
+    if (state_ == State::Notify && current_.clip >= 0 && current_.t >= asset_->clips[current_.clip].duration) {
+        cheering_ = false;
         Enter(Resting());
+    }
 
     if (talk_ == Talk::Speaking) {                // mouth: open while loud, held a moment so it does not flicker
         if (talkLevel_ > 0.13f) mouthHold_ = 0.09f;
@@ -143,10 +154,13 @@ const char* Mascot::Face() const {
     case State::Music:
         if (talk_ == Talk::Speaking) return mouthOpen_ ? "happy" : "neutral";    // talking: the mouth opens and closes
         return "happy";
-    case State::Notify: return "surprised";
+    case State::Notify: return cheering_ ? "happy" : "surprised";
     case State::Permission: return "wink";
     default:
         if (talk_ == Talk::Listening) return "surprised";                         // wide, attentive eyes
+        if (talk_ == Talk::None && mood_ == Mood::Sleepy)                          // eyes closed, a sleepy peek now and then
+            return std::fmod(time_, 9.0f) > 8.2f ? "neutral" : "blink";
+        if (talk_ == Talk::None && mood_ == Mood::Worried) return "surprised";
         return blinkLeft_ > 0 ? "blink" : "neutral";
     }
 }

@@ -118,6 +118,24 @@ A session that has just appeared can briefly report no playback info; the worker
 The mascot's mood is layered so sources never fight: ambient (idle / music playing) < pending AI
 permission request < one-shot notification reaction.
 
+**Live lyrics** (`services/LyricsService`). Time-synced lyrics come from [LRCLIB](https://lrclib.net) (free,
+open, no key): one request per new song on a worker thread (WinHTTP), first `/api/get` with title,
+artist, album and length (exact match), then `/api/search` picking the result with synced lyrics and
+the closest length (video titles are cleaned first: "(Official Video)", "Artist - Topic", "Artist -
+Title"). Every answer, a miss too, is cached in `%LOCALAPPDATA%\Eflow\lyrics\<hash>.lrc` (misses are
+asked again after 7 days; offline is not remembered as a miss), so a replayed song costs nothing.
+The island picks the line from the position `MediaService` already extrapolates (0.15 s early) and
+sets ONE timer for the moment the next line starts; a change plays a 0.35 s rise-and-fade and then
+no frames are drawn until the next line. Closed island: a slim pill (28 px) as wide as the line, with
+a green note; live pills (downloads, tasks, agents) and a Solu conversation take priority. Music tab:
+the line being sung and the next one between the artist and the progress bar (the tab grows 36 px
+only while a song has lyrics); a long line steps down a size before it is cut. The lyrics button at
+the right of the transport row switches all of it (`lyrics.json`); it is green when lyrics show and
+quiet when the song has none. Clicking the lyric pill opens the Music tab.
+While a pill covers the idle bar, Solu's microphone-level updates no longer request frames (the meter
+is not visible): music with vocals made Solu's speech detector fire ~14 times a second, which had kept
+the closed island drawing ~17 frames/s.
+
 ## 6. AI permission centre
 
 * `eflow-hook.exe` is the `PermissionRequest` command hook for Claude Code and Codex (both use the same
@@ -295,6 +313,99 @@ voice) that Eflow runs as a **hidden helper process**. Nothing is loaded until t
   "how's the research going?", "open my last report". A deep job takes about 2 minutes on the RTX 5050.
 * **Exact answers.** Arithmetic in a request ("12 times 8", "15% of 240", "square root of 144") is computed
   (`actions.spoken_math`, a safe AST evaluator) and handed to the model, like the time and disk values.
+* **Live activities on the thin bar** (`core/Activity.h`, `services/ActivityMonitor`, `App::PushActivities`,
+  `IslandWindow::DrawLive`). When something is going on, the idle bar grows into a 352 x 32 pill (icon, title, detail,
+  percentage / countdown ring / close button, a thin progress line, "+N" when more is waiting). Sources: browser downloads
+  (`.crdownload` / `.part` growing in Downloads), Explorer copy dialogs (`OperationStatusWindow`, "34% complete"), Solu's research
+  and note taking (`activity` / `activity_end` events), the focus timer, Solu's nudges, and 5-second "done" flashes (which make the
+  cat cheer). Order: done, nudges, focus, Solu's jobs, downloads/copies. Hovering a pill opens the island after 0.8 s, so a click
+  (open) or the close button can come first. Repaints only once a second (50 ms while an indeterminate shimmer runs).
+* **Focus timer.** `focus` events from Solu ("start a 25 minute focus session") run a Pomodoro in `App` (focus / break rounds);
+  the pill shows the countdown ring, Solu says when a round or break ends, the cat naps during breaks.
+* **The cat's day** (`Mascot::Mood`, `Mascot::Cheer`). Sleepy (eyes closed, slow breathing, "z"s) from 23:00 to 05:00 and during
+  focus breaks; worried (wide eyes, a sweat drop) after a minute of >90% CPU or >94% memory; a happy hop with sparkles when a
+  download, copy, research, notes or a focus round finishes. Checked every 30 s with `GetSystemTimes` (no extra sampling).
+* **Privacy key** Ctrl+Alt+H: every island is hidden and Solu's microphone closes (`pause`); press again to bring both back.
+* **Quick capture** Ctrl+Alt+Q (or "Solu, let me show you" / "translate this part"): `CaptureOverlay` dims all screens, the
+  dragged area stays clear (colour-keyed hole, white outline), and Solu gets `region` to explain or translate just that area.
+* **Solu's skills** (`solu/skills.py`): clipboard history (in memory only; passwords and keys hidden), routines ("when I say
+  study mode, ..."; `solu_routines.json`; their safe steps run without cards), tidy a folder (plan on a card, never overwrites),
+  study buddy (quiz from the screen, a PDF or a topic; spoken answers graded; weak points remembered), lecture / meeting notes
+  (the PC's sound through WASAPI loopback, Whisper every 30 s, notes page in Documents\Solu Notes), morning briefing (weather
+  from wttr.in, notification senders shared by Eflow, plans from memory, a headline), rare nudges (low battery, a plan for
+  tomorrow, two hours without a break; at most one per 30 min, six a day; shown as pills, never spoken), smart messaging
+  (WhatsApp: search, open, check the chat header, card, send; email: memory or Gmail's contact suggestion, card, send),
+  translate and explain-the-error answers for the screen.
+* **Agents tab** (`services/AgentMonitor`, `IslandWindow::DrawAgents`). Replaces "AI Requests". Two logo buttons (Claude Code,
+  Codex) with a status dot; it opens on whichever agent is working (else the most recent) until you pick one. Monitoring is
+  read-only and needs no hooks: `ReadDirectoryChangesW`-style notifications (`FindFirstChangeNotification`, recursive) on
+  `~/.claude/projects` and `~/.codex/sessions` wake a worker that reads only the appended bytes of each session file from the
+  last 6 hours and parses Claude's `user` / `assistant` / `tool_use` / `tool_result` lines and Codex's `event_msg` /
+  `response_item` lines into a per-session feed (what you asked, what it said, each tool with its subject, "Finished"),
+  a status (working / idle; "waiting for you" when an approval card from that tool is pending) and a title. Giant lines
+  (tool output > 300 KB) are not parsed. Per session: project, title, feed with the mouse wheel / Up / Down. While an agent is
+  working it also shows as a live pill on the thin bar; when it finishes there is a pill and the cat cheers.
+  **Prompting** works like typing to the agent in your editor: the box (Ctrl+Alt+A opens it focused; a "+" button starts a
+  new chat) runs `claude -p <text> --resume <id> --output-format json` / `codex exec resume <id> <text>` in the session's folder,
+  hidden, stdin = NUL. For Claude the island's `PermissionRequest` hook is attached for that run only (`--settings`, a file in
+  `%LOCALAPPDATA%\Eflow`) unless it is already connected globally, so approvals arrive as cards. The reply shows up in the same
+  feed because it lands in the session's log. The island takes keyboard focus only while you type (`WS_EX_NOACTIVATE` is lifted,
+  `WM_CHAR` / `WM_KEYDOWN` edit the text; Esc or clicking elsewhere gives focus back). No IME: type with your keyboard layout
+  (Unicode characters work), paste with Ctrl+V. Limit: your already-open editor panel does not show the prompt live; the work
+  and the answer do appear here and in the session file, and the editor shows them after a reload.
+  **Go to the window:** clicking the session header (project name with a small "open" glyph) calls `AgentMonitor::FocusHost`: it finds
+  the VS Code / Cursor window whose title has the project's name (or a terminal titled claude / codex; otherwise it runs
+  `code <folder>`) and brings it to the front. Ctrl+click also opens that Claude conversation in the Claude panel through the
+  extension's `vscode://anthropic.claude-code/open?session=<id>` link (reloads it, so prompts sent from the island show up;
+  VS Code asks once to allow the link). A pill about an agent opens the island straight on this tab.
+  Solu: `agent_status` ("what is Claude doing?") and `tell_agent` ("tell Codex to ...", approved on a card) use the same data.
+* **The file shelf** (`services/ShelfStore`, `IslandWindow::DrawShelf`, tab 6 "Shelf"). The island is an OLE drop target
+  (`RegisterDragDrop`, `OleInitialize` in `App`): dragging files over it, even when it is the thin bar, opens it on the Shelf
+  tab with a big breathing "+" drop zone; releasing holds the files **by reference** (nothing is copied or moved), saved in
+  `%LOCALAPPDATA%\Eflow\shelf.json`, missing files are dropped on load. Each item gets a real thumbnail or its icon from
+  `IShellItemImageFactory` on a worker thread. Cards pop in, lift on hover, have an x (take off the shelf; the file is untouched),
+  click selects (Ctrl for several), double-click opens, right-click shows it in Explorer, the "+" card (or the empty zone)
+  opens a file picker, the wheel slides along the shelf, "Clear" empties it. **Dragging out:** pressing a card and pulling
+  starts a genuine shell drag (`SHDoDragDrop` with an `IShellItemArray` data object: file list, IDList, names, contents), for
+  all selected cards (or just that one). Only copy / link are offered, so the originals never move. The island stays open
+  during the drag, ignores its own drag coming back, and lets go afterwards.
+* **Long tasks** (`solu/tasks.py`, `solu/uia.py`; `%LOCALAPPDATA%\Eflow\solu_tasks.json`). "Start a task: ...", "I want you to work on
+  ...", "your goal is ...", "every morning at 8 ...", or the chat brain's `start_task` tool for a goal with many steps. One worker
+  thread runs one task at a time:
+  1. **Plan**: one JSON model call writes 3-9 concrete steps (each with a "done when"), coarse (coding = one step delegated to Claude
+     Code / Codex and waited for with `agent_wait`). The plan is shown as **one approval card**; once approved, non-risky actions of
+     the task run without cards. Sending email/messages, prompts to agents, tidying folders, risky commands and overwriting files
+     always ask separately.
+  2. **Each step**, a loop of: look (UI Automation controls + one OCR pass, cached 4 s and shared with click-finding), one model call
+     with a small fixed-shape prompt (goal, plan with the current step, notes, last 6 actions, the screen, a hint) and the tools
+     the step needs, ONE tool call, execute, wait 0.45 s, look again and tell the model **what changed** (or that nothing did).
+     `step_done(proof)` is checked once by a lenient verifier (false only when the screen contradicts the claim). A step that fails
+     is retried differently, the remaining plan is revised once or twice, and then Solu asks the user (skip / try again / stop).
+  3. **Safety**: actions only go to the window the task chose (the first one must be named in the goal; a changed foreground window
+     refuses clicks/typing until the model brings the right one back); stuck detection by "same action and same screen"; a budget of
+     90 actions / 120 minutes after which it asks to carry on.
+  4. **Questions park the task**: when a task asks the user something (its own question, "I'm stuck", "carry on?") it is saved as
+     *waiting* and the worker moves on to other tasks; the answer resumes it where it stopped. Results of non-screen tools
+     (research, files, command output, an agent's reply) are shown to the model in full on its next turn.
+  5. **Bursts**: a turn may carry up to 4 actions the model is sure of (click a field, type, Enter). They run back to back
+     (0.12 s apart), each still through the window guard and approvals; the burst stops at the first failure and the model is
+     told which actions did not run; the screen is read once at the end. The hand is fast: a pointer move is ~25 ms through
+     8 points (apps still get hover / drag-over), a click ~60 ms, a drag ~0.35 s, typing is one SendInput batch.
+  6. **Windows a task may touch**: closing, minimizing, moving or resizing only works on windows the task opened itself or the
+     user's goal names; closing always asks. (A test task once closed the user's YouTube window because its title was on screen.)
+  **Graphics memory** (`solu/gpu.py`): every model request goes through it. The brain is let go after 3 minutes unused (and when
+  Solu quits); when it loads, 1.5 GB of the card stays free for the user's apps (Chrome, VS Code, WhatsApp crash when the card is
+  full) and only the layers that fit go to the GPU, the rest to the CPU. The chosen layer count is shared between processes in
+  `%LOCALAPPDATA%\Eflow\gpu_layers.json` (a different count makes Ollama reload the whole model). Speed: 53 tokens/s whole on
+  the card, ~11-19 tokens/s when only 22-30 of 37 layers fit.
+  The model never competes with the conversation: every model call waits while Solu or the user speaks (`chat_busy`) and is
+  dropped when the user starts talking. Prompts stay about 1.5k tokens, with the same `num_ctx` (no reload). Speed on the RTX 5050:
+  about 3 s of model time + 1.5 s of looking per action. Tasks are saved, a task running when Solu closes comes back *paused*.
+  Voice: "pause / continue / stop the task", "how's the task going", "what tasks do you have", "clear finished tasks", answering a
+  question the task asked, "every <day> at <time> <goal>" (schedules, checked every 20 s), "what's scheduled". The island shows a live
+  pill ("Task", "Needs you"), and the Solu AI tab lists tasks with a progress line and pause / resume / stop buttons.
+  New tools for chat and tasks: `look`, `click_element` (UI Automation first, OCR text second; `times` for repeats), `drag`,
+  `wait`, `wait_for_text`, `agent_wait`, `start_task`.
 * **Not in this version.** A native C++ engine instead of Python.
 
 ## 9. Mascot pipeline

@@ -1,7 +1,12 @@
 #include "App.h"
 
+#include <shlobj.h>
+
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "core/Log.h"
@@ -24,6 +29,11 @@ constexpr UINT kMenuConnectClaude = 3;
 constexpr UINT kMenuConnectCodex = 4;
 constexpr UINT kMenuMascotFirst = 10;           // Mascot test submenu: Idle, Music, Notification, AI request
 constexpr int kSoluHotkeyId = 1;                  // Ctrl+Alt+Space: start / end a conversation with Solu
+constexpr int kPrivacyHotkeyId = 2;               // Ctrl+Alt+H: hide everything, Solu stops listening (again: back)
+constexpr int kAgentsHotkeyId = 4;                // Ctrl+Alt+A: write to Claude Code / Codex from the island
+constexpr int kCaptureHotkeyId = 3;               // Ctrl+Alt+Q: drag over part of the screen and Solu explains it
+constexpr UINT_PTR kActivityTimer = 2;            // 1 s while the focus timer or a short-lived pill is up
+constexpr UINT_PTR kMoodTimer = 3;                // every 30 s: is it late, is the PC struggling?
 constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
 std::wstring ExePath() {
@@ -44,6 +54,7 @@ bool IsShellWindow(HWND hwnd) {
 // True when `hwnd` covers the whole of `monitor` (games, video players, F11 browsers, presentations).
 bool CoversMonitor(HWND hwnd, HMONITOR monitor) {
     if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsShellWindow(hwnd)) return false;
+    if (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) return false;   // click-through overlays (Epic Pen, game overlays) are not apps
     if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) != monitor) return false;
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
@@ -62,6 +73,7 @@ int App::Run() {
 
     g_app = this;
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
+    OleInitialize(nullptr);                  // drag and drop (files onto the island, files out of the shelf)
     if (!gfx_.Init() || !CreateMessageWindow()) return 1;
 
 #ifdef EFLOW_PACKAGED
@@ -79,9 +91,25 @@ int App::Run() {
     solu_->Start();                         // starts Solu again if it was switched on last time
     hotkey_ = RegisterHotKey(msgWnd_, kSoluHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE) != FALSE;
     if (!hotkey_) Log("Ctrl+Alt+Space is taken by another program; Solu can still be started from the island");
+    if (!RegisterHotKey(msgWnd_, kPrivacyHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H')) Log("Ctrl+Alt+H is taken by another program");
+    if (!RegisterHotKey(msgWnd_, kCaptureHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q')) Log("Ctrl+Alt+Q is taken by another program");
+    if (!RegisterHotKey(msgWnd_, kAgentsHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A')) Log("Ctrl+Alt+A is taken by another program");
+    shelf_ = std::make_unique<ShelfStore>(msgWnd_, WM_APP_SHELF);
+    shelf_->Load();
+    agents_ = std::make_unique<AgentMonitor>(msgWnd_, WM_APP_AGENTS);
+    agents_->Start();
+    activityMonitor_ = std::make_unique<ActivityMonitor>(msgWnd_, WM_APP_ACTIVITY);
+    activityMonitor_->Start();
+    SetTimer(msgWnd_, kMoodTimer, 30000, nullptr);
     BuildIslands();
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
+    lyrics_ = std::make_unique<LyricsService>(msgWnd_);
+    {                                                    // live lyrics are on unless the user switched them off
+        std::ifstream in(LyricsSettingPath());
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        lyricsOn_ = text.find("false") == std::string::npos;
+    }
     permissions_ = std::make_unique<PermissionServer>(msgWnd_);
     permissions_->Start();
     notifications_ = std::make_unique<NotificationService>(msgWnd_);
@@ -108,6 +136,12 @@ int App::Run() {
 
     system_.reset();
     if (hotkey_) UnregisterHotKey(msgWnd_, kSoluHotkeyId);
+    UnregisterHotKey(msgWnd_, kPrivacyHotkeyId);
+    UnregisterHotKey(msgWnd_, kCaptureHotkeyId);
+    UnregisterHotKey(msgWnd_, kAgentsHotkeyId);
+    activityMonitor_.reset();
+    agents_.reset();
+    shelf_.reset();
     solu_.reset();                           // stops the Solu helper
     audio_.reset();
     camera_.reset();
@@ -122,6 +156,7 @@ int App::Run() {
     }
     islands_.clear();
     Shell_NotifyIconW(NIM_DELETE, &tray_);
+    OleUninitialize();
     CoUninitialize();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
@@ -158,6 +193,30 @@ void App::SetMascotState(Mascot::State state) {
     for (auto& island : islands_) island->SetMascotState(state);
 }
 
+std::wstring App::LyricsSettingPath() {
+    PWSTR base = nullptr;
+    std::wstring path;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) path = std::wstring(base) + L"\\Eflow\\lyrics.json";
+    CoTaskMemFree(base);
+    return path;
+}
+
+void App::OnLyricsChanged() {
+    if (!lyrics_) return;
+    const Lyrics lyrics = lyrics_->Snapshot();
+    for (auto& island : islands_) island->SetLyrics(lyrics);
+}
+
+void App::SetLyricsOn(bool on) {
+    lyricsOn_ = on;
+    {
+        std::ofstream out(LyricsSettingPath(), std::ios::trunc);
+        out << (on ? "{\"on\": true}\n" : "{\"on\": false}\n");
+    }
+    for (auto& island : islands_) island->SetLyricsOn(on);
+    if (on) OnMediaChanged();                            // look the playing song up now
+}
+
 void App::OnMediaChanged() {
     if (!media_) return;
     const MediaInfo info = media_->Snapshot();
@@ -167,6 +226,7 @@ void App::OnMediaChanged() {
         info.PositionNow(), info.duration, info.artwork ? info.artwork->width : 0, info.artwork ? info.artwork->height : 0,
         info.canPrevious, info.canToggle, info.canNext, info.canSeek, info.canShuffle, info.shuffleOn, info.canRepeat, info.repeat);
 #endif
+    if (lyrics_ && lyricsOn_ && info.hasSession) lyrics_->Request(info.title, info.artist, info.album, info.duration, info.sourceApp);
     for (auto& island : islands_) {
         island->SetMedia(info);
         island->SetMusicPlaying(info.playing);
@@ -174,6 +234,7 @@ void App::OnMediaChanged() {
 }
 
 void App::OnPermissionsChanged() {
+    if (shoot_) return;                                              // filming: the director decides
     std::vector<PermissionRequest> pending;
     if (permissions_) pending = permissions_->Pending();
     if (solu_)                                                       // Solu's requests share the same card
@@ -182,15 +243,20 @@ void App::OnPermissionsChanged() {
 }
 
 void App::OnSystemChanged() {
-    if (!system_) return;
+    if (!system_ || shoot_) return;
     const SystemSnapshot snapshot = system_->Snapshot();
     for (auto& island : islands_) island->SetSystem(snapshot);
 }
 
 void App::OnSoluChanged() {
-    if (!solu_) return;
+    if (!solu_ || shoot_) return;
     const SoluSnapshot snapshot = solu_->Snapshot();
     for (auto& island : islands_) island->SetSolu(snapshot);
+    if (showAnswer_ && (snapshot.state == SoluState::Thinking || snapshot.state == SoluState::Speaking)) {
+        showAnswer_ = false;                                         // the answer to a quick capture: show it
+        for (auto& island : islands_) island->ShowForSolu();
+    }
+    for (const SoluAppEvent& e : solu_->TakeAppEvents()) OnSoluAppEvent(e);
     if (snapshot.approvalsVersion != soluApprovalsVersion_) {
         soluApprovalsVersion_ = snapshot.approvalsVersion;
         OnPermissionsChanged();
@@ -199,7 +265,7 @@ void App::OnSoluChanged() {
 }
 
 void App::OnSoluHotkey() {
-    if (!solu_) return;
+    if (!solu_ || shoot_) return;
     // Open the island where the pointer is, so the user sees the conversation start.
     POINT pt;
     GetCursorPos(&pt);
@@ -209,20 +275,320 @@ void App::OnSoluHotkey() {
     solu_->Talk();
 }
 
+// ---- live activities -------------------------------------------------------------------------
+
+// ---- agents (Claude Code and Codex) ------------------------------------------------------------
+
+void App::OnShelfChanged() {
+    if (!shelf_ || shoot_) return;
+    const ShelfSnapshot snap = shelf_->Snapshot();
+    for (auto& island : islands_) island->SetShelf(snap);
+}
+
+void App::OnAgentsChanged() {
+    if (!agents_ || shoot_) return;
+    AgentSnapshot snap = agents_->Snapshot();
+    const uint64_t now = GetTickCount64();
+    if (now - hookCheck_ > 5000) {                                                  // are the approval cards connected (a file read: not on every change)
+        hookCheck_ = now;
+        claudeHooked_ = HookInstaller::IsConnected(AiTool::ClaudeCode);
+        codexHooked_ = HookInstaller::IsConnected(AiTool::Codex);
+    }
+    snap.claudeHooked = claudeHooked_;
+    snap.codexHooked = codexHooked_;
+    // A session that waits for an approval is "waiting for you".
+    if (permissions_)
+        for (const PermissionRequest& r : permissions_->Pending())
+            for (AgentSession& s : snap.sessions)
+                if ((r.source == L"Claude Code") == (s.tool == AgentTool::Claude) && (r.cwd.empty() || r.cwd == s.cwd || r.project == s.project))
+                    if (s.status == AgentStatus::Working) s.status = AgentStatus::Waiting, s.doing = L"Waiting for you";
+    // A session that just finished: the cat cheers and a pill says so (unless the Agents tab is what you are looking at).
+    for (const AgentSession& s : snap.sessions) {
+        const auto it = agentWas_.find(s.tool == AgentTool::Claude ? L"c:" + s.id : L"x:" + s.id);
+        const bool was = it != agentWas_.end() && it->second == AgentStatus::Working;
+        agentWas_[s.tool == AgentTool::Claude ? L"c:" + s.id : L"x:" + s.id] = s.status;
+        if (was && s.status == AgentStatus::Idle) {
+            Activity a;
+            a.id = L"agentdone:" + s.id + std::to_wstring(now);
+            a.kind = Activity::Kind::Done;
+            a.glyph = L"";
+            a.title = s.tool == AgentTool::Claude ? L"Claude finished" : L"Codex finished";
+            a.detail = s.project;
+            a.accent = s.tool == AgentTool::Claude ? 0xD97757 : 0x30D158;
+            a.dismissible = true;
+            a.expiresAt = now + 8000;
+            doneItems_.push_back(std::move(a));
+            CheerAll();
+        }
+    }
+    agentSnap_ = snap;
+    for (auto& island : islands_) island->SetAgents(snap);
+    if (solu_) {                                                                     // Solu can say what they are doing
+        auto esc = [](const std::wstring& w) {
+            std::string out;
+            for (wchar_t c : w) {
+                if (c == L'"' || c == L'\\') out += '\\', out += static_cast<char>(c);
+                else if (c < 0x20) out += ' ';
+                else if (c < 0x80) out += static_cast<char>(c);
+                else {
+                    char buf[8];
+                    const int n8 = WideCharToMultiByte(CP_UTF8, 0, &c, 1, buf, 8, nullptr, nullptr);
+                    out.append(buf, n8 > 0 ? n8 : 0);
+                }
+            }
+            return out;
+        };
+        std::string json = "{\"agents\":[";
+        int count = 0;
+        for (const AgentSession& s : snap.sessions) {
+            if (count >= 6) break;
+            const char* state = s.status == AgentStatus::Working ? "working" : s.status == AgentStatus::Waiting ? "waiting for the user" : "idle";
+            json += std::string(count++ ? "," : "") + "{\"agent\":\"" + (s.tool == AgentTool::Claude ? "Claude Code" : "Codex") + "\",\"project\":\"" +
+                    esc(s.project) + "\",\"title\":\"" + esc(s.title) + "\",\"state\":\"" + state + "\",\"doing\":\"" + esc(s.doing) +
+                    "\",\"last_reply\":\"" + esc(s.lastReply.substr(0, 300)) + "\"}";
+        }
+        json += "]}";
+        if (json != lastAgentContext_) {
+            lastAgentContext_ = json;
+            solu_->SendContext(json);
+        }
+    }
+    PushActivities();
+}
+
+void App::OnActivityChanged() {
+    if (!activityMonitor_) return;
+    const uint64_t now = GetTickCount64();
+    for (const std::wstring& name : activityMonitor_->TakeFinished()) {          // a download or copy just finished
+        Activity a;
+        a.id = L"done:" + name + std::to_wstring(now);
+        a.kind = Activity::Kind::Done;
+        a.glyph = L"";                                                        // check mark
+        a.title = name == L"Copy" ? L"Copied" : L"Downloaded";
+        a.detail = name == L"Copy" ? L"All files are in place" : name;
+        a.accent = 0x30D158;
+        a.dismissible = true;
+        a.expiresAt = now + 5000;
+        doneItems_.push_back(std::move(a));
+        CheerAll();
+    }
+    PushActivities();
+}
+
+void App::PushActivities() {
+    if (shoot_) return;
+    const uint64_t now = GetTickCount64();
+    auto alive = [&](const Activity& a) { return (!a.expiresAt || a.expiresAt > now) && !dismissed_.count(a.id); };
+    std::erase_if(doneItems_, [&](const Activity& a) { return !alive(a); });
+    std::erase_if(soluActivities_, [&](const Activity& a) { return !alive(a); });
+    std::vector<Activity> all;
+    for (const Activity& a : doneItems_) all.push_back(a);                         // most important first
+    for (const Activity& a : soluActivities_) if (a.kind == Activity::Kind::Nudge) all.push_back(a);
+    if (focus_.on) {
+        Activity f;
+        f.id = L"focus";
+        f.kind = Activity::Kind::Timer;
+        f.glyph = focus_.onBreak ? L"" : L"";                         // a cup of tea / a stopwatch
+        f.title = focus_.onBreak ? L"Break" : L"Focus";
+        f.detail = L"Round " + std::to_wstring(focus_.round) + L" of " + std::to_wstring(focus_.rounds);
+        f.accent = focus_.onBreak ? 0x64D2FF : 0xBF5AF2;
+        f.endsAt = focus_.endsAt;
+        f.length = focus_.length;
+        all.push_back(std::move(f));
+    }
+    for (const Activity& a : soluActivities_) if (a.kind != Activity::Kind::Nudge) all.push_back(a);
+    for (const AgentSession& s : agentSnap_.sessions) {                                // an agent is working: its pill, with what it is doing
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        const ULONGLONG unixNow = (((static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000;
+        if (s.status != AgentStatus::Working || unixNow - std::min(unixNow, s.lastActivity) > 5 * 60 * 1000) continue;
+        Activity a;
+        a.id = L"agent:" + s.id;
+        a.kind = Activity::Kind::Progress;
+        a.glyph = s.tool == AgentTool::Claude ? L"" : L"";
+        a.title = s.tool == AgentTool::Claude ? L"Claude Code" : L"Codex";
+        a.detail = s.doing;
+        a.accent = s.tool == AgentTool::Claude ? 0xD97757 : 0x64D2FF;
+        all.push_back(std::move(a));
+    }
+    if (activityMonitor_)
+        for (const Activity& a : activityMonitor_->Snapshot()) all.push_back(a);
+    for (auto& island : islands_) island->SetActivities(all);
+    const bool ticking = focus_.on || !doneItems_.empty() || std::any_of(soluActivities_.begin(), soluActivities_.end(),
+                                                                         [](const Activity& a) { return a.expiresAt != 0; });
+    if (ticking) SetTimer(msgWnd_, kActivityTimer, 1000, nullptr);
+    else KillTimer(msgWnd_, kActivityTimer);
+}
+
+void App::OnSoluAppEvent(const SoluAppEvent& e) {
+    const uint64_t now = GetTickCount64();
+    if (e.name == "activity") {                                                     // research and other long jobs
+        Activity a;
+        a.id = e.Get("id");
+        a.title = e.Get("title");
+        a.detail = e.Get("detail");
+        const std::wstring p = e.Get("progress");
+        a.progress = p.empty() ? -1.0f : static_cast<float>(_wtof(p.c_str()));
+        a.glyph = e.Get("id") == L"research" ? L"" : L"";              // magnifier / lightning
+        a.accent = 0xBF5AF2;
+        std::erase_if(soluActivities_, [&](const Activity& x) { return x.id == a.id; });
+        soluActivities_.push_back(std::move(a));
+    } else if (e.name == "activity_end") {
+        const std::wstring id = e.Get("id");
+        std::erase_if(soluActivities_, [&](const Activity& x) { return x.id == id; });
+        if (e.Get("done") == L"true") {
+            Activity d;
+            d.id = L"done:" + id + std::to_wstring(now);
+            d.kind = Activity::Kind::Done;
+            d.glyph = L"";
+            d.title = e.Get("title").empty() ? L"Done" : e.Get("title");
+            d.detail = e.Get("detail");
+            d.accent = 0x30D158;
+            d.dismissible = true;
+            d.expiresAt = now + 6000;
+            doneItems_.push_back(std::move(d));
+            CheerAll();
+        }
+    } else if (e.name == "nudge") {                                                 // rare and quiet: a pill, never a voice
+        Activity n;
+        n.id = L"nudge:" + std::to_wstring(++nudgeSeq_);
+        n.kind = Activity::Kind::Nudge;
+        n.glyph = L"";                                                        // light bulb
+        n.title = e.Get("title").empty() ? L"Solu" : e.Get("title");
+        n.detail = e.Get("text");
+        n.accent = 0xFFB340;
+        n.dismissible = true;
+        n.expiresAt = now + 60000;
+        soluActivities_.push_back(std::move(n));
+    } else if (e.name == "focus") {
+        const int minutes = _wtoi(e.Get("minutes").c_str());
+        if (minutes <= 0) StopFocus(false);
+        else StartFocus(minutes, std::max(1, _wtoi(e.Get("break").c_str())), std::max(1, _wtoi(e.Get("rounds").c_str())));
+    } else if (e.name == "capture") {
+        StartCapture(e.Get("mode").empty() ? L"explain" : e.Get("mode"));
+    } else if (e.name == "cheer") {
+        CheerAll();
+    } else if (e.name == "agent_prompt" && agents_) {                              // "Solu, tell Claude to ..."
+        const AgentTool tool = e.Get("tool") == L"codex" ? AgentTool::Codex : AgentTool::Claude;
+        const std::wstring project = e.Get("project");
+        const AgentSession* pick = nullptr;
+        for (const AgentSession& s : agentSnap_.sessions) {                          // the project they named, else the agent's latest
+            if (s.tool != tool) continue;
+            if (!project.empty() && _wcsicmp(s.project.c_str(), project.c_str()) == 0) { pick = &s; break; }
+            if (!pick) pick = &s;
+        }
+        std::wstring error;
+        if (!agents_->Send(tool, pick ? pick->id : L"", pick ? pick->cwd : L"", e.Get("text"), false, error))
+            Log("agent: Solu could not send the prompt: %ls", error.c_str());
+    }
+    PushActivities();
+}
+
+void App::StartFocus(int focusMinutes, int breakMinutes, int rounds) {
+    focus_ = {};
+    focus_.on = true;
+    focus_.focusMin = focusMinutes;
+    focus_.breakMin = breakMinutes;
+    focus_.rounds = rounds;
+    focus_.length = static_cast<uint64_t>(focusMinutes) * 60000;
+    focus_.endsAt = GetTickCount64() + focus_.length;
+    Log("focus: %d min focus, %d min break, %d rounds", focusMinutes, breakMinutes, rounds);
+    UpdateMood();
+    PushActivities();
+}
+
+void App::StopFocus(bool finished) {
+    if (!focus_.on) return;
+    focus_.on = false;
+    if (finished && solu_) solu_->Say(L"That's all your focus rounds. Great work today!");
+    UpdateMood();
+    PushActivities();
+}
+
+void App::TickFocus() {
+    if (!focus_.on || GetTickCount64() < focus_.endsAt) return;
+    if (!focus_.onBreak) {                                                          // a focus round is over: a break
+        CheerAll();
+        if (focus_.round >= focus_.rounds) {
+            StopFocus(true);
+            return;
+        }
+        focus_.onBreak = true;
+        focus_.length = static_cast<uint64_t>(focus_.breakMin) * 60000;
+        if (solu_) solu_->Say(L"Nice focus! Take a " + std::to_wstring(focus_.breakMin) + L" minute break.");
+    } else {                                                                        // the break is over
+        focus_.onBreak = false;
+        ++focus_.round;
+        focus_.length = static_cast<uint64_t>(focus_.focusMin) * 60000;
+        if (solu_) solu_->Say(L"Break's over. Back to focus!");
+    }
+    focus_.endsAt = GetTickCount64() + focus_.length;
+    UpdateMood();
+}
+
+void App::CheerAll() {
+    for (auto& island : islands_) island->Cheer();
+}
+
+void App::UpdateMood() {
+    if (shoot_) return;                                                             // filming: the director sets the mood
+    // Sleepy late at night and during focus breaks; worried when the PC has been flat out for a minute.
+    const std::time_t t = std::time(nullptr);
+    std::tm local{};
+    localtime_s(&local, &t);
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        auto u64 = [](FILETIME f) { return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+        const uint64_t i = u64(idle), total = u64(kernel) + u64(user);
+        if (cpuTotal_ && total > cpuTotal_) {
+            const double busy = 1.0 - static_cast<double>(i - cpuIdle_) / static_cast<double>(total - cpuTotal_);
+            busyChecks_ = busy > 0.90 ? busyChecks_ + 1 : 0;
+        }
+        cpuIdle_ = i;
+        cpuTotal_ = total;
+    }
+    MEMORYSTATUSEX mem{sizeof(mem)};
+    GlobalMemoryStatusEx(&mem);
+    Mascot::Mood mood = Mascot::Mood::Normal;
+    if (busyChecks_ >= 2 || mem.dwMemoryLoad >= 94) mood = Mascot::Mood::Worried;
+    else if ((focus_.on && focus_.onBreak) || local.tm_hour >= 23 || local.tm_hour < 5) mood = Mascot::Mood::Sleepy;
+    for (auto& island : islands_) island->SetMood(mood);
+}
+
+void App::TogglePrivacy() {
+    privacy_ = !privacy_;
+    Log("privacy mode %s", privacy_ ? "on" : "off");
+    for (auto& island : islands_) ShowWindow(island->hwnd(), privacy_ ? SW_HIDE : SW_SHOWNOACTIVATE);
+    if (solu_) {
+        if (privacy_) solu_->StopSpeaking();
+        solu_->SetPaused(privacy_);
+    }
+    if (!privacy_) UpdateFullscreenState();                                         // a fullscreen app may still want it hidden
+}
+
+void App::StartCapture(const std::wstring& mode) {
+    if (privacy_ || capture_.Active()) return;
+    capture_.Start(mode, [this](RECT r, const std::wstring& m) {
+        captured_ = r;
+        capturedMode_ = m;
+        PostMessageW(msgWnd_, WM_APP_CAPTURED, 0, 0);
+    });
+}
+
 void App::OnCameraChanged() {
-    if (!camera_) return;
+    if (!camera_ || shoot_) return;
     const CameraSnapshot snapshot = camera_->Snapshot();
     for (auto& island : islands_) island->SetCamera(snapshot);
 }
 
 void App::OnAudioChanged() {
-    if (!audio_) return;
+    if (!audio_ || shoot_) return;
     const AudioSnapshot snapshot = audio_->Snapshot();
     for (auto& island : islands_) island->SetAudio(snapshot);
 }
 
 void App::OnNotificationsChanged() {
-    if (!notifications_) return;
+    if (!notifications_ || shoot_) return;
     const NotificationSnapshot snap = notifications_->Snapshot();
 #ifndef NDEBUG
     Log("notifications: access=%d count=%zu arrivals=%llu", static_cast<int>(snap.access), snap.items.size(),
@@ -230,6 +596,28 @@ void App::OnNotificationsChanged() {
 #endif
     const bool arrived = snap.arrivals > seenArrivals_;
     seenArrivals_ = snap.arrivals;
+    if (solu_) {                                                     // what Solu may mention: who wrote, in which app (not the text)
+        std::string json = "{\"notifications\":[";
+        for (size_t i = 0; i < snap.items.size() && i < 30; ++i) {
+            const auto& n = snap.items[i];
+            auto esc = [](const std::wstring& w) {
+                std::string out;
+                for (wchar_t c : w) {
+                    if (c == L'"' || c == L'\\') out += '\\', out += static_cast<char>(c);
+                    else if (c < 0x20) out += ' ';
+                    else if (c < 0x80) out += static_cast<char>(c);
+                    else {                                            // UTF-8
+                        char buf[8];
+                        const int n8 = WideCharToMultiByte(CP_UTF8, 0, &c, 1, buf, 8, nullptr, nullptr);
+                        out.append(buf, n8 > 0 ? n8 : 0);
+                    }
+                }
+                return out;
+            };
+            json += std::string(i ? "," : "") + "{\"app\":\"" + esc(n.app) + "\",\"title\":\"" + esc(n.title) + "\"}";
+        }
+        solu_->SendContext(json + "]}");
+    }
     for (auto& island : islands_) {
         island->SetNotifications(snap);
         if (arrived) island->OnNotification();
@@ -278,9 +666,11 @@ void App::BuildIslands() {
                 if (camera_) camera_->Watch(watching ? +1 : -1);
             },
             [this](bool input, const std::wstring& id) {
+                if (shoot_) return ShootSelect(input, id);
                 if (audio_) audio_->Select(input, id);
             },
             [this](int side, bool muted) {                      // 0 microphone, 1 speaker, 2 camera (privacy switch), 3 Solu (off = muted)
+                if (shoot_) return ShootMute(side, muted);      // filming: nothing is really muted
                 if (side == 3) {
                     if (solu_) solu_->Enable(!muted);
                 } else if (side == 2) {
@@ -290,14 +680,14 @@ void App::BuildIslands() {
                 }
             },
             [this](bool input, bool start) {                    // the "Test" button in the microphone / speaker menu
-                if (!audio_) return;
+                if (!audio_ || shoot_) return;
                 if (start) audio_->StartTest(input);
                 else audio_->StopTest();
             });
         island->SetSoluHandlers(
-            [this](bool on) { if (solu_) solu_->Enable(on); },
+            [this](bool on) { if (solu_ && !shoot_) solu_->Enable(on); },
             [this] { OnSoluHotkey(); },
-            [this](const std::wstring& voice) { if (solu_) solu_->SetVoice(voice); },
+            [this](const std::wstring& voice) { if (solu_ && !shoot_) solu_->SetVoice(voice); },
             [this](bool headphones) { if (solu_) solu_->SetHeadphones(headphones); },
             [this] { if (solu_) solu_->StopSpeaking(); },
             [this](bool captions) { if (solu_) solu_->SetCaptions(captions); },
@@ -307,12 +697,55 @@ void App::BuildIslands() {
         });
         island->SetNotificationHandlers(
             [this](uint32_t id) {
+                if (shoot_) return ShootDismissNotification(id);
                 if (notifications_) notifications_->Dismiss(id);
             },
             [this] {
+                if (shoot_) {
+                    shootNotifs_.items.clear();
+                    for (auto& island : islands_) island->SetNotifications(shootNotifs_);
+                    return;
+                }
                 if (notifications_) notifications_->ClearAll();
             });
+        island->SetAgentHandlers(
+            [this](AgentTool tool, const std::wstring& session, const std::wstring& cwd, const std::wstring& text, bool fresh, std::wstring& error) {
+                if (shoot_) return true;                        // filming: the director plays the agent's answer
+                return agents_ && agents_->Send(tool, session, cwd, text, fresh, error);
+            },
+            [this](AgentTool tool) { ToggleAiTool(tool == AgentTool::Claude ? AiTool::ClaudeCode : AiTool::Codex); });
+        island->SetLyricsOn(lyricsOn_);
+        island->SetLyricsHandler([this](bool on) { SetLyricsOn(on); });
+        island->SetTaskHandler([this](const std::string& op, const std::string& id) { if (solu_ && !shoot_) solu_->TaskControl(op, id); });
+        island->SetShelfHandlers([this](const std::vector<std::wstring>& paths) {
+                                     if (shoot_) {                       // filming: the real shelf is left alone
+                                         for (const auto& p : paths) ShootShelfAdd(p);
+                                         for (auto& island : islands_) island->SetShelf(shootShelf_);
+                                     } else if (shelf_) shelf_->Add(paths);
+                                 },
+                                 [this](const std::wstring& path) {
+                                     if (shoot_) {
+                                         std::erase_if(shootShelf_.items, [&](const ShelfItem& i) { return i.path == path; });
+                                         ++shootShelf_.version;
+                                         for (auto& island : islands_) island->SetShelf(shootShelf_);
+                                     } else if (shelf_) shelf_->Remove(path);
+                                 },
+                                 [this] { if (shelf_ && !shoot_) shelf_->Clear(); });
+        island->SetAgentOpen([this](const AgentSession& s, bool openChat) {
+            AgentSession copy = s;
+            std::thread([copy, openChat] { AgentMonitor::FocusHost(copy, openChat); }).detach();         // (it sleeps briefly: not on the UI thread)
+        });
+        island->SetActivityDismiss([this](const std::wstring& id) {
+            if (shoot_) {
+                std::erase_if(shootActs_, [&](const Activity& a) { return a.id == id; });
+                for (auto& island : islands_) island->SetActivities(shootActs_);
+                return;
+            }
+            dismissed_.insert(id);
+            PushActivities();
+        });
         island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
+            if (shoot_) return ShootDecide(id);                 // filming: nothing is really approved
             if (id >= kSoluApprovalBase) {
                 if (solu_) solu_->Answer(id, decision);
                 return;
@@ -330,7 +763,10 @@ void App::RebuildGraphics() {
         return;
     }
     BuildIslands();
+    OnShelfChanged();
     OnMediaChanged();                        // fresh islands start with the current track
+    OnLyricsChanged();                       // ... and its lyrics (the lookup is not repeated for the same song)
+    OnAgentsChanged();                       // the agents tab and the live pills (it pushes the activities too)
     OnAudioChanged();
     OnCameraChanged();
     OnSoluChanged();
@@ -461,6 +897,26 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == kDisplayDebounceTimer) {
             KillTimer(hwnd, kDisplayDebounceTimer);
             RebuildGraphics();
+        } else if (wp == kActivityTimer) {
+            TickFocus();
+            PushActivities();
+        } else if (wp == kMoodTimer) {
+            UpdateMood();
+        }
+        return 0;
+    case WM_APP_ACTIVITY:
+        OnActivityChanged();
+        return 0;
+    case WM_APP_AGENTS:
+        OnAgentsChanged();
+        return 0;
+    case WM_APP_SHELF:
+        OnShelfChanged();
+        return 0;
+    case WM_APP_CAPTURED:
+        if (solu_ && !shoot_) {
+            showAnswer_ = true;
+            solu_->LookAtRegion(captured_, capturedMode_);
         }
         return 0;
     case WM_APP_DEVICE_LOST:
@@ -475,6 +931,9 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
     case WM_APP_MEDIA:
         OnMediaChanged();
+        return 0;
+    case WM_APP_LYRICS:
+        OnLyricsChanged();
         return 0;
     case WM_APP_NOTIFICATION:
         OnNotificationsChanged();
@@ -493,6 +952,15 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_HOTKEY:
         if (wp == kSoluHotkeyId) OnSoluHotkey();
+        else if (wp == kPrivacyHotkeyId) TogglePrivacy();
+        else if (wp == kCaptureHotkeyId) StartCapture(L"explain");
+        else if (wp == kAgentsHotkeyId) {                                          // open where the pointer is, cursor in the prompt box
+            POINT pt;
+            GetCursorPos(&pt);
+            const HMONITOR here = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+            for (auto& island : islands_)
+                if (island->monitor() == here || islands_.size() == 1) island->FocusAgentPrompt();
+        }
         return 0;
 #ifndef NDEBUG
     case WM_APP_DEBUG_SOLU:                  // scripted tests: 1 on, 0 off, 2 talk, 3 ask, 4 stop
@@ -509,12 +977,29 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == 9) solu_->Ask(L"Open the calculator");
             else if (wp == 10) solu_->Ask(L"Close the calculator window");
             else if (wp == 11) solu_->Ask(L"Research the benefits of drinking water, then email a short summary to test@example.com");
+            else if (wp == 12) {                                        // a test nudge
+                SoluAppEvent e;
+                e.name = "nudge";
+                e.fields["title"] = L"Tomorrow";
+                e.fields["text"] = L"Your exam is on October 20th";
+                OnSoluAppEvent(e);
+            } else if (wp == 13) StartCapture(L"explain");
+            else if (wp == 14) solu_->Ask(L"Start a focus session for 1 minute with 1 minute breaks and 2 rounds");
+            else if (wp == 15) solu_->Ask(L"Start a task: research three facts about honey bees, then write them into a file called bee-test.txt in my Documents folder");
         }
         return 0;
 #endif
     case WM_APP_PERMISSION:
         OnPermissionsChanged();
         return 0;
+#ifndef NDEBUG
+    case WM_COPYDATA: {                      // shoot mode: the director's commands (UTF-8 JSON)
+        const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+        if (cds && cds->dwData == 0x45464C57 && cds->lpData)
+            OnShootCommand(std::string(static_cast<const char*>(cds->lpData), cds->cbData));
+        return TRUE;
+    }
+#endif
 #ifndef NDEBUG
     case WM_APP_DEBUG_TAB:
         for (auto& island : islands_) island->DebugOpenTab(static_cast<int>(static_cast<INT_PTR>(wp)));
