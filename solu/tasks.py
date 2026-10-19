@@ -41,7 +41,6 @@ GUI_TOOLS = {"click_element", "click_text", "type_text", "press_keys", "scroll",
              "open_file", "wait_for_text"}
 GUI_WORDS = re.compile(r"\b(click|open|type|press|tab|window|button|menu|page|screen|drag|select|field|scroll|tick|check|enter|fill|"
                        r"log ?in|sign|chrome|browser|notepad|settings|app|folder|explorer|download|upload|search box)\b", re.I)
-ALWAYS_ASK = {"send_email", "send_message", "tell_agent", "tidy_folder"}      # these reach other people or move many files: a card every time
 
 PLAN = ("Plan how to reach this goal on the user's Windows PC.\nGOAL: {goal}\n\n"
         "You can: open apps and websites; look at the screen and click, type, press keys, scroll and drag in any window; "
@@ -89,7 +88,6 @@ TOOLS = [
     actions._tool("note", "Write a fact in the task's notes so it is remembered for later steps.",
                   {"key": actions._s("short name"), "value": actions._s("the fact")}, ["key", "value"]),
 ]
-TASK_TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 BASE_TOOLS = ["look", "click_element", "type_text", "press_keys", "scroll", "wait", "wait_for_text", "window_control", "open_app", "open_website"]
 
 
@@ -134,7 +132,6 @@ class Task:
         self.steps = []                                   # {"text", "done_when", "status": todo|doing|done|failed|skipped, "result", "tries"}
         self.status = "planning"                          # planning running paused waiting done failed cancelled
         self.created = time.time()
-        self.updated = self.created
         self.finished = 0.0
         self.notes = {}
         self.log = []                                     # {"t", "text"}: what was done, newest last
@@ -142,7 +139,6 @@ class Task:
         self.budget = MAX_ACTIONS
         self.deadline = time.time() + MAX_MINUTES * 60
         self.question = ""
-        self.approved = False
         self.result = ""
         self.schedule_id = schedule_id
         self.replans = 0
@@ -167,7 +163,6 @@ class Task:
         self.log.append({"t": time.time(), "text": short(text, 300)})
         if len(self.log) > 120:
             self.log = self.log[-120:]
-        self.updated = time.time()
 
     @property
     def done_count(self):
@@ -310,7 +305,7 @@ class TaskRunner:
                 t.add_log("paused by the user")
                 text = f"Paused {t.title}."
             elif op == "resume" and t.status in ("paused",):
-                t.status = "running" if t.steps and t.approved else "planning"
+                t.status = "running" if t.steps else "planning"
                 t.budget = max(t.budget, t.actions + MAX_ACTIONS // 2)
                 t.deadline = max(t.deadline, time.time() + 30 * 60)
                 t.add_log("resumed by the user")
@@ -446,12 +441,7 @@ class TaskRunner:
             self.emit(True)
             self._plan(task)
             self._checkpoint(task)
-        if not task.approved:
-            if not self._approve_plan(task):
-                task.status, task.finished = "cancelled", time.time()
-                task.add_log("the user did not approve the plan")
-                return
-            task.approved = True
+        if task.status == "planning":                                              # no plan card: the user's rule is to just do it
             task.status = "running"
             self.save()
         self.emit(True)
@@ -485,17 +475,6 @@ class TaskRunner:
         task.steps = [{"text": short(s["text"], 200), "done_when": short(s.get("done_when", ""), 160), "status": "todo", "result": "", "tries": 0} for s in steps]
         task.add_log(f"planned {len(task.steps)} steps")
         self.save()
-
-    def _approve_plan(self, task):
-        detail = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(task.steps))
-        if task.needs:
-            detail += f"\n\nIt will use: {', '.join(task.needs)}.\nMessages, emails and prompts to your agents still ask each time."
-        task.status, task.question = "waiting", f"Approve the plan for {task.title}?"
-        self.save()
-        self.emit(True)
-        answer = self.solu.ask_permission("run_task", {"title": task.title, "steps": detail}, background=True)
-        task.question = ""
-        return answer in ("allow", "always", "all")
 
     def _replan(self, task, failed, why):
         done = "; ".join(s["text"] for s in task.steps if s["status"] == "done") or "nothing yet"
@@ -731,7 +710,7 @@ class TaskRunner:
 
     # ---- doing it (with the approvals the user gave) ------------------------------------------------------------------
     def _exec(self, task, name, args):
-        if name not in actions.LEVEL:
+        if name not in actions.TOOL_NAMES:
             return f"error: there is no tool called {name}"
         if name in GUI_ACTIONS:                                                      # never type or click into a window the task did not choose
             import ctypes
@@ -753,10 +732,6 @@ class TaskRunner:
             if hwnd not in task.own and not self._named_in_goal(task, hwnd, title):
                 return (f"error: nothing was done: '{short(title, 60)}' is one of the user's own windows, not one this task opened or the goal "
                         f"names. Leave it alone and carry on with the task's own windows.")
-            if args.get("action") == "close":                                        # closing can lose the user's work: always asked
-                answer = self.solu.ask_permission(name, args, background=True)
-                if answer not in ("allow", "always", "all"):
-                    return "the user said no, so the window was not closed; leave it open"
         if name == "type_text":                                                      # typing is not idempotent: never type what is already there
             want = " ".join(str(args.get("text", "")).split()).lower()
             seen = " ".join(getattr(self, "_prev_lines", None) or []).lower()
@@ -767,9 +742,7 @@ class TaskRunner:
             value = args.get(key)
             if isinstance(value, str) and re.match(r"(?i)^[a-z]:\\users\\public\\", value) and "public" not in task.goal.lower():
                 args[key] = os.path.join(actions.HOME, value.split("\\", 3)[3])
-        needs = actions.needs_approval(name, args)
-        risky = actions.describe(name, args)[2] if needs else False
-        if needs and (not task.approved or risky or name in ALWAYS_ASK):
+        if actions.needs_approval(name, args):                                     # deleting, writing, closing, sending: asked every time
             answer = self.solu.ask_permission(name, args, background=True)
             if answer == "deny":
                 return "the user said no, so it was not done; do not try another way to do the same thing"

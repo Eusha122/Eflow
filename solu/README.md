@@ -40,14 +40,69 @@ That creates `solu\venv`, downloads the models into `solu\models` and pulls the 
 are ignored by git. Eflow looks for Solu in `solu\` next to the repository, in a `solu\` folder next to
 `eflow.exe`, or in the folder named by the `EFLOW_SOLU_DIR` environment variable.
 
+## How a request flows
+
+```
+microphone ─► listening.py ─► "Solu, play maths" ─► Solu.handle(text)
+                (VAD, Whisper, wake word)                   │
+                                                            ├─ intents.py: a fixed command matches ─► do it, say so
+                                                            └─ otherwise brain.py: the language model answers,
+                                                               calling tools from actions.py when it needs them
+```
+
+Everything that changes the PC goes through `Solu.use_tool`, which shows an approval card (`approvals.py`) when the
+action needs one. Fixed commands exist because a small model is unreliable with actions: it would say "Media paused."
+without pausing anything. The brain handles everything else: conversation, questions, multi-step requests.
+
 ## Files
+
+`Solu` (in `solu_chat.py`) is one object; its behaviour is split into mixins, one module per job.
 
 | File | What it is |
 |---|---|
 | `solu_service.py` | The hidden helper Eflow runs: one JSON event per line out, one JSON command per line in. |
-| `solu_chat.py` | The conversation engine (microphone, turn taking, Whisper, the brain, Kokoro). Also runs on its own: `run_solu.bat`. |
+| `solu_chat.py` | Builds `Solu` from the mixins below; also runs on its own from a console (`run_solu.bat`). |
+| `listening.py` | The microphone loop: turn-taking, the wake word, its own echo, conversations. |
+| `audio.py` | Devices (following the island and Windows' default), speech-to-text, the speaker queue. |
+| `intents.py` | Fixed commands: music, open, click, settings, memory, tasks, reports. **Add commands here.** |
+| `brain.py` | The language model: streamed answers and the tool-using agent loop. |
+| `approvals.py` | Approval cards on the island, answered by tap or by voice. |
+| `screen_help.py` | Questions about the screen: OCR text first, the vision model for pictures. |
+| `jobs.py` | Deep research in the background; hooks that long tasks use. |
+| `skill_runner.py` | Routines, the study quiz, lecture notes, the morning briefing, messages. |
+| `config.py`, `prompts.py` | Models and the model server; what the model is told. |
+| `actions.py` | The tools themselves (`Hands`): apps, websites, Spotify, keyboard, mouse, files, ... |
+| `tasks.py` | Long background tasks: plan, approve once, then step by step. |
+| `skills.py`, `research.py`, `memory.py`, `screen.py`, `uia.py`, `gpu.py` | The building blocks the modules above use. |
 | `voice_presets.py`, `presets.json` | The five voices (blends of Kokoro voices, pitch and pace). |
 | `dev/` | Scratch benchmarks and tests (ignored by git). |
+
+## Adding a command
+
+Write one function in the right section of `intents.py`:
+
+```python
+@intent
+def weather(solu, req):
+    """'What's the weather?'"""
+    if not re.search(r"\bweather\b", req.t):        # req.t: lower case, words only
+        return None                                  # not mine: the next intent (or the brain) gets it
+    return act(solu, req, "weather", {}, lambda result: result)   # use a tool, then say something
+```
+
+Intents are tried top to bottom and the first match wins, so keep patterns strict: a false match is worse than a
+miss, because a miss still reaches the brain.
+
+## Testing
+
+`tests/hardcore_test.py` sends about 60 typed requests through `Solu.handle` (the same path as speech) and checks which
+tool was used, with which arguments, and what Solu said. Tools that would change the PC are recorded instead of run;
+memory and tasks use temporary files. Run all of it, or one group:
+
+```powershell
+solu\venv\Scripts\python.exe solu\tests\hardcore_test.py
+solu\venv\Scripts\python.exe solu\tests\hardcore_test.py music
+```
 
 ## Licences to know about
 

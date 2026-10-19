@@ -1,9 +1,7 @@
 """Solu's hands: the things it can do on the PC, described for the brain (Ollama tool calling) and carried out here.
 
-Every tool has a permission level:
-  auto     harmless and expected (music keys, volume, a timer, the time): done at once
-  ask      the island shows an Approve / Reject card first (the user can also say "yes" / "no")
-Some "ask" tools can be trusted for good ("Always allow"); commands, file writes and closing windows never can.
+Solu does what it is told at once. Only actions that delete, write, close or send something as the user show an
+Approve / Reject card on the island first (the user can also say "yes" / "no"): see needs_approval().
 """
 import ctypes
 import difflib
@@ -14,11 +12,11 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 from ctypes import wintypes
 
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 NO_WINDOW = 0x08000000
-TRUST_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "Eflow", "solu_trust.json")
 HOME = os.path.expanduser("~")
 
 
@@ -91,7 +89,9 @@ TOOLS = [
           {"text": _s("the words to wait for"), "seconds": _n("how long at most, default 30")}, ["text"]),
     _tool("agent_wait", "Wait for the user's coding agent (Claude Code or Codex) to finish what it is doing, then return its last message. Use it after tell_agent.",
           {"agent": {"type": "string", "enum": ["claude", "codex"]}, "minutes": _n("how long to wait at most, default 15")}, ["agent"]),
-    _tool("media_control", "Control the music or video that is playing.",
+    _tool("play_song", "Play a specific song, artist or playlist the user names, on Spotify or YouTube.",
+          {"query": _s("what to play, e.g. 'Shape of You Ed Sheeran'"), "app": {"type": "string", "enum": ["spotify", "youtube"], "description": "where; default Spotify"}}, ["query"]),
+    _tool("media_control", "Pause, resume or skip the music or video that is ALREADY playing. It cannot choose a song: use play_song for that.",
           {"action": {"type": "string", "enum": ["play_pause", "next", "previous", "stop"]}}, ["action"]),
     _tool("set_volume", "Change the PC's sound volume.",
           {"percent": _n("set the volume to this level, 0-100"), "change": _n("or change it by this many percent, e.g. 10 or -10"),
@@ -128,15 +128,6 @@ TOOLS = [
           {"command": _s("the PowerShell command")}, ["command"]),
 ]
 
-# name -> (level, can be always-allowed)
-LEVEL = {"start_task": ("auto", False), "look": ("auto", False), "click_element": ("ask", True), "drag": ("ask", True), "wait": ("auto", False), "wait_for_text": ("auto", False),
-         "agent_wait": ("auto", False), "research": ("auto", False), "deep_research": ("auto", False), "focus_timer": ("auto", False), "clipboard_history": ("auto", False),
-         "tidy_folder": ("auto", False), "send_message": ("auto", False), "start_quiz": ("auto", False), "take_notes": ("auto", False), "agent_status": ("auto", False), "tell_agent": ("ask", False), "send_email": ("ask", False), "open_app": ("auto", False), "open_website": ("auto", False),
-         "scroll": ("auto", False), "web_search": ("auto", False), "media_control": ("auto", False),
-         "set_volume": ("auto", False), "set_timer": ("auto", False), "system_info": ("auto", False), "look_at_screen": ("auto", False),
-         "click_text": ("ask", True), "type_text": ("ask", True), "press_keys": ("ask", True), "window_control": ("auto", False),
-         "find_files": ("ask", True), "open_file": ("auto", True), "read_file": ("ask", True), "write_file": ("ask", False),
-         "clipboard": ("ask", True), "run_command": ("ask", False)}
 
 RISKY = re.compile(r"\b(remove-item|rm|del|erase|rmdir|rd|format(-volume)?|clear-disk|shutdown|restart-computer|stop-computer|"
                    r"reg\s+delete|remove-itemproperty|set-executionpolicy|diskpart|bcdedit|cipher|takeown|icacls|stop-process|taskkill|"
@@ -150,7 +141,8 @@ TRIGGERS = {
     "open_app": r"open|launch|start|run|app|program",
     "open_website": r"open|go to|website|site|\.com|\.org|\.net|youtube|chatgpt|gmail|facebook|url|link|browser",
     "web_search": r"search|google|look ?up",
-    "research": r"research|search|look ?up|find out|learn about|information|info|news|latest|summar|about",
+    "research": r"research|search|look ?up|find out|learn about|information|info|news|latest|summar|about|who won|winner|champion|"
+                r"\b(last|current|recent|newest|this year's|today's)\b|price|cost|score|president|prime minister|ceo|released?|20[2-3]\d",
     "focus_timer": r"focus|pomodoro|study session|work session|concentrat|deep work",
     "clipboard_history": r"copied|clipboard|i copy|copy earlier",
     "tidy_folder": r"tidy|clean ?up|organi[sz]e|sort (my|the|out)|declutter",
@@ -171,6 +163,7 @@ TRIGGERS = {
     "agent_wait": r"(claude|codex).*(finish|done|complete)|wait for (claude|codex)",
     "deep_research": r"deep|in[- ]?depth|detailed|thorough|report|(make|write|create|prepare) (a |me a |an )?(doc|document|paper|summary)|"
                      r"research (on|about|into)|study (on|about)",
+    "play_song": r"\bplay\b|\bput on\b|\blisten to\b|\bsong\b|spotify|youtube",
     "media_control": r"play|pause|resume|next|previous|skip|song|music|track|video",
     "set_volume": r"volume|louder|quieter|mute|unmute|sound|audio",
     "set_timer": r"timer|remind|alarm|countdown",
@@ -250,41 +243,32 @@ def spoken_math(text):
     return best, shown
 
 
-# ---- trust ("Always allow") ---------------------------------------------------------------------------------------
-def trusted():
-    try:
-        with open(TRUST_FILE, encoding="utf-8") as f:
-            return set(json.load(f).get("always", []))
-    except (OSError, ValueError):
-        return set()
-
-
-def trust(name):
-    names = trusted() | {name}
-    os.makedirs(os.path.dirname(TRUST_FILE), exist_ok=True)
-    with open(TRUST_FILE, "w", encoding="utf-8") as f:
-        json.dump({"always": sorted(names)}, f)
-
-
-def forget_trust():
-    try:
-        os.remove(TRUST_FILE)
-    except OSError:
-        pass
-
-
+# ---- when Solu asks first ------------------------------------------------------------------------------------------------
+# Solu does what the user says at once. It asks first only before something that cannot be taken back: deleting, writing
+# or changing files, closing windows (unsaved work), running a program or script, and sending something as the user
+# (an email or a prompt to their coding agent cannot be unsent). The user's rule: "everything except delete, write, close".
+TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOLS)
+ALWAYS_ASKS = {"write_file", "send_email", "tell_agent"}            # tidy_folder and send_message ask inside, with their details
+CHANGES_THINGS = re.compile(RISKY.pattern + r"|\b(set-content|add-content|out-file|new-item|copy-item|move-item|rename-item|"
+                            r"set-itemproperty|new-itemproperty|mkdir|md|copy|move|ren|rename|xcopy|robocopy|reg\s+add|"
+                            r"stop-service|set-service|winget|choco|pip|npm|git\s+(push|reset|clean|checkout))\b|>", re.I)
+CLOSING_KEYS = re.compile(r"(?i)\balt\+f4\b|\bctrl\+(shift\+)?[wq]\b|(^|\+)(shift\+)?(del|delete)$")
 RUNS_CODE = (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".msi", ".scr", ".com", ".hta", ".reg", ".py")
 
 
 def needs_approval(name, args):
-    level, _ = LEVEL.get(name, ("ask", False))
-    if name == "open_file" and str(args.get("path", "")).lower().rstrip('" ').endswith(RUNS_CODE):
-        return name not in trusted()                                               # "opening" a program or script runs code: ask
-    if level == "auto":
-        return False
-    if name == "window_control" and args.get("action") == "list":
-        return False
-    return name not in trusted()
+    """True when this action must be shown on an approval card before it happens."""
+    if name in ALWAYS_ASKS:
+        return True
+    if name == "run_command":
+        return bool(CHANGES_THINGS.search(str(args.get("command", ""))))
+    if name == "press_keys":
+        return bool(CLOSING_KEYS.search(str(args.get("keys", "")).replace(" ", "")))
+    if name == "window_control":
+        return args.get("action") == "close"
+    if name == "open_file":
+        return str(args.get("path", "")).lower().rstrip('" ').endswith(RUNS_CODE)
+    return False
 
 
 def _foreground_title():
@@ -294,50 +278,33 @@ def _foreground_title():
 
 
 def describe(name, a):
-    """What the approval card says: (action, detail, risky, can always-allow)."""
-    can_always = LEVEL.get(name, ("ask", False))[1]
-    if name == "open_app":
-        return "open an app", a.get("name", ""), False, can_always
-    if name == "open_website":
-        return "open a website", a.get("url", ""), False, can_always
-    if name == "click_text":
-        return "click on the screen", f"“{a.get('text', '')}”  in  {_foreground_title()}", False, can_always
-    if name == "type_text":
-        return f"type into {_foreground_title()[:40]}", a.get("text", ""), False, can_always
-    if name == "press_keys":
-        return f"press keys in {_foreground_title()[:40]}", a.get("keys", ""), bool(re.search(r"alt\+f4|ctrl\+w|del", a.get("keys", ""), re.I)), can_always
-    if name == "window_control":
-        return f"{a.get('action', '')} a window", a.get("title", ""), a.get("action") == "close", False
-    if name == "find_files":
-        return "search your files", a.get("name", "") + (f"  in  {a['folder']}" if a.get("folder") else ""), False, can_always
-    if name == "open_file":
-        return "open a file", a.get("path", ""), False, can_always
-    if name == "read_file":
-        return "read a file", a.get("path", ""), False, can_always
+    """What the approval card says: (what Solu wants to do, the details, whether it is risky). Plain words, never JSON."""
     if name == "write_file":
         exists = os.path.exists(_path(a.get("path", "")))
         return (("change a file" if exists else "create a file"), f"{a.get('path', '')}\n\n{a.get('content', '')[:1500]}",
-                exists and not a.get("append"), False)
-    if name == "clipboard":
-        return ("read your clipboard", "", False, can_always) if a.get("action") == "read" else ("copy to the clipboard", a.get("text", ""), False, can_always)
-    if name == "run_task":
-        return f"run a task: {a.get('title', '')}", a.get("steps", ""), False, False
-    if name == "tell_agent":
-        who = "Codex" if str(a.get("agent", "")).lower().startswith("co") else "Claude Code"
-        return f"send a prompt to {who}" + (f" in {a['project']}" if a.get("project") else ""), a.get("message", ""), False, False
-    if name == "tidy_folder":
-        return f"tidy {os.path.basename(a.get('folder', '')) or 'a folder'}", a.get("summary", ""), False, False
-    if name == "whatsapp":
-        return f"send a WhatsApp message to {a.get('to', '')}", a.get("text", ""), False, False
+                exists and not a.get("append"))
     if name == "send_email":
         to = email_address(a.get("to", ""))
-        if not to:
-            return "open an email draft (you add the address)", f"Subject: {a.get('subject', '')}\n\n{a.get('body', '')}", False, False
-        return f"send an email to {to}", f"Subject: {a.get('subject', '')}\n\n{a.get('body', '')}", False, False
+        body = f"Subject: {a.get('subject', '')}\n\n{a.get('body', '')}"
+        return (f"send an email to {to}", body, False) if to else ("open an email draft (you add the address)", body, False)
+    if name == "whatsapp":
+        return f"send a WhatsApp message to {a.get('to', '')}", a.get("text", ""), False
+    if name == "tell_agent":
+        who = "Codex" if str(a.get("agent", "")).lower().startswith("co") else "Claude Code"
+        return f"send a prompt to {who}" + (f" in {a['project']}" if a.get("project") else ""), a.get("message", ""), False
+    if name == "tidy_folder":
+        return f"tidy {os.path.basename(a.get('folder', '')) or 'a folder'}", a.get("summary", ""), False
     if name == "run_command":
         cmd = a.get("command", "")
-        return "run a command", cmd, bool(RISKY.search(cmd)), False
-    return f"use {name}", json.dumps(a), False, False
+        return "run a command that changes your PC", cmd, bool(RISKY.search(cmd))
+    if name == "press_keys":
+        return f"press {a.get('keys', '')} in {_foreground_title()[:40]}", "This can close a window or delete something.", True
+    if name == "window_control":
+        return f"close {a.get('title') or _foreground_title()}", "Anything unsaved in it may be lost.", True
+    if name == "open_file":
+        return "run a program", a.get("path", ""), True
+    words = name.replace("_", " ")                                       # (a tool added later without its own wording)
+    return words, "\n".join(f"{k}: {v}" for k, v in a.items()), False
 
 
 # ---- apps -----------------------------------------------------------------------------------------------------------
@@ -366,7 +333,7 @@ def preload():
     threading.Thread(target=_load_apps, daemon=True).start()
 
 
-ALIASES = {"browser": "chrome", "explorer": "file explorer", "files": "file explorer", "my files": "file explorer", "calc": "calculator",
+ALIASES = {"browser": "google chrome", "chrome": "google chrome", "google": "google chrome", "explorer": "file explorer", "files": "file explorer", "my files": "file explorer", "calc": "calculator",
            "terminal": "terminal", "cmd": "command prompt", "vs code": "visual studio code", "vscode": "visual studio code",
            "word": "word", "excel": "excel", "settings": "settings", "store": "microsoft store", "task manager": "task manager"}
 
@@ -379,6 +346,9 @@ def find_app(name):
     exact = [n for n in names if n.lower() == want]
     if exact:
         return exact[0], apps[exact[0]]
+    words = sorted([n for n in names if re.search(r"\b" + re.escape(want) + r"\b", n.lower()) and "uninstall" not in n.lower()], key=len)
+    if words:
+        return words[0], apps[words[0]]
     starts = sorted([n for n in names if n.lower().startswith(want)], key=len)
     if starts:
         return starts[0], apps[starts[0]]
@@ -607,10 +577,27 @@ def search_files(name, folder=None, budget=7.0, limit=12):
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
 
 
+WIKI_AGENT = {"User-Agent": "Solu/1.0 (Eflow desktop assistant)"}                 # Wikipedia asks API users to name themselves
+
+
+def _wikipedia_intro(url):
+    """A Wikipedia article's introduction as clean text (its page HTML is mostly navigation). The answer to "who is the
+    current ..." is usually the intro's LAST sentence, so it is kept whole."""
+    title = urllib.parse.unquote(url.rsplit("/wiki/", 1)[1])
+    api = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode(
+        {"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "redirects": 1, "format": "json", "titles": title})
+    try:
+        pages = json.loads(urllib.request.urlopen(urllib.request.Request(api, headers=WIKI_AGENT), timeout=6).read())["query"]["pages"]
+        return re.sub(r"\s+", " ", next(iter(pages.values())).get("extract", "")).strip()[:3500]
+    except Exception:                                                               # noqa: BLE001
+        return ""
+
+
 def _page_text(url, limit=1800):
     """The readable text of a web page (scripts, menus and markup removed), cut to `limit` characters."""
     import html as htmlmod
-    import urllib.request
+    if "en.wikipedia.org/wiki/" in url:
+        return _wikipedia_intro(url)
     try:
         raw = urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=6).read(600_000).decode("utf-8", "replace")
     except Exception:                                                               # noqa: BLE001
@@ -622,21 +609,154 @@ def _page_text(url, limit=1800):
     return text[:limit]
 
 
-def search_results(query):
-    """Web search (DuckDuckGo, no key): [(title, url, snippet)], ads removed."""
+def _spotify_window(wait=0.0):
+    import uiautomation as auto
+    deadline = time.monotonic() + wait
+    while True:
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if win.ClassName == "Chrome_WidgetWin_1" and "spotify" in _process_name(win.ProcessId):
+                    return win
+            except Exception:                                                       # noqa: BLE001
+                continue
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
+LIBRARY_NOISE = {"my", "the", "a", "playlist", "playlists", "album", "favorite", "favourite", "spotify", "on", "in", "from", "song", "songs", "music", "list", "called", "named"}
+
+
+def _spotify_library_play(query, win):
+    """The user's own playlists / albums / artists ("maths Playlist • Eusha" in Your Library): open the best match and press
+    its big Play button. Returns what plays, or None when nothing in the library matches."""
+    import uiautomation as auto
+    want = set(re.findall(r"[a-z0-9']+", query.lower())) - LIBRARY_NOISE
+    liked = re.search(r"\bliked songs?\b|\bmy likes\b|\bsongs i liked\b", query, re.I)
+    if not want and not liked:
+        return None
+    best, best_score = None, 0.0
+    for control, _ in auto.WalkControl(win, maxDepth=40):
+        if control.ControlTypeName != "ButtonControl":
+            continue
+        m = re.match(r"^(.+?)\s+(?:Pinned\s+)?(Playlist|Album|Artist|Podcast|EP|Single)\b", (control.Name or "").strip())
+        if not m:
+            continue
+        title = m.group(1)
+        if liked and title.lower() == "liked songs":
+            best, best_score = control, 9.0
+            break
+        words = set(re.findall(r"[a-z0-9']+", title.lower()))
+        if not words or not want:
+            continue
+        score = len(want & words) / len(want) + (1.0 if words == want else 0.0)
+        if score > best_score:
+            best, best_score = control, score
+    if best is None or best_score < 1.0:                                           # every word the user said must be in the name
+        return None
+    title = re.sub(r"\s+(?:Pinned\s+)?(Playlist|Album|Artist|Podcast|EP|Single)\b.*$", "", best.Name.strip())
+    best.GetInvokePattern().Invoke()                                               # open it ...
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:                                             # ... and press its big "Play <title>" button
+        time.sleep(0.5)
+        for control, _ in auto.WalkControl(win, maxDepth=40):
+            if control.ControlTypeName == "ButtonControl" and (control.Name or "").strip().lower() == f"play {title.lower()}":
+                control.GetInvokePattern().Invoke()
+                return f"{title} (from the user's library)"
+    return None
+
+
+def _spotify_play_first(query, wait=15.0):                               # a cold Spotify start takes ~8 s
+    """After a spotify:search: link: press the first "Play ..." button of the results (Spotify names them "Play <song> by <artist>").
+    Returns what it pressed, or None."""
+    import uiautomation as auto
+    deadline = time.monotonic() + wait
+    time.sleep(1.5)                                                                 # the search page takes a moment to fill
+    while time.monotonic() < deadline:
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if win.ClassName != "Chrome_WidgetWin_1" or "spotify" not in _process_name(win.ProcessId):
+                    continue
+                want = set(re.findall(r"[a-z0-9']+", query.lower())) - {"by", "the", "a", "song", "by"}
+                best, best_score = None, 0
+                for control, _ in auto.WalkControl(win, maxDepth=40):         # results: "Play MISERY - SLOWED", "Play misery. Radio", ...
+                    if control.ControlTypeName != "ButtonControl":
+                        continue
+                    name = (control.Name or "").strip()
+                    if not re.match(r"^play\s+\S", name, re.I) or re.match(r"^play(back)?\s*(/|speed|queue)", name, re.I):
+                        continue
+                    if re.search(r"\bradio$", name, re.I) and "radio" not in want:
+                        continue
+                    words = set(re.findall(r"[a-z0-9']+", name[5:].lower()))
+                    score = len(want & words) - 0.1 * len(words - want)       # the user's words, and few others ("SLOWED", "100HRS")
+                    if score > best_score:
+                        best, best_score = control, score
+                if best is not None:
+                    best.GetInvokePattern().Invoke()
+                    return best.Name[5:]
+            except Exception:                                                       # noqa: BLE001
+                continue
+        time.sleep(0.5)
+    return None
+
+
+def _process_name(pid):
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)                                         # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf, size = ctypes.create_unicode_buffer(520), wintypes.DWORD(520)
+        return os.path.basename(buf.value).lower() if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)) else ""
+    finally:
+        k32.CloseHandle(h)
+
+
+def _strip_html(text):
     import html as htmlmod
-    import urllib.request
+    return htmlmod.unescape(re.sub("<.*?>", "", text)).strip()
+
+
+def _search_duckduckgo(query):
+    """The whole web, no key. It answers bursts of searches with a challenge page (HTTP 202): then this finds nothing."""
     req = urllib.request.Request("https://html.duckduckgo.com/html/", data=urllib.parse.urlencode({"q": query}).encode(), headers=UA)
-    page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+    page = urllib.request.urlopen(req, timeout=5).read().decode("utf-8", "replace")      # slow = blocked: move on
     links = re.findall(r'class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', page)
     snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
     results = []
     for (u, title), sn in zip(links, snips):
         u = urllib.parse.unquote(re.sub(r".*uddg=([^&]+).*", r"\1", u))
-        if "duckduckgo.com/y.js" in u:                                              # an ad
-            continue
-        results.append((htmlmod.unescape(re.sub("<.*?>", "", title)), u, htmlmod.unescape(re.sub("<.*?>", "", sn)).strip()))
+        if "duckduckgo.com/y.js" not in u:                                          # (that one is an ad)
+            results.append((_strip_html(title), u, _strip_html(sn)))
     return results
+
+
+def _search_wikipedia(query):
+    """Wikipedia's own search API: made for programs, never blocks; facts and events, not prices. It matches keywords, so
+    the question words go: "who is the current president of the United States" -> "president of the United States"."""
+    topic = re.sub(r"(?i)^(who|what|when|where|which|how( much| many)?)('s|\s+(is|was|are|were|did|does|do|won))*\s+|\?", "", query.strip())
+    topic = re.sub(r"(?i)\b(the|current|latest|last|right now|today)\b\s*", "", topic).strip() or query
+    url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode(
+        {"action": "query", "list": "search", "format": "json", "srlimit": 5, "srsearch": topic})
+    found = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers=WIKI_AGENT),
+                                              timeout=10).read())
+    return [(hit["title"], "https://en.wikipedia.org/wiki/" + urllib.parse.quote(hit["title"].replace(" ", "_")), _strip_html(hit["snippet"]))
+            for hit in found.get("query", {}).get("search", [])]
+
+
+SEARCH_ENGINES = (_search_duckduckgo, _search_wikipedia)                           # tried in order until one finds something
+
+
+def search_results(query):
+    """Web search without an API key: [(title, url, snippet)]."""
+    for engine in SEARCH_ENGINES:
+        try:
+            results = engine(query)
+        except Exception:                                                           # noqa: BLE001  (offline, blocked, changed page)
+            results = []
+        if results:
+            return results
+    return []
 
 
 def research(query, pages=3):
@@ -748,6 +868,31 @@ class Hands:
         os.startfile(url)
         time.sleep(3.5)                                                             # let the page load before anything is typed into it
         return f"opened {url} in the browser; it has loaded and its main text box usually has the cursor"
+
+    def do_play_song(self, query, app="spotify"):
+        query = re.sub(r"\s+(on|in|from)\s+(spotify|youtube)\s*$", "", query.strip(), flags=re.I)
+        if str(app).lower().startswith("spot") and find_app("spotify")[0]:
+            win = _spotify_window()
+            if win is None:                                                         # not running: start it first
+                os.startfile("spotify:")
+                win = _spotify_window(wait=15.0)
+                time.sleep(2.0)                                                     # the library fills in after the window appears
+            if win is not None:
+                mine = _spotify_library_play(query, win)                           # "my maths playlist" is in their own library
+                if mine:
+                    return f"Spotify is now playing: {mine}"
+            os.startfile("spotify:search:" + urllib.parse.quote(query))
+            pressed = _spotify_play_first(query)
+            if pressed:
+                return f"Spotify is now playing: {pressed}"
+            return f"opened the search for '{query}' in Spotify, but could not press play; the user can pick it there"
+        page = urllib.request.urlopen(urllib.request.Request("https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query), headers=UA),
+                                      timeout=10).read().decode("utf-8", "replace")
+        ids = re.findall(r'"videoId":"([\w-]{11})"', page)
+        if not ids:
+            return f"error: YouTube found nothing for '{query}'"
+        os.startfile("https://www.youtube.com/watch?v=" + ids[0])
+        return f"opened '{query}' on YouTube in the browser; it starts playing by itself"
 
     def do_web_search(self, query):
         os.startfile("https://www.google.com/search?q=" + urllib.parse.quote_plus(query))
@@ -1169,11 +1314,29 @@ class Hands:
         return f"{action} done: {name}"
 
     def do_scroll(self, direction, pages=1):
+        """Scroll the window the user is in. Less than a page ("a bit") turns the mouse wheel over the window's middle,
+        like a person would; whole pages press Page Down / Up; top and bottom press Ctrl+Home / Ctrl+End."""
+        direction = str(direction).lower()
         if direction in ("top", "bottom"):
             press("ctrl+home" if direction == "top" else "ctrl+end")
             return f"scrolled to the {direction}"
-        times = max(1, min(20, int(float(pages or 1))))
-        _tap(0x22 if direction == "down" else 0x21, times)                          # Page Down / Page Up: no mouse moves
+        pages = max(0.1, min(20.0, float(pages or 1)))
+        if pages < 1:
+            hwnd = user32.GetForegroundWindow()
+            rect = wintypes.RECT()
+            if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return "error: no window to scroll"
+            here = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(here))
+            user32.SetCursorPos((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+            notch = 120 if direction == "up" else -120                                # one wheel click
+            for _ in range(max(1, round(pages * 10))):
+                user32.mouse_event(0x0800, 0, 0, notch, 0)                            # MOUSEEVENTF_WHEEL
+                time.sleep(0.02)
+            user32.SetCursorPos(here.x, here.y)                                        # the pointer goes back where it was
+            return f"scrolled {direction} a little"
+        times = int(round(pages))
+        _tap(0x22 if direction == "down" else 0x21, times)                          # Page Down / Page Up
         return f"scrolled {direction} {times} page(s)"
 
     def do_find_files(self, name, folder=None):

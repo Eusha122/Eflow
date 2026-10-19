@@ -2,7 +2,9 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <ctime>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -11,6 +13,7 @@
 
 #include "core/Log.h"
 #include "core/Messages.h"
+#include "core/Utf8.h"
 
 namespace eflow {
 namespace {
@@ -34,6 +37,8 @@ constexpr int kAgentsHotkeyId = 4;                // Ctrl+Alt+A: write to Claude
 constexpr int kCaptureHotkeyId = 3;               // Ctrl+Alt+Q: drag over part of the screen and Solu explains it
 constexpr UINT_PTR kActivityTimer = 2;            // 1 s while the focus timer or a short-lived pill is up
 constexpr UINT_PTR kMoodTimer = 3;                // every 30 s: is it late, is the PC struggling?
+constexpr UINT_PTR kReminderTimer = 4;            // fires when the next reminder is due (at least once a minute)
+constexpr UINT_PTR kAlarmStopTimer = 5;           // a ringing chime stops by itself after a minute (the card stays)
 constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
 std::wstring ExePath() {
@@ -96,12 +101,14 @@ int App::Run() {
     if (!RegisterHotKey(msgWnd_, kAgentsHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A')) Log("Ctrl+Alt+A is taken by another program");
     shelf_ = std::make_unique<ShelfStore>(msgWnd_, WM_APP_SHELF);
     shelf_->Load();
+    reminders_.Load();
     agents_ = std::make_unique<AgentMonitor>(msgWnd_, WM_APP_AGENTS);
     agents_->Start();
     activityMonitor_ = std::make_unique<ActivityMonitor>(msgWnd_, WM_APP_ACTIVITY);
     activityMonitor_->Start();
     SetTimer(msgWnd_, kMoodTimer, 30000, nullptr);
     BuildIslands();
+    TickReminders();                        // rings anything that came due while Eflow was closed
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
     lyrics_ = std::make_unique<LyricsService>(msgWnd_);
@@ -279,6 +286,96 @@ void App::OnSoluHotkey() {
 
 // ---- agents (Claude Code and Codex) ------------------------------------------------------------
 
+// ---- reminders ---------------------------------------------------------------------------------
+
+void App::TickReminders() {
+    const int64_t wait = reminders_.Tick(UnixNow());
+    SetTimer(msgWnd_, kReminderTimer, static_cast<UINT>(std::min<int64_t>(wait, 60) * 1000), nullptr);
+    OnRemindersChanged();
+}
+
+void App::OnRemindersChanged() {
+    const ReminderSnapshot snap = reminders_.Snapshot();
+    bool newRing = false, newHeadsUp = false;
+    for (const Alert& a : snap.ringing)
+        if (std::none_of(ringingWas_.begin(), ringingWas_.end(), [&](const Alert& b) { return a.id == b.id && a.early == b.early; }))
+            (a.early ? newHeadsUp : newRing) = true;
+    ringingWas_ = snap.ringing;
+    if (newRing) {
+        alarm_.Ring();
+        SetTimer(msgWnd_, kAlarmStopTimer, 60000, nullptr);
+    } else if (newHeadsUp) {
+        alarm_.HeadsUp();
+    } else if (snap.ringing.empty()) {
+        KillTimer(msgWnd_, kAlarmStopTimer);
+        alarm_.Stop();
+    }
+    if (shoot_) return;
+    for (auto& island : islands_) island->SetReminders(snap);
+    if (solu_) {                                                     // so Solu can answer "what are my reminders?"
+        auto esc = [](const std::wstring& w) {
+            std::string out;
+            for (char c : ToUtf8(w)) {
+                if (c == '"' || c == '\\') out += '\\';
+                if (static_cast<unsigned char>(c) >= 0x20) out += c;
+            }
+            return out;
+        };
+        std::string json = "{\"reminders\":[";
+        const int64_t now = UnixNow();
+        for (size_t i = 0; i < snap.items.size() && i < 12; ++i) {
+            const Reminder& r = snap.items[i];
+            json += std::string(i ? "," : "") + "{\"title\":\"" + esc(r.title) + "\",\"when\":\"" +
+                    esc(r.missed ? L"missed" : FormatWhen(r.at, r.repeat, now)) + "\",\"note\":\"" + esc(r.note) + "\"}";
+        }
+        json += "]}";
+        if (json != lastReminderContext_) {
+            lastReminderContext_ = json;
+            solu_->SendContext(json);
+        }
+    }
+}
+
+void App::OnSoluReminder(const SoluAppEvent& e) {
+    // "Remind me about the Codeforces contest on 4 March at 8 pm": the same parser as the island's box, so both agree.
+    auto spoken = [](std::wstring when) {                             // "Thu, Mar 4 · 8:00 PM" -> "Thu, Mar 4 at 8:00 PM"
+        const size_t dot = when.find(L" · ");
+        if (dot != std::wstring::npos) when.replace(dot, 3, L" at ");
+        if (when.rfind(L"Daily", 0) == 0) when.replace(0, 5, L"every day");
+        return when;
+    };
+    if (e.name == "reminder_remove") {
+        const std::wstring want = e.Get("title");
+        for (const Reminder& r : reminders_.Snapshot().items) {
+            std::wstring a = r.title, b = want;
+            for (auto* x : {&a, &b}) std::transform(x->begin(), x->end(), x->begin(), ::towlower);
+            if (!b.empty() && (a.find(b) != std::wstring::npos || b.find(a) != std::wstring::npos)) {
+                reminders_.Remove(r.id);
+                TickReminders();
+                solu_->ReminderReply(L"Okay, I deleted the " + r.title + L" reminder.");
+                return;
+            }
+        }
+        solu_->ReminderReply(L"I couldn't find a reminder like that.");
+        return;
+    }
+    const int64_t now = UnixNow();
+    const When w = ParseWhen(e.Get("text"), now);
+    if (!w.ok) {
+        solu_->ReminderReply(L"When should I remind you? Say a day and a time.");
+        return;
+    }
+    if (w.repeat == Repeat::None && w.at <= now) {
+        solu_->ReminderReply(L"That time has already passed. Say another one.");
+        return;
+    }
+    reminders_.Add(w.title, e.Get("note"), w.at, w.repeat, w.earlyMinutes);
+    TickReminders();
+    std::wstring said = L"Okay, I'll remind you: " + w.title + L", " + spoken(FormatWhen(w.at, w.repeat, now)) + L".";
+    if (w.meridiemGuessed) said += L" Tell me if you meant the other time of day.";
+    solu_->ReminderReply(said);
+}
+
 void App::OnShelfChanged() {
     if (!shelf_ || shoot_) return;
     const ShelfSnapshot snap = shelf_->Snapshot();
@@ -421,6 +518,7 @@ void App::PushActivities() {
 }
 
 void App::OnSoluAppEvent(const SoluAppEvent& e) {
+    if (e.name == "reminder" || e.name == "reminder_remove") return OnSoluReminder(e);
     const uint64_t now = GetTickCount64();
     if (e.name == "activity") {                                                     // research and other long jobs
         Activity a;
@@ -744,6 +842,14 @@ void App::BuildIslands() {
             dismissed_.insert(id);
             PushActivities();
         });
+        island->SetReminderHandlers(
+            [this](const std::wstring& title, const std::wstring& note, int64_t at, Repeat repeat, int early) {
+                reminders_.Add(title, note, at, repeat, early);
+                TickReminders();
+            },
+            [this](uint32_t id) { reminders_.Remove(id); TickReminders(); },
+            [this](uint32_t id) { reminders_.Dismiss(id); TickReminders(); },
+            [this](uint32_t id, int minutes) { reminders_.Snooze(id, minutes); TickReminders(); });
         island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
             if (shoot_) return ShootDecide(id);                 // filming: nothing is really approved
             if (id >= kSoluApprovalBase) {
@@ -764,6 +870,7 @@ void App::RebuildGraphics() {
     }
     BuildIslands();
     OnShelfChanged();
+    OnRemindersChanged();
     OnMediaChanged();                        // fresh islands start with the current track
     OnLyricsChanged();                       // ... and its lyrics (the lookup is not repeated for the same song)
     OnAgentsChanged();                       // the agents tab and the live pills (it pushes the activities too)
@@ -902,7 +1009,18 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PushActivities();
         } else if (wp == kMoodTimer) {
             UpdateMood();
+        } else if (wp == kReminderTimer) {
+            TickReminders();
+        } else if (wp == kAlarmStopTimer) {
+            KillTimer(hwnd, kAlarmStopTimer);
+            alarm_.Stop();
         }
+        return 0;
+    case WM_POWERBROADCAST:                  // back from sleep: ring what came due meanwhile, re-arm the timer
+        if (wp == PBT_APMRESUMEAUTOMATIC) TickReminders();
+        return TRUE;
+    case WM_TIMECHANGE:                      // the clock or the time zone changed
+        TickReminders();
         return 0;
     case WM_APP_ACTIVITY:
         OnActivityChanged();

@@ -21,7 +21,7 @@ import urllib.request
 KEEP = "3m"                     # how long the brain stays in memory after its last use
 RESERVE_GB = 1.5                # always left free for the user's other apps
 # per model: layers (blocks + output), GB per layer (weights + context cache), GB it needs beyond its layers
-SIZES = {"qwen3:8b": (37, 0.175, 0.2), "qwen3-vl:4b": (37, 0.12, 1.5)}
+SIZES = {"qwen3:8b": (37, 0.175, 0.2), "qwen3:4b-instruct": (37, 0.1, 0.3), "qwen3-vl:4b": (37, 0.12, 1.5)}
 API = "http://127.0.0.1:11434/api"
 SHARED = os.path.join(os.environ.get("LOCALAPPDATA", "."), "Eflow", "gpu_layers.json")
 SMI = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe")
@@ -100,6 +100,37 @@ def options(model, opts):
     if layers is not None:
         out["num_gpu"] = layers
     return out
+
+
+_installed = {}                 # model -> installed in Ollama? (asked once)
+
+
+def installed(model):
+    if model not in _installed:
+        try:
+            with urllib.request.urlopen(API + "/tags", timeout=2) as resp:
+                names = {m.get("name") for m in json.loads(resp.read()).get("models", [])}
+            _installed[model] = model in names
+        except Exception:                                                             # noqa: BLE001
+            return False
+    return _installed[model]
+
+
+def _fits(model, free):
+    layers_n, layer_gb, fixed_gb = SIZES.get(model, (37, 0.17, 0.6))
+    return free is None or free - RESERVE_GB >= fixed_gb + layers_n * layer_gb
+
+
+def brain(big, fast):
+    """Which brain answers now. The big one only when it fits WHOLE on the card: split with the processor it took 30 s
+    to start answering, while the fast one (whole on the card) starts in well under a second. A loaded brain is kept."""
+    if not installed(fast):
+        return big
+    if is_loaded(big):
+        return big
+    if is_loaded(fast):
+        return fast
+    return big if _fits(big, free_vram_gb()) else fast
 
 
 def _loaded_layers(model):

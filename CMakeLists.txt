@@ -32,8 +32,10 @@ add_executable(eflow WIN32
     src/core/Json.cpp
     src/core/Log.cpp
     src/core/PackageIdentity.cpp
+    src/core/When.cpp
     src/island/IslandWindow.cpp
     src/island/CaptureOverlay.cpp
+    src/island/RemindersView.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
     src/mascot/MascotRenderer.cpp
@@ -50,6 +52,8 @@ add_executable(eflow WIN32
     src/services/ActivityMonitor.cpp
     src/services/AgentMonitor.cpp
     src/services/ShelfStore.cpp
+    src/services/ReminderStore.cpp
+    src/services/AlarmSound.cpp
     src/services/SystemMonitor.cpp
     src/app.manifest
     ${SHADER_OUT}/mascot_vs.h
@@ -70,7 +74,7 @@ target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EH
 set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
     COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs windowsapp shell32 user32
-    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32 winhttp)
+    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32 winhttp winmm)
 
 # The PermissionRequest hook command run by Claude Code / Codex; lives next to eflow.exe (it verifies
 # that the pipe it talks to is served by that eflow.exe).
@@ -80,6 +84,12 @@ target_compile_definitions(eflow-hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_ME
 target_compile_options(eflow-hook PRIVATE /W4 /permissive- /utf-8 /EHsc)
 target_link_libraries(eflow-hook PRIVATE advapi32)
 add_dependencies(eflow eflow-hook)
+
+# Unit tests for the parts that need no window (run build\<config>\eflow-tests.exe).
+add_executable(eflow-tests tests/when_test.cpp src/core/When.cpp)
+target_include_directories(eflow-tests PRIVATE src)
+target_compile_definitions(eflow-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(eflow-tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
 
 # Runtime assets live next to the executable.
 add_custom_command(TARGET eflow POST_BUILD

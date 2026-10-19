@@ -434,12 +434,6 @@ class Nudges(threading.Thread):
 
 
 # ---- smart messaging ---------------------------------------------------------------------------------------------------------------
-def _ocr_window():
-    import screen
-    look = screen.look_at_foreground()
-    return look, screen.read_text(look)
-
-
 def whatsapp_open_chat(name):
     """Open WhatsApp, search the contact, open the chat and check its header. Returns (chat title or None, note)."""
     import screen

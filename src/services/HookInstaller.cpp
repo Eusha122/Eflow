@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
 
@@ -23,29 +24,13 @@ std::filesystem::path Home() {
     return home;
 }
 
-std::string Utf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
-}
-
-std::wstring Wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), w.data(), n);
-    return w;
-}
-
 // The command line the tool runs. Forward slashes work for every shell the tools may use on
 // Windows (cmd, PowerShell, Git Bash), and the quotes protect paths with spaces.
 std::string HookCommand(AiTool tool) {
     wchar_t exe[MAX_PATH * 2];
     const DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     std::filesystem::path hook = std::filesystem::path(std::wstring(exe, n)).parent_path() / L"eflow-hook.exe";
-    std::string path = Utf8(hook.wstring());
+    std::string path = ToUtf8(hook.wstring());
     for (char& c : path)
         if (c == '\\') c = '/';
     return "\"" + path + "\" --source " + (tool == AiTool::ClaudeCode ? "claude-code" : "codex");
@@ -79,7 +64,7 @@ bool Load(const std::filesystem::path& file, json::Value& root, std::wstring& er
     }
     if (!json::Parse(text, root, parseError) || root.type != json::Value::Type::Object) {
         // Never overwrite a file we cannot understand.
-        error = L"Could not read " + file.wstring() + L" (" + Wide(parseError) + L"). It was left unchanged.";
+        error = L"Could not read " + file.wstring() + L" (" + FromUtf8(parseError) + L"). It was left unchanged.";
         return false;
     }
     return true;

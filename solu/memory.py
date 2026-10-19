@@ -24,9 +24,11 @@ please solu hey okay ok like want need get got make made tell said say says user
 
 EXTRACT = (
     "You maintain a small long-term memory about the user of a desktop assistant. Read the conversation below and pick out only "
-    "lasting facts worth remembering in future conversations: the user's name, people in their life (relation, and how to reach "
+    "lasting facts worth remembering in future conversations: people in their life (relation, and how to reach "
     "them: phone, email, WhatsApp), their preferences and dislikes, ongoing plans or goals, and important personal details. "
     "Preferences about how the assistant should behave count too (e.g. 'The user prefers short answers.'). "
+    "Only facts the USER said about themselves, in their own words. Never facts from their screen, web pages, documents or "
+    "accounts, never the user's name (it is saved separately), and never anything that sounds misheard or does not make sense. "
     "Skip small talk, questions, one-off requests and commands, things the assistant said, and anything already in the memory. "
     "Write each fact as one short sentence about 'the user' (e.g. 'The user's sister is Shoily; they message her on WhatsApp.'). "
     'Return JSON: {"memories": [{"text": "...", "kind": "name|person|preference|plan|fact"}]} with at most 3 items; '
@@ -62,15 +64,53 @@ def _words(text):
     return out
 
 
+PEOPLE = r"(?:best friend|friend|sister|brother|mom|mum|mother|dad|father|wife|husband|girlfriend|boyfriend|partner|son|daughter|boss|teacher|cousin)"
+
+
+def from_statement(text):
+    """A plain statement worth keeping the moment it is said: 'my favourite playlist is maths', 'my sister's name is Mim',
+    'my favorite playlist on Spotify, which is Maths'. Returns (fact, kind) or None. Questions are never facts."""
+    t = re.sub(r"\s+", " ", text).strip()
+    if t.endswith("?") or re.match(r"(?i)^(what|who|when|where|which|how|why|do|does|did|is|are|can|could)\b", t):
+        return None
+    m = re.search(r"(?i)\bmy ((?:favou?rite|usual) [\w' ]{2,30}?)(?: on \w+)?,? (?:which|that) (?:is|are) ([^,.!?]{1,50})", t) or \
+        re.search(r"(?i)\bmy ((?:favou?rite|usual) [\w' ]{2,30}?)(?: on \w+)? (?:is|are) ([^,.!?]{1,50})", t) or \
+        re.search(rf"(?i)\bmy ({PEOPLE}(?:'s| s)? (?:name|birthday|number|email|favou?rite [\w ]+?))(?: is| are|'s) ([^,.!?]{{1,50}})", t) or \
+        re.search(rf"(?i)\bmy ({PEOPLE})(?:'s| is) (?:name is |called )?([A-Z][\w'-]+)", t)
+    if not m:
+        return None
+    what, value = m.group(1).strip().lower().replace("favourite", "favorite"), m.group(2).strip()
+    if re.match(r"(?i)^(not|a|the|so|very|really|too)\b", value) or len(value) < 2:
+        return None
+    if re.fullmatch(PEOPLE, what):
+        what += "'s name"
+    kind = "preference" if what.startswith(("favorite", "usual")) else "person"
+    return f"The user's {what} is {value}.", kind
+
+
 class Memory:
     def __init__(self, path=PATH):
         self.path = path
         self.lock = threading.Lock()
         self.items = []
+        self._mtime = None                                         # the file as this process last read or wrote it
+        self._load()
+
+    def _load(self):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(self.path, encoding="utf-8") as f:
                 self.items = [m for m in json.load(f).get("memories", []) if m.get("text")]
+            self._mtime = os.path.getmtime(self.path)
         except (OSError, ValueError):
+            pass
+
+    def _fresh(self):
+        """Re-read the file if someone else changed it (another Solu, or the user cleaning it): saving the old copy from
+        this process's memory would bring deleted facts back."""
+        try:
+            if os.path.getmtime(self.path) != self._mtime:
+                self._load()
+        except OSError:
             pass
 
     def _save(self):
@@ -79,6 +119,7 @@ class Memory:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"memories": self.items}, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)                                 # never a half-written file
+        self._mtime = os.path.getmtime(self.path)
 
     def _similar(self, a, b):
         wa, wb = _words(a), _words(b)
@@ -92,6 +133,9 @@ class Memory:
             return False
         kind = kind if kind in KINDS else "fact"
         with self.lock:
+            self._fresh()
+            if kind == "name" and source != "told" and any(m["kind"] == "name" and m.get("source") == "told" for m in self.items):
+                return False                                        # a guess from a misheard conversation ("Yush") never replaces it
             for m in self.items:
                 if (kind == "name" and m["kind"] == "name") or self._similar(m["text"], text):
                     if m["text"] == text:
@@ -109,6 +153,7 @@ class Memory:
     def relevant(self, text, k=5):
         """The memories that matter for this request: the core ones, then the best word matches. Microseconds."""
         with self.lock:
+            self._fresh()
             if not self.items:
                 return []
             core = [m for m in self.items if m["kind"] in CORE][:4]
@@ -126,10 +171,31 @@ class Memory:
                 m["used"] = m.get("used", 0) + 1                    # (counts are saved with the next change)
             return [m["text"] for m in picked]
 
+    def user_name(self):
+        """The user's name as they told it ('Eusha Ibna Akbor'), or None."""
+        with self.lock:
+            self._fresh()
+            for m in reversed(self.items):
+                hit = m["kind"] == "name" and re.search(r"(?i)name is (.+?)\.?$", m["text"])
+                if hit:
+                    return hit.group(1).strip()
+        return None
+
+    def find_favorite(self, what):
+        """'playlist' -> 'maths' when the user said their favourite playlist is maths; None if unknown."""
+        with self.lock:
+            self._fresh()
+            for m in reversed(self.items):
+                hit = re.search(rf"favou?rite {what}\w*(?: on \w+)? (?:is|are) (.+?)\.?$", m["text"], re.I)
+                if hit:
+                    return hit.group(1).strip()
+        return None
+
     def forget(self, query):
         """Remove the memory that best matches `query`; returns its text, or None."""
         want = _words(query)
         with self.lock:
+            self._fresh()
             best, score = None, 0.0
             for m in self.items:
                 words = _words(m["text"])
@@ -145,6 +211,7 @@ class Memory:
 
     def clear(self):
         with self.lock:
+            self._fresh()
             if os.path.exists(self.path):
                 shutil.copyfile(self.path, self.path + ".bak")      # one undo, just in case
             self.items = []
@@ -152,6 +219,7 @@ class Memory:
 
     def summary(self, n=8):
         with self.lock:
+            self._fresh()
             ranked = sorted(self.items, key=lambda m: (m["kind"] not in CORE, -m.get("used", 0)))
             return [m["text"] for m in ranked[:n]], len(self.items)
 
@@ -169,6 +237,8 @@ class Memory:
             return []
         saved = []
         for m in found[:3]:
-            if isinstance(m, dict) and isinstance(m.get("text"), str) and self.add(m["text"], m.get("kind", "fact"), "learned"):
+            if not isinstance(m, dict) or not isinstance(m.get("text"), str) or m.get("kind") == "name":
+                continue                                             # names only come from "my name is ...": guesses were misheard
+            if self.add(m["text"], m.get("kind", "fact"), "learned"):
                 saved.append(m["text"])
         return saved

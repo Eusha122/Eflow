@@ -4,7 +4,6 @@ fallback for windows that expose nothing (games, canvases, remote desktops).
 """
 import ctypes
 import time
-from ctypes import wintypes
 
 import uiautomation as auto
 

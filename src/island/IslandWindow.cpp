@@ -16,6 +16,7 @@
 
 #include "core/Log.h"
 #include "core/Messages.h"
+#include "island/IslandStyle.h"
 #include "mascot/MascotRenderer.h"
 
 namespace eflow {
@@ -26,15 +27,11 @@ constexpr float kTopInset = 6.0f;          // gap between the screen edge and th
 constexpr float kMargin = 26.0f;           // room around the island for the shadow and spring overshoot
 constexpr float kCollapsedW = 196.0f;
 constexpr float kCollapsedH = 7.0f;
-constexpr float kExpandedW = 620.0f;
-constexpr float kExpandedH = 176.0f;
 constexpr float kMaxRadius = 24.0f;
 constexpr float kHotSlackX = 14.0f;        // extra hover area around the idle bar
 constexpr float kHotSlackY = 9.0f;
 constexpr float kLeaveSlack = 6.0f;        // how far outside the panel still counts as "inside"
 
-constexpr float kTabTop = 14.0f;
-constexpr float kTabH = 30.0f;
 constexpr float kTabPadX = 14.0f;
 constexpr float kTabGap = 4.0f;
 
@@ -57,12 +54,8 @@ constexpr float kMascotPawsY = -0.268f;    // model y of the paw bottoms
 constexpr float kMascotFromRight = 92.0f;  // mascot centre, measured from the panel's right edge
 constexpr float kMascotFloor = 12.0f;      // paw bottoms above the panel's bottom edge
 constexpr float kMascotRise = 12.0f;       // it rises this far into place as the panel opens
-constexpr float kMascotLane = 172.0f;      // panel width reserved on the right for the mascot
 
-constexpr D2D1_COLOR_F Rgba(float r, float g, float b, float a) { return {r, g, b, a}; }
 constexpr D2D1_COLOR_F kIslandFill = Rgba(0.051f, 0.051f, 0.063f, 1.0f);
-constexpr D2D1_COLOR_F kText = Rgba(0.96f, 0.96f, 0.98f, 1.0f);
-constexpr D2D1_COLOR_F kTextDim = Rgba(0.96f, 0.96f, 0.98f, 0.52f);
 
 constexpr int kHitPrev = 10, kHitPlay = 11, kHitNext = 12;   // media control hit ids
 constexpr int kHitShuffle = 14, kHitRepeat = 15;            // the two extra transport buttons
@@ -113,14 +106,15 @@ constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
 
-const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"Agents", L"System", L"Shelf"};
+const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"Agents", L"System", L"Shelf", L"Reminders"};
 const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No new messages",
-                                                   L"No pending requests", L"", L""};
+                                                   L"No pending requests", L"", L"", L""};
 const wchar_t* const kEmptyBody[kSectionCount] = {
     L"Play something in Spotify, YouTube or your browser",
     L"New notifications will show up here",
     L"WhatsApp messages will show up here",
     L"Requests from Solu, Claude Code and Codex appear here",
+    L"",
     L"",
     L"",
 };
@@ -130,10 +124,6 @@ std::wstring LowerCase(std::wstring s) {
     return s;
 }
 // ---- System tab: what each ring can show -----------------------------------------------------
-constexpr D2D1_COLOR_F kAccent = Rgba(0.42f, 0.70f, 1.0f, 1.0f);
-constexpr D2D1_COLOR_F kAmber = Rgba(1.0f, 0.73f, 0.30f, 1.0f);
-constexpr D2D1_COLOR_F kRed = Rgba(1.0f, 0.42f, 0.38f, 1.0f);
-constexpr D2D1_COLOR_F kGreen = Rgba(0.36f, 0.86f, 0.56f, 1.0f);
 constexpr D2D1_COLOR_F kNeutral = Rgba(0.60f, 0.60f, 0.65f, 1.0f);   // "normal": not available, connect it first
 constexpr float kRingRadius = 27.0f;
 constexpr float kRingThickness = 6.0f;
@@ -315,7 +305,6 @@ std::wstring FormLabel(int form, const std::wstring& deviceName) {
     }
 }
 
-D2D1_COLOR_F WithAlpha(D2D1_COLOR_F c, float a) { return {c.r, c.g, c.b, c.a * a}; }
 
 void SetOpenSprings(Spring& w, Spring& h) {
     w.stiffness = 330, w.damping = 30;     // slightly under-damped: a soft, living overshoot
@@ -571,7 +560,7 @@ void IslandWindow::UpdateClickAway() {
 
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
-    return debugPinned_ || pressed_ >= 0 || promptFocus_ || dragOver_ || shelfDragging_ || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
+    return debugPinned_ || pressed_ >= 0 || field_ || !reminders_.ringing.empty() || dragOver_ || shelfDragging_ || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
            (soluWake_ && solu_.state == SoluState::Loading);
 }
 
@@ -656,7 +645,7 @@ void IslandWindow::Expand() {
 
 void IslandWindow::Collapse() {
     if (!expanded_) return;
-    BlurPrompt(true);
+    Blur(true);
     dragOver_ = dragOpened_ = false;
     shelfScroll_ = 0;
     agentAuto_ = true;                           // next time it opens on whichever agent is busy
@@ -896,6 +885,7 @@ void IslandWindow::OnNotification() {
     // the user has the pointer on it (or it was already open).
     if (mascot_) mascot_->Notify();
     notifScrollTarget_ = 0;                      // newest first: show it
+    if (!reminders_.ringing.empty()) return;     // a ringing reminder keeps the island until it is answered
     const bool wasOpen = expanded_;
     OnClick(static_cast<int>(Section::Notifications));
     Expand();
@@ -937,6 +927,12 @@ void IslandWindow::OnWheel(int delta) {
         const D2D1_RECT_F area = ShelfArea(IslandRect());
         const float total = (static_cast<float>(shelf_.items.size()) + 1) * (kCardW + kCardGap);
         shelfScroll_ = std::clamp(shelfScroll_ - (delta > 0 ? 1.0f : -1.0f) * (kCardW + kCardGap) * 1.5f, 0.0f, std::max(0.0f, total - (area.right - area.left)));
+        Animate();
+        return;
+    }
+    if (expanded_ && section_ == Section::Reminders && reminders_.ringing.empty()) {   // scroll a long reminder list
+        const int rows = RemindersGeometry(IslandRect()).rows;
+        reminderScroll_ = std::clamp(reminderScroll_ + (delta > 0 ? -1 : 1), 0, std::max(0, static_cast<int>(reminders_.items.size()) - rows));
         Animate();
         return;
     }
@@ -1051,6 +1047,7 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
         if (n == 0) return kHitShelfAdd;                                   // the whole empty drop zone
         return -1;
     }
+    if (section_ == Section::Reminders) return RemindersHit(p, island);
     if (section_ == Section::Ai && permissions_.empty()) {          // the agents panel
         const AgentsLayout g = AgentsGeometry(island);
         auto in = [&](const D2D1_RECT_F& r) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; };
@@ -1137,6 +1134,12 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitReminderFirst && id <= kHitReminderLast) {
+        RemindersClick(id);
+        hover_ = -1;
+        Animate();
+        return;
+    }
     if (id >= kHitTaskPause && id < kHitTaskStop + 10) {
         const bool stop = id >= kHitTaskStop;
         const size_t i = static_cast<size_t>(id - (stop ? kHitTaskStop : kHitTaskPause));
@@ -1205,7 +1208,7 @@ void IslandWindow::OnClick(int id) {
         } else if (id == kHitAgentGo) {
             if (const AgentSession* s = CurrentSession(); s && agentOpen_) agentOpen_(*s, (GetKeyState(VK_CONTROL) & 0x8000) != 0);   // Ctrl: also reload the chat
         } else if (id == kHitPrompt) {
-            FocusPrompt();
+            Focus(prompt_);
         } else if (id == kHitSend) {
             SendPrompt();
         } else if (id == kHitNewChat) {
@@ -1407,6 +1410,9 @@ void IslandWindow::OnClick(int id) {
         return;
     }
     if (id < 0 || id >= kSectionCount) return;
+    const bool boxOnTab = (field_ == &prompt_ && id == static_cast<int>(Section::Ai)) ||
+                          ((field_ == &reminderWhat_ || field_ == &reminderNote_) && id == static_cast<int>(Section::Reminders));
+    if (field_ && !boxOnTab) Blur(false);        // the box being typed in is not on the new tab
     section_ = static_cast<Section>(id);
     popover_ = -1;                               // switching tabs dismisses an open menu
     UpdateSystemWatch();
@@ -1734,6 +1740,10 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             DrawShelf(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
             continue;
         }
+        if (i == static_cast<int>(Section::Reminders)) {
+            DrawReminders(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Ai)) {
             DrawAgents(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
             continue;
@@ -2008,6 +2018,26 @@ void IslandWindow::SetPermissions(const std::vector<PermissionRequest>& pending)
     Animate();
 }
 
+void IslandWindow::SetReminders(const ReminderSnapshot& snapshot) {
+    const bool newAlert = std::any_of(snapshot.ringing.begin(), snapshot.ringing.end(), [&](const Alert& a) {
+        return std::none_of(reminders_.ringing.begin(), reminders_.ringing.end(), [&](const Alert& b) { return a.id == b.id && a.early == b.early; });
+    });
+    const bool wasRinging = !reminders_.ringing.empty();
+    reminders_ = snapshot;
+    if (newAlert && !suppressed_) {                              // something rings: open on it, and keep it open until answered
+        if (mascot_) mascot_->Notify();
+        Expand();
+        OnClick(static_cast<int>(Section::Reminders));
+        KillTimer(hwnd_, kAutoCloseTimer);
+        autoClosePending_ = false;
+    }
+    if (wasRinging && reminders_.ringing.empty() && expanded_ && !Pinned() && !CursorInIsland(kLeaveSlack))
+        SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);       // answered: close like any other time
+    hover_ = -1;
+    ApplyHeightTarget();
+    Animate();
+}
+
 float IslandWindow::PermissionDetailH() const {
     if (permissions_.empty() || permissions_.front().id < kSoluApprovalBase) return 34.0f;
     const float width = kExpandedW - 24.0f - (mascot_ ? kMascotLane : 24.0f) - 20.0f;
@@ -2180,6 +2210,7 @@ float IslandWindow::TargetHeight() const {
         return std::clamp(96.0f + PermissionDetailH() + 6.0f + 28.0f + 14.0f, kExpandedH, kMaxPanelH);
     if (section_ == Section::Ai) return kAgentsH;                  // the agents panel
     if (section_ == Section::Shelf) return kShelfH;
+    if (section_ == Section::Reminders) return reminders_.ringing.empty() ? kRemindersH : kAlarmH;
     if (section_ == Section::Solu && SoluTaskRows() > 0 && !CaptionsShown()) return kSoluTasksH;
     if (CaptionsShown() && !solu_.said.empty()) {                // the live view grows so the whole answer fits
         const float width = kExpandedW - 22.0f - (mascot_ ? kMascotLane : 22.0f);
@@ -2362,7 +2393,6 @@ void IslandWindow::DrawAudioButtons(ID2D1DeviceContext* dc, D2D1_RECT_F base, fl
     }
     IDWriteTextFormat* glyphFont = gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_NORMAL, true);
     const wchar_t* const glyphs[4] = {L"", L"", L"", L""};     // microphone, speaker, camera, gear
-    const float now = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
     for (int side = 0; side < 4; ++side) {
         const Dot dot = SideDot(side);
         const bool muted = side < 3 && SideMuted(side);
@@ -3276,10 +3306,10 @@ void IslandWindow::SetAgents(const AgentSnapshot& snapshot) {
 void IslandWindow::UpdateAgentTimer() {
     KillTimer(hwnd_, kAgentTimer);
     if (!expanded_ || section_ != Section::Ai) return;
-    bool busy = agents_.sending || promptFocus_;
+    bool busy = agents_.sending || field_;
     for (const AgentSession& s : agents_.sessions)
         if (s.status == AgentStatus::Working) busy = true;
-    if (busy) SetTimer(hwnd_, kAgentTimer, promptFocus_ ? 260 : 120, nullptr);
+    if (busy) SetTimer(hwnd_, kAgentTimer, field_ ? 260 : 120, nullptr);
 }
 
 IslandWindow::AgentsLayout IslandWindow::AgentsGeometry(const D2D1_RECT_F& island) const {
@@ -3489,41 +3519,10 @@ void IslandWindow::DrawAgents(ID2D1DeviceContext* dc, D2D1_RECT_F base, float a)
     dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F((g.newBtn.left + g.newBtn.right) / 2, (g.newBtn.top + g.newBtn.bottom) / 2), 16.0f, 16.0f), brush_.Get());
     DrawText(dc, newChat_ ? L"" : L"", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL, true), g.newBtn, WithAlpha(kText, (newChat_ ? 1.0f : 0.8f) * a),
              DWRITE_TEXT_ALIGNMENT_CENTER);
-    brush_->SetColor(D2D1::ColorF(1, 1, 1, (promptFocus_ ? 0.13f : 0.075f) * a));
-    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{g.box, 16, 16}, brush_.Get());
-    if (promptFocus_) {
-        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.85f * a));
-        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(g.box.left + 0.5f, g.box.top + 0.5f, g.box.right - 0.5f, g.box.bottom - 0.5f), 16, 16}, brush_.Get(), 1.2f);
-    }
-    IDWriteTextFormat* input = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
-    const float textLeft = g.box.left + 14, textRight = g.box.right - 12, boxW = textRight - textLeft;
-    if (prompt_.empty()) {
-        std::wstring hint = sendingHere ? L"Sending…" : newChat_ ? (agentTool_ == AgentTool::Claude ? L"Start a new chat with Claude Code…" : L"Start a new chat with Codex…")
-                          : (agentTool_ == AgentTool::Claude ? L"Message Claude Code…" : L"Message Codex…");
-        DrawText(dc, hint.c_str(), input, D2D1::RectF(textLeft, g.box.top, textRight, g.box.bottom), WithAlpha(kTextDim, 1.1f * a));
-    } else {
-        std::wstring shown = prompt_;
-        for (wchar_t& c : shown)
-            if (c == L'\n') c = L'⏎';
-        const float caretX = std::ceil(gfx_.MeasureWidth(shown.substr(0, caret_).c_str(), input));
-        if (caretX - promptScroll_ > boxW - 6) promptScroll_ = caretX - (boxW - 6);
-        if (caretX < promptScroll_) promptScroll_ = caretX;
-        if (promptScroll_ < 0) promptScroll_ = 0;
-        dc->PushAxisAlignedClip(D2D1::RectF(textLeft, g.box.top, textRight, g.box.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
-        const float full = std::ceil(gfx_.MeasureWidth(shown.c_str(), input)) + 40;
-        DrawText(dc, shown.c_str(), input, D2D1::RectF(textLeft - promptScroll_, g.box.top, textLeft - promptScroll_ + full, g.box.bottom), WithAlpha(kText, a));
-        dc->PopAxisAlignedClip();
-    }
-    if (promptFocus_ && (now / 530) % 2 == 0) {                         // the caret
-        const std::wstring head = prompt_.substr(0, caret_);
-        std::wstring shownHead = head;
-        for (wchar_t& c : shownHead)
-            if (c == L'\n') c = L'⏎';
-        const float cx = textLeft + std::ceil(gfx_.MeasureWidth(shownHead.c_str(), input)) - promptScroll_;
-        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.95f * a));
-        dc->FillRectangle(D2D1::RectF(cx, g.box.top + 8, cx + 1.3f, g.box.bottom - 8), brush_.Get());
-    }
-    const bool canSend = !prompt_.empty() && !sendingHere;
+    const std::wstring hint = sendingHere ? L"Sending…" : newChat_ ? (agentTool_ == AgentTool::Claude ? L"Start a new chat with Claude Code…" : L"Start a new chat with Codex…")
+                            : (agentTool_ == AgentTool::Claude ? L"Message Claude Code…" : L"Message Codex…");
+    DrawField(dc, prompt_, g.box, hint.c_str(), a);
+    const bool canSend = !prompt_.text.empty() && !sendingHere;
     brush_->SetColor(D2D1::ColorF(0.04f + (hover_ == kHitSend && canSend ? 0.06f : 0.0f), 0.47f, 1.0f, (canSend ? 1.0f : 0.32f) * a));
     dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F((g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2), 16.0f, 16.0f), brush_.Get());
     DrawText(dc, L"", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL, true), g.send, WithAlpha(D2D1::ColorF(1, 1, 1, 1), (canSend ? 1.0f : 0.6f) * a),
@@ -3540,25 +3539,28 @@ void IslandWindow::FocusAgentPrompt() {
     Expand();
     OnClick(static_cast<int>(Section::Ai));
     KillTimer(hwnd_, kCloseTimer);
-    FocusPrompt();
+    Focus(prompt_);
     Animate();
 }
 
-void IslandWindow::FocusPrompt() {
-    if (promptFocus_) return;
-    prevForeground_ = GetForegroundWindow();
-    if (prevForeground_ == hwnd_) prevForeground_ = nullptr;
-    promptFocus_ = true;
-    KillTimer(hwnd_, kCloseTimer);
-    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE));
-    SetForegroundWindow(hwnd_);
-    SetFocus(hwnd_);
+void IslandWindow::Focus(TextField& field) {
+    if (!field_) {                                                       // the island takes the keyboard
+        prevForeground_ = GetForegroundWindow();
+        if (prevForeground_ == hwnd_) prevForeground_ = nullptr;
+        KillTimer(hwnd_, kCloseTimer);
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE));
+        SetForegroundWindow(hwnd_);
+        SetFocus(hwnd_);
+    }
+    field_ = &field;
+    field.caret = field.text.size();
     UpdateAgentTimer();
+    Animate();
 }
 
-void IslandWindow::BlurPrompt(bool restoreWindow) {
-    if (!promptFocus_) return;
-    promptFocus_ = false;
+void IslandWindow::Blur(bool restoreWindow) {
+    if (!field_) return;
+    field_ = nullptr;
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
     if (restoreWindow && prevForeground_ && IsWindow(prevForeground_)) SetForegroundWindow(prevForeground_);   // back to what you were doing
     prevForeground_ = nullptr;
@@ -3567,72 +3569,73 @@ void IslandWindow::BlurPrompt(bool restoreWindow) {
     Animate();
 }
 
-void IslandWindow::PromptInsert(const std::wstring& text) {
-    prompt_.insert(caret_, text);
-    caret_ += text.size();
-    agentError_.clear();
-}
-
 void IslandWindow::OnChar(wchar_t ch) {
-    if (!promptFocus_) return;
-    if (ch == L'\r') {
-        if (GetKeyState(VK_SHIFT) & 0x8000) PromptInsert(L"\n");
+    if (!field_) return;
+    if (ch == 0x1B) {                                                   // Esc: leave the box, back to your editor
+        Blur(true);
+    } else if (ch == L'\r' && field_ == &prompt_) {
+        if (GetKeyState(VK_SHIFT) & 0x8000) prompt_.Insert(L"\n");
         else SendPrompt();
-    } else if (ch == L'\b') {
-        if (caret_ > 0) prompt_.erase(--caret_, 1);
-    } else if (ch == 0x7F) {                                            // Ctrl+Backspace: the word before the caret
-        size_t at = caret_;
-        while (at > 0 && prompt_[at - 1] == L' ') --at;
-        while (at > 0 && prompt_[at - 1] != L' ') --at;
-        prompt_.erase(at, caret_ - at);
-        caret_ = at;
-    } else if (ch == 0x1B) {                                            // Esc: leave the box, back to your editor
-        BlurPrompt(true);
-    } else if (ch >= 0x20) {
-        PromptInsert(std::wstring(1, ch));
+    } else if (ch == L'\r' || ch == L'\t') {
+        RemindersKey(ch == L'\r' ? VK_RETURN : VK_TAB);
+    } else if (field_->OnChar(ch)) {
+        if (field_ == &prompt_) agentError_.clear();
+        if (field_ == &reminderWhat_) reminderFlip_ = false;                // a new time: the guess starts again
     }
     Animate();
 }
 
 void IslandWindow::OnKey(WPARAM vk) {
-    if (!promptFocus_) return;
-    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-    if (vk == VK_LEFT) {
-        if (ctrl) { while (caret_ > 0 && prompt_[caret_ - 1] == L' ') --caret_; while (caret_ > 0 && prompt_[caret_ - 1] != L' ') --caret_; }
-        else if (caret_ > 0) --caret_;
-    } else if (vk == VK_RIGHT) {
-        if (ctrl) { while (caret_ < prompt_.size() && prompt_[caret_] == L' ') ++caret_; while (caret_ < prompt_.size() && prompt_[caret_] != L' ') ++caret_; }
-        else if (caret_ < prompt_.size()) ++caret_;
-    } else if (vk == VK_HOME) {
-        caret_ = 0;
-    } else if (vk == VK_END) {
-        caret_ = prompt_.size();
-    } else if (vk == VK_DELETE) {
-        if (caret_ < prompt_.size()) prompt_.erase(caret_, 1);
-    } else if (vk == VK_UP || vk == VK_DOWN) {                          // scroll through what the agent did
+    if (!field_) return;
+    if (field_ == &prompt_ && (vk == VK_UP || vk == VK_DOWN)) {          // scroll through what the agent did
         if (const AgentSession* s = CurrentSession())
             agentScroll_ = std::clamp(agentScroll_ + (vk == VK_UP ? 1 : -1), 0, std::max(0, static_cast<int>(s->feed.size()) - 1));
-    } else if (ctrl && vk == 'V') {
-        if (OpenClipboard(hwnd_)) {
-            if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
-                if (const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(data))) {
-                    std::wstring pasted = text;
-                    GlobalUnlock(data);
-                    pasted.erase(std::remove(pasted.begin(), pasted.end(), L'\r'), pasted.end());
-                    if (pasted.size() > 8000) pasted.resize(8000);
-                    PromptInsert(pasted);
-                }
-            }
-            CloseClipboard();
-        }
-    } else if (ctrl && vk == 'A') {
-        caret_ = prompt_.size();
+    } else if (field_ != &prompt_ && (vk == VK_UP || vk == VK_DOWN)) {
+        RemindersKey(vk);
+    } else {
+        field_->OnKey(vk, hwnd_);
     }
     Animate();
 }
 
+// One line of editable text: hint when empty, the text scrolled so the caret stays in view, a blinking caret.
+// `right`: room kept free at the right end (for a chip drawn inside the box).
+void IslandWindow::DrawField(ID2D1DeviceContext* dc, TextField& field, const D2D1_RECT_F& box, const wchar_t* hint, float a, float right) {
+    const bool focused = field_ == &field;
+    const float radius = (box.bottom - box.top) / 2;
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, (focused ? 0.13f : 0.075f) * a));
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{box, radius, radius}, brush_.Get());
+    if (focused) {
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.85f * a));
+        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(box.left + 0.5f, box.top + 0.5f, box.right - 0.5f, box.bottom - 0.5f), radius, radius},
+                                 brush_.Get(), 1.2f);
+    }
+    IDWriteTextFormat* input = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    const float textLeft = box.left + 14, textRight = box.right - 12 - right, width = textRight - textLeft;
+    std::wstring shown = field.text;
+    for (wchar_t& c : shown)
+        if (c == L'\n') c = L'⏎';
+    if (shown.empty()) {
+        DrawText(dc, hint, input, D2D1::RectF(textLeft, box.top, textRight, box.bottom), WithAlpha(kTextDim, 1.1f * a));
+    } else {
+        const float caretX = std::ceil(gfx_.MeasureWidth(shown.substr(0, field.caret).c_str(), input));
+        if (caretX - field.scroll > width - 6) field.scroll = caretX - (width - 6);
+        if (caretX < field.scroll) field.scroll = caretX;
+        if (field.scroll < 0) field.scroll = 0;
+        dc->PushAxisAlignedClip(D2D1::RectF(textLeft, box.top, textRight, box.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+        const float full = std::ceil(gfx_.MeasureWidth(shown.c_str(), input)) + 40;
+        DrawText(dc, shown.c_str(), input, D2D1::RectF(textLeft - field.scroll, box.top, textLeft - field.scroll + full, box.bottom), WithAlpha(kText, a));
+        dc->PopAxisAlignedClip();
+    }
+    if (focused && (GetTickCount64() / 530) % 2 == 0) {                 // the caret
+        const float cx = textLeft + std::ceil(gfx_.MeasureWidth(shown.substr(0, field.caret).c_str(), input)) - field.scroll;
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.95f * a));
+        dc->FillRectangle(D2D1::RectF(cx, box.top + 8, cx + 1.3f, box.bottom - 8), brush_.Get());
+    }
+}
+
 void IslandWindow::SendPrompt() {
-    std::wstring text = prompt_;
+    std::wstring text = prompt_.text;
     while (!text.empty() && (text.back() == L' ' || text.back() == L'\n')) text.pop_back();
     if (text.empty() || !agentSend_ || (agents_.sending && agents_.sendingTool == agentTool_)) return;
     const AgentSession* s = CurrentSession();
@@ -3640,9 +3643,7 @@ void IslandWindow::SendPrompt() {
     if (cwd.empty() && !agents_.sessions.empty()) cwd = agents_.sessions.front().cwd;          // a new chat: where you worked last
     std::wstring error;
     if (agentSend_(agentTool_, newChat_ || !s ? L"" : s->id, cwd, text, newChat_ || !s, error)) {
-        prompt_.clear();
-        caret_ = 0;
-        promptScroll_ = 0;
+        prompt_.Clear();
         agentError_.clear();
         agentScroll_ = 0;
         newChat_ = false;
@@ -4025,7 +4026,7 @@ LRESULT CALLBACK IslandWindow::WndProcThunk(HWND hwnd, UINT msg, WPARAM wp, LPAR
 LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEACTIVATE:
-        return promptFocus_ ? MA_ACTIVATE : MA_NOACTIVATE;   // clicking the island never steals focus, except while typing in it
+        return field_ ? MA_ACTIVATE : MA_NOACTIVATE;   // clicking the island never steals focus, except while typing in it
     case WM_CHAR:
         OnChar(static_cast<wchar_t>(wp));
         return 0;
@@ -4033,7 +4034,7 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         OnKey(wp);
         return 0;
     case WM_KILLFOCUS:
-        if (promptFocus_) BlurPrompt(false);
+        if (field_) Blur(false);
         return 0;
     case WM_GETDLGCODE:
         return DLGC_WANTALLKEYS;

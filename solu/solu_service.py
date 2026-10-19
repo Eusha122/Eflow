@@ -32,6 +32,8 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))         # models/ is relati
 
 import solu_chat  # noqa: E402
 import gpu  # noqa: E402
+from config import BRAIN, FAST  # noqa: E402
+from voice_presets import PRESETS  # noqa: E402
 
 emit_lock = threading.Lock()
 
@@ -85,7 +87,8 @@ def main():
         cmd = commands.get()
         name = cmd.get("cmd")
         if name == "quit":
-            gpu.unload(solu_chat.BRAIN)                       # Solu off or Eflow closing: give the graphics card back now
+            for model in (BRAIN, FAST):                               # Solu off or Eflow closing: give the graphics card back now
+                gpu.unload(model)
             os._exit(0)
         elif name == "talk":                                  # the hotkey: start a conversation, or end the running one
             if solu.in_conversation:
@@ -101,7 +104,7 @@ def main():
                     solu.audio_out.get_nowait()
                 except queue.Empty:
                     break
-        elif name == "voice" and cmd.get("name") in solu_chat.PRESETS:
+        elif name == "voice" and cmd.get("name") in PRESETS:
             solu.args.voice = cmd["name"]
             if not solu.speaking.is_set():                    # a short hello so you can hear the new voice
                 solu.cancel.clear()
@@ -126,6 +129,8 @@ def main():
         elif name == "region":                                                # quick capture
             threading.Thread(target=solu.respond_region, args=(int(cmd["x"]), int(cmd["y"]), int(cmd["w"]), int(cmd["h"]),
                                                               cmd.get("mode", "explain")), daemon=True).start()
+        elif name == "reminder_reply":                                       # Eflow added (or could not add) a reminder
+            solu.reminder_replies.put(cmd.get("text", ""))
         elif name == "context":
             solu.context.update(cmd.get("data") or {})                        # notifications and agents arrive separately
         elif name == "approval" and cmd.get("answer") in ("allow", "always", "deny", "all"):
@@ -133,18 +138,7 @@ def main():
         elif name == "ask" and cmd.get("text") and not solu.speaking.is_set():
             emit("heard", text=cmd["text"])
             emit("state", state="thinking")
-            skill = solu.special(cmd["text"])
-            if skill:
-                threading.Thread(target=skill, daemon=True).start()
-                continue
-            if solu.is_screen_request(cmd["text"]):
-                threading.Thread(target=solu.respond_screen, args=(cmd["text"],), daemon=True).start()
-                continue
-            answer = solu.try_command(cmd["text"])
-            if answer is not None and answer:
-                threading.Thread(target=solu.respond_text, args=(answer,), daemon=True).start()
-            elif answer is None:
-                threading.Thread(target=solu.respond, args=(cmd["text"],), daemon=True).start()
+            threading.Thread(target=solu.handle, args=(cmd["text"],), daemon=True).start()
 
 
 if __name__ == "__main__":

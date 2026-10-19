@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
 
@@ -41,22 +42,6 @@ std::string Base64Decode(const std::string& in) {
         }
     }
     return out;
-}
-
-std::string ToUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
-}
-
-std::wstring FromUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-    return w;
 }
 
 std::wstring AppDataDir() {
@@ -297,7 +282,8 @@ void SoluService::ReaderLoop(HANDLE process, HANDLE readPipe) {
                         }
                     }
                 } else if (ev->text == "activity" || ev->text == "activity_end" || ev->text == "nudge" || ev->text == "focus" ||
-                           ev->text == "capture" || ev->text == "cheer" || ev->text == "agent_prompt") {   // the app acts on these itself
+                           ev->text == "capture" || ev->text == "cheer" || ev->text == "agent_prompt" ||
+                           ev->text == "reminder" || ev->text == "reminder_remove") {   // the app acts on these itself
                     SoluAppEvent e;
                     e.name = ev->text;
                     for (const auto& [key, value] : root.members)
@@ -554,6 +540,8 @@ void SoluService::SendContext(const std::string& json) { Send("{\"cmd\":\"contex
 void SoluService::TaskControl(const std::string& op, const std::string& id) {
     Send("{\"cmd\":\"task\",\"op\":" + Quote(op) + ",\"id\":" + Quote(id) + "}");
 }
+
+void SoluService::ReminderReply(const std::wstring& said) { Send("{\"cmd\":\"reminder_reply\",\"text\":" + Quote(ToUtf8(said)) + "}"); }
 
 void SoluService::Ask(const std::wstring& text) { Send("{\"cmd\":\"ask\",\"text\":" + Quote(ToUtf8(text)) + "}"); }
 

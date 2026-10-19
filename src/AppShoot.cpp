@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
 
@@ -16,21 +17,13 @@ namespace {
 
 using json::Value;
 
-std::wstring Wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-    return w;
-}
-
 const Value* Get(const Value& v, const char* key) {
     return const_cast<Value&>(v).Find(key);
 }
 bool Has(const Value& v, const char* key) { return Get(v, key) != nullptr; }
 std::wstring Str(const Value& v, const char* key, const wchar_t* fallback = L"") {
     const Value* m = Get(v, key);
-    return m && m->type == Value::Type::String ? Wide(m->text) : std::wstring(fallback);
+    return m && m->type == Value::Type::String ? FromUtf8(m->text) : std::wstring(fallback);
 }
 double Num(const Value& v, const char* key, double fallback = 0) {
     const Value* m = Get(v, key);
@@ -94,13 +87,13 @@ AudioSide ParseSide(const Value& v, int defaultForm) {
         dev.id = dev.name;
         dev.form = static_cast<int>(Num(d, "form", defaultForm));
         dev.isDefault = Bool(d, "default");
-        for (const Value& app : Items(d, "apps")) dev.apps.push_back(Wide(app.text));
+        for (const Value& app : Items(d, "apps")) dev.apps.push_back(FromUtf8(app.text));
         side.devices.push_back(std::move(dev));
     }
     side.name = Str(v, "name", side.devices.empty() ? L"" : side.devices.front().name.c_str());
     side.selectedId = Str(v, "selected");
     side.connected = side.ready = true;
-    for (const Value& a : Items(v, "inUseBy")) side.inUseBy.push_back(Wide(a.text));
+    for (const Value& a : Items(v, "inUseBy")) side.inUseBy.push_back(FromUtf8(a.text));
     side.level = static_cast<float>(Num(v, "level"));
     side.muted = Bool(v, "muted");
     return side;
@@ -317,14 +310,14 @@ void App::OnShootCommand(const std::string& text) {
     } else if (cmd == L"camera") {
         shootCamera_.valid = true;
         shootCamera_.devices.clear();
-        for (const Value& d : Items(v, "devices")) shootCamera_.devices.push_back({Wide(d.text), true, L""});
+        for (const Value& d : Items(v, "devices")) shootCamera_.devices.push_back({FromUtf8(d.text), true, L""});
         shootCamera_.inUseBy.clear();
-        for (const Value& a : Items(v, "inUseBy")) shootCamera_.inUseBy.push_back(Wide(a.text));
+        for (const Value& a : Items(v, "inUseBy")) shootCamera_.inUseBy.push_back(FromUtf8(a.text));
         shootCamera_.blocked = Bool(v, "blocked");
         for (auto& island : islands_) island->SetCamera(shootCamera_);
     } else if (cmd == L"shelf") {
         shootShelf_.items.clear();
-        for (const Value& f : Items(v, "files")) ShootShelfAdd(Wide(f.text));
+        for (const Value& f : Items(v, "files")) ShootShelfAdd(FromUtf8(f.text));
         for (auto& island : islands_) island->SetShelf(shootShelf_);
     } else if (cmd == L"media") {                                 // rewind the real player so every take starts alike
         if (media_) {

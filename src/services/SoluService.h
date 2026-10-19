@@ -95,6 +95,7 @@ public:
     void SetPaused(bool paused);                 // privacy: the microphone closes and Solu goes quiet until resumed
     void LookAtRegion(RECT screen, const std::wstring& mode);   // quick capture: explain / translate this part of the screen
     void SendContext(const std::string& json);   // what Eflow knows that Solu may use (notification counts)
+    void ReminderReply(const std::wstring& said);   // the answer to a "reminder" event: what Solu should say
     std::vector<SoluAppEvent> TakeAppEvents();          // answers a typed question (tests / future text box)
     SoluSnapshot Snapshot();
     std::vector<PermissionRequest> Approvals();

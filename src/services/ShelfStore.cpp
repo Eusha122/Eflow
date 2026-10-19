@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
 
@@ -18,22 +19,6 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr size_t kMaxItems = 60;
-
-std::string U8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(std::max(n, 0)), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring W(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring out(static_cast<size_t>(std::max(n, 0)), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
-    return out;
-}
 
 std::wstring StorePath() {
     PWSTR p = nullptr;
@@ -126,7 +111,7 @@ void ShelfStore::Load() {
                 for (json::Value& v : list->items)
                     if (v.type == json::Value::Type::String && !v.text.empty() && items_.size() < kMaxItems) {
                         ShelfItem item;
-                        item.path = W(v.text);
+                        item.path = FromUtf8(v.text);
                         Describe(item);
                         if (!item.missing) items_.push_back(std::move(item));       // a file that is gone is not brought back
                     }
@@ -138,7 +123,7 @@ void ShelfStore::Load() {
 void ShelfStore::Save() {
     json::Value root = json::Value::Object();
     json::Value list = json::Value::Array();
-    for (const ShelfItem& i : items_) list.items.push_back(json::Value::String(U8(i.path)));
+    for (const ShelfItem& i : items_) list.items.push_back(json::Value::String(ToUtf8(i.path)));
     root.Member("items") = std::move(list);
     std::ofstream file(StorePath(), std::ios::binary | std::ios::trunc);
     if (file) file << json::Write(root);

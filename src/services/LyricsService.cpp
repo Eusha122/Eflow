@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Messages.h"
 
@@ -20,22 +21,6 @@ namespace eflow {
 namespace {
 
 constexpr int kMissRetryDays = 7;               // a song LRCLIB did not have is asked about again after a week
-
-std::string Utf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
-}
-
-std::wstring Wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-    return w;
-}
 
 std::wstring Lower(std::wstring s) {
     for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
@@ -52,7 +37,7 @@ std::wstring Trim(const std::wstring& s) {
 std::string UrlEncode(const std::wstring& w) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
-    for (unsigned char c : Utf8(w)) {
+    for (unsigned char c : ToUtf8(w)) {
         if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += static_cast<char>(c);
         else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
     }
@@ -69,7 +54,7 @@ std::filesystem::path CacheDir() {
 
 std::wstring CacheName(const std::wstring& key) {             // FNV-1a: short, stable, no personal text in file names
     uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : Utf8(key)) { h ^= c; h *= 1099511628211ull; }
+    for (unsigned char c : ToUtf8(key)) { h ^= c; h *= 1099511628211ull; }
     wchar_t name[32];
     swprintf_s(name, L"%016llx.lrc", static_cast<unsigned long long>(h));
     return name;
@@ -93,7 +78,7 @@ std::vector<LyricLine> ParseLrc(const std::string& lrc) {
             pos = close + 1;
         }
         if (stamps.empty()) continue;
-        std::wstring text = Trim(Wide(raw.substr(pos)));
+        std::wstring text = Trim(FromUtf8(raw.substr(pos)));
         if (text == L"♪") text.clear();                        // LRCLIB marks breaks with a note
         for (double at : stamps) lines.push_back({at, text});
     }
@@ -110,7 +95,7 @@ std::string HttpGet(const std::string& path, int& status) {
     if (!session) return body;
     WinHttpSetTimeouts(session, 4000, 4000, 6000, 6000);
     HINTERNET connect = WinHttpConnect(session, L"lrclib.net", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    const std::wstring wpath = Wide(path);
+    const std::wstring wpath = FromUtf8(path);
     HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", wpath.c_str(), nullptr, WINHTTP_NO_REFERER,
                                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
     if (request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
@@ -261,7 +246,7 @@ void LyricsService::Run() {
                     for (const LyricLine& l : lines) {
                         char stamp[24];
                         sprintf_s(stamp, "[%02d:%05.2f]", static_cast<int>(l.at) / 60, std::fmod(l.at, 60.0));
-                        out << stamp << Utf8(l.text) << "\n";
+                        out << stamp << ToUtf8(l.text) << "\n";
                     }
                 } else {
                     out << "#missing " << static_cast<long long>(std::time(nullptr)) << "\n";

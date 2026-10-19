@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
 #include "services/HookInstaller.h"
@@ -24,22 +25,6 @@ constexpr size_t kBigLine = 300 * 1024;              // lines this long are tool
 constexpr ULONGLONG kRecentMs = 6ull * 3600 * 1000;  // sessions older than this are not shown
 constexpr ULONGLONG kStaleMs = 4ull * 60 * 1000;     // "working" with no news for this long: probably stopped
 constexpr ULONGLONG kStaleToolMs = 20ull * 60 * 1000;
-
-std::wstring W(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring out(static_cast<size_t>(std::max(n, 0)), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
-    return out;
-}
-
-std::string U8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(std::max(n, 0)), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), n, nullptr, nullptr);
-    return out;
-}
 
 Value* Get(const Value* v, const char* key) {
     if (!v || v->type != Value::Type::Object) return nullptr;
@@ -99,7 +84,7 @@ std::wstring Trim(std::wstring s, size_t max) {
 
 std::wstring Base(const std::string& path) {
     const size_t cut = path.find_last_of("\\/");
-    return W(cut == std::string::npos ? path : path.substr(cut + 1));
+    return FromUtf8(cut == std::string::npos ? path : path.substr(cut + 1));
 }
 
 std::wstring ProjectOf(const std::wstring& cwd) {
@@ -113,27 +98,27 @@ std::wstring ProjectOf(const std::wstring& cwd) {
 // A Claude tool call, as a short verb and subject: Bash {command} -> ("Run", "npm test").
 void DescribeClaudeTool(const std::string& name, const Value* input, std::wstring& verb, std::wstring& subject) {
     auto field = [&](const char* k) { return Str(input, k); };
-    verb = W(name);
+    verb = FromUtf8(name);
     if (name == "Bash" || name == "PowerShell") {
         verb = L"Run";
         std::string c = field("command");
-        subject = Trim(W(c), 90);
+        subject = Trim(FromUtf8(c), 90);
     } else if (name == "Read") { verb = L"Read"; subject = Base(field("file_path"));
     } else if (name == "Edit" || name == "MultiEdit" || name == "NotebookEdit") { verb = L"Edit"; subject = Base(field("file_path"));
     } else if (name == "Write") { verb = L"Write"; subject = Base(field("file_path"));
-    } else if (name == "Grep" || name == "Glob") { verb = L"Search"; subject = Trim(W(field("pattern")), 70);
-    } else if (name == "WebSearch") { verb = L"Search the web"; subject = Trim(W(field("query")), 70);
-    } else if (name == "WebFetch") { verb = L"Open page"; subject = Trim(W(field("url")), 70);
-    } else if (name == "Task" || name == "Agent") { verb = L"Sub-agent"; subject = Trim(W(field("description")), 70);
+    } else if (name == "Grep" || name == "Glob") { verb = L"Search"; subject = Trim(FromUtf8(field("pattern")), 70);
+    } else if (name == "WebSearch") { verb = L"Search the web"; subject = Trim(FromUtf8(field("query")), 70);
+    } else if (name == "WebFetch") { verb = L"Open page"; subject = Trim(FromUtf8(field("url")), 70);
+    } else if (name == "Task" || name == "Agent") { verb = L"Sub-agent"; subject = Trim(FromUtf8(field("description")), 70);
     } else if (name == "TodoWrite") { verb = L"Update plan"; subject.clear();
     } else if (name.rfind("mcp__", 0) == 0) {
         const size_t last = name.rfind("__");
-        verb = W(name.substr(last + 2));
+        verb = FromUtf8(name.substr(last + 2));
         std::replace(verb.begin(), verb.end(), L'_', L' ');
-        subject = W(name.substr(5, name.find("__", 5) - 5));
+        subject = FromUtf8(name.substr(5, name.find("__", 5) - 5));
     } else {
         for (const char* k : {"description", "command", "file_path", "pattern", "query", "prompt"})
-            if (!field(k).empty()) { subject = Trim(W(field(k)), 70); break; }
+            if (!field(k).empty()) { subject = Trim(FromUtf8(field(k)), 70); break; }
     }
 }
 
@@ -434,12 +419,12 @@ void AgentMonitor::IngestClaude(Tracked& t, const std::string& line) {
     if (!time) time = NowMs();
     if (type == "ai-title") {
         const std::string title = Str(&root, "aiTitle");
-        if (!title.empty()) s.title = W(title);
+        if (!title.empty()) s.title = FromUtf8(title);
         return;
     }
     if (type != "user" && type != "assistant") return;
-    NoteCwd(s, W(Str(&root, "cwd")));
-    if (const std::string id = Str(&root, "sessionId"); !id.empty()) s.id = W(id);
+    NoteCwd(s, FromUtf8(Str(&root, "cwd")));
+    if (const std::string id = Str(&root, "sessionId"); !id.empty()) s.id = FromUtf8(id);
     s.lastActivity = std::max(s.lastActivity, time);
     if (Flag(&root, "isSidechain")) {                 // a sub-agent is busy: the main session is working too
         t.turnDone = false;
@@ -471,8 +456,8 @@ void AgentMonitor::IngestClaude(Tracked& t, const std::string& line) {
                 t.turnDone = true;
                 push({AgentEvent::Kind::Failed, L"Stopped by you", L"", false, "", 0});
             } else {
-                if (s.title.empty()) s.title = Trim(W(text), 60);
-                push({AgentEvent::Kind::You, Trim(W(text), 400), L"", false, "", 0});
+                if (s.title.empty()) s.title = Trim(FromUtf8(text), 60);
+                push({AgentEvent::Kind::You, Trim(FromUtf8(text), 400), L"", false, "", 0});
                 t.turnDone = false;
             }
         }
@@ -486,8 +471,8 @@ void AgentMonitor::IngestClaude(Tracked& t, const std::string& line) {
         if (bt == "text") {
             const std::string text = Str(&block, "text");
             if (text.find_first_not_of(" \r\n\t") == std::string::npos) continue;
-            push({AgentEvent::Kind::Said, Trim(W(text), 1800), L"", false, "", 0});
-            s.lastReply = Trim(W(text), 1800);
+            push({AgentEvent::Kind::Said, Trim(FromUtf8(text), 1800), L"", false, "", 0});
+            s.lastReply = Trim(FromUtf8(text), 1800);
         } else if (bt == "tool_use") {
             AgentEvent e;
             e.kind = AgentEvent::Kind::Tool;
@@ -517,9 +502,9 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
         if (s.feed.size() > kFeedMax) s.feed.erase(s.feed.begin(), s.feed.begin() + (s.feed.size() - kFeedMax));
     };
     if (type == "session_meta" || type == "turn_context") {
-        NoteCwd(s, W(Str(p, "cwd")));
+        NoteCwd(s, FromUtf8(Str(p, "cwd")));
         if (type == "session_meta")
-            if (const std::string id = Str(p, "id"); !id.empty()) s.id = W(id);
+            if (const std::string id = Str(p, "id"); !id.empty()) s.id = FromUtf8(id);
         return;
     }
     s.lastActivity = std::max(s.lastActivity, time);
@@ -531,7 +516,7 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
             const size_t mark = text.find("## My request for Codex:");
             if (mark != std::string::npos) text = text.substr(mark + 24);
             if (!IsNoise(text.substr(0, 1)) || text.find_first_not_of(" \r\n\t") != std::string::npos) {
-                const std::wstring w = Trim(W(text), 400);
+                const std::wstring w = Trim(FromUtf8(text), 400);
                 if (!w.empty()) {
                     if (s.title.empty()) s.title = Trim(w, 60);
                     push({AgentEvent::Kind::You, w, L"", false, "", 0});
@@ -539,7 +524,7 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
             }
             t.turnDone = false;
         } else if (pt == "agent_message") {
-            const std::wstring w = Trim(W(Str(p, "message")), 1800);
+            const std::wstring w = Trim(FromUtf8(Str(p, "message")), 1800);
             if (!w.empty()) {
                 push({AgentEvent::Kind::Said, w, L"", false, "", 0});
                 s.lastReply = w;
@@ -547,7 +532,7 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
         } else if (pt == "task_complete") {
             for (AgentEvent& e : s.feed) e.running = false;
             t.turnDone = true;
-            const std::wstring last = Trim(W(Str(p, "last_agent_message")), 1800);
+            const std::wstring last = Trim(FromUtf8(Str(p, "last_agent_message")), 1800);
             if (!last.empty()) s.lastReply = last;
             if (s.feed.empty() || s.feed.back().kind != AgentEvent::Kind::Done) push({AgentEvent::Kind::Done, L"Finished", L"", false, "", 0});
         } else if (pt == "turn_aborted") {
@@ -555,9 +540,9 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
             t.turnDone = true;
             push({AgentEvent::Kind::Failed, L"Stopped", L"", false, "", 0});
         } else if (pt == "error") {
-            push({AgentEvent::Kind::Failed, Trim(W(Str(p, "message")), 200), L"", false, "", 0});
+            push({AgentEvent::Kind::Failed, Trim(FromUtf8(Str(p, "message")), 200), L"", false, "", 0});
         } else if (pt == "web_search_end") {
-            push({AgentEvent::Kind::Tool, L"Search the web", Trim(W(Str(p, "query")), 70), false, "", 0});
+            push({AgentEvent::Kind::Tool, L"Search the web", Trim(FromUtf8(Str(p, "query")), 70), false, "", 0});
         }
         return;
     }
@@ -590,8 +575,8 @@ void AgentMonitor::IngestCodex(Tracked& t, const std::string& line) {
                 if (q != std::string::npos) cmd = JsString(input, q);
             }
             if (cmd.empty() && !input.empty() && input.rfind("const", 0) != 0) cmd = input;
-            if (cmd.empty() && name != "exec") e.text = W(name);
-            e.detail = Trim(W(cmd), 90);
+            if (cmd.empty() && name != "exec") e.text = FromUtf8(name);
+            e.detail = Trim(FromUtf8(cmd), 90);
         }
         push(std::move(e));
         t.turnDone = false;
@@ -772,7 +757,7 @@ bool AgentMonitor::Send(AgentTool tool, const std::wstring& sessionId, const std
             const std::wstring settings = AppData() + L"\\agent-claude-settings.json";
             wchar_t exe[MAX_PATH * 2];
             const DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-            std::string hook = U8(fs::path(std::wstring(exe, n)).parent_path().wstring() + L"\\eflow-hook.exe");
+            std::string hook = ToUtf8(fs::path(std::wstring(exe, n)).parent_path().wstring() + L"\\eflow-hook.exe");
             std::string escaped;
             for (char c : hook) escaped += c == '\\' ? std::string("/") : std::string(1, c);
             std::ofstream out(settings, std::ios::binary | std::ios::trunc);
@@ -838,16 +823,16 @@ bool AgentMonitor::Send(AgentTool tool, const std::wstring& sessionId, const std
             const size_t nl = text.find_last_of('\n', text.size() > 1 ? text.size() - 2 : 0);
             Value v;
             std::string err;
-            if (json::Parse(nl == std::string::npos ? text : text.substr(nl + 1), v, err) && Flag(&v, "is_error")) problem = Trim(W(Str(&v, "result")), 160);
+            if (json::Parse(nl == std::string::npos ? text : text.substr(nl + 1), v, err) && Flag(&v, "is_error")) problem = Trim(FromUtf8(Str(&v, "result")), 160);
         } else {
             size_t at = text.rfind("\"error\"");
             if (at == std::string::npos) at = text.rfind("turn.failed");
             if (at != std::string::npos) {
                 const size_t m = text.find("\"message\":\"", at);
-                if (m != std::string::npos) problem = Trim(W(JsString(text, m + 10)), 160);
+                if (m != std::string::npos) problem = Trim(FromUtf8(JsString(text, m + 10)), 160);
             }
         }
-        if (problem.empty() && code != 0) problem = Trim(W(text.substr(text.size() > 200 ? text.size() - 200 : 0)), 160);
+        if (problem.empty() && code != 0) problem = Trim(FromUtf8(text.substr(text.size() > 200 ? text.size() - 200 : 0)), 160);
         std::lock_guard lock(mutex_);
         sending_ = false;
         if (!problem.empty()) {

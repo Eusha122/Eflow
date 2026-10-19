@@ -18,7 +18,10 @@
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 #include "core/Activity.h"
+#include "core/When.h"
+#include "island/TextField.h"
 #include "services/AgentMonitor.h"
+#include "services/ReminderStore.h"
 #include "services/ShelfStore.h"
 
 #include <oleidl.h>
@@ -31,7 +34,7 @@ namespace eflow {
 
 class MascotRenderer;
 
-inline constexpr int kSectionCount = 6;   // Music, Notifications, Solu AI, Agents, System, Shelf
+inline constexpr int kSectionCount = 7;   // Music, Notifications, Solu AI, Agents, System, Shelf, Reminders
 inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 
 // One island per monitor: a borderless, always-on-top, non-activating popup whose pixels come from a
@@ -40,7 +43,7 @@ inline constexpr int kMetricCount = 4;    // CPU, GPU, Memory, Network
 // inside the open panel and only renders while the panel is visible.
 class IslandWindow {
 public:
-    enum class Section { Music, Notifications, Solu, Ai, System, Shelf };
+    enum class Section { Music, Notifications, Solu, Ai, System, Shelf, Reminders };
 
     // `owner` receives WM_APP_DEVICE_LOST when the GPU device goes away. `mascotAsset`/`mascotRenderer`
     // may be null, in which case the island runs without the mascot.
@@ -97,6 +100,17 @@ public:
         shelfAdd_ = std::move(add);
         shelfRemove_ = std::move(remove);
         shelfClear_ = std::move(clear);
+    }
+    // Reminders and alarms: the list, a box to type a new one ("Codeforces contest 4 March 8pm"), and the card that shows
+    // while one rings (the island opens for it). The view is in RemindersView.cpp.
+    void SetReminders(const ReminderSnapshot& snapshot);
+    void SetReminderHandlers(std::function<void(const std::wstring&, const std::wstring&, int64_t, Repeat, int)> add,
+                             std::function<void(uint32_t)> remove, std::function<void(uint32_t)> dismiss,
+                             std::function<void(uint32_t, int)> snooze) {
+        reminderAdd_ = std::move(add);
+        reminderRemove_ = std::move(remove);
+        reminderDismiss_ = std::move(dismiss);
+        reminderSnooze_ = std::move(snooze);
     }
     DWORD ShelfDragEnter(IDataObject* data);                     // called by the OLE drop target (in IslandWindow.cpp)
     DWORD ShelfDragOver();
@@ -277,7 +291,7 @@ private:
     Spring w_, h_;
     Spring tabX_, tabW_;                         // selection pill
     std::array<float, kSectionCount> tabHover_{};            // 0..1 hover highlight per tab
-    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0, 0, 0}; // cross-fade between sections
+    std::array<float, kSectionCount> sectionAlpha_{1, 0, 0, 0, 0, 0, 0}; // cross-fade between sections
     Section section_ = Section::Music;
 
     MediaInfo media_;
@@ -346,10 +360,9 @@ private:
     std::wstring agentSession_;                  // chosen session id ("" = the best one of that agent)
     bool agentAuto_ = true;                      // follow whichever agent is working until the user picks one
     int agentScroll_ = 0;                        // feed rows scrolled up from the newest
-    std::wstring prompt_, agentError_;
-    size_t caret_ = 0;
-    float promptScroll_ = 0;
-    bool promptFocus_ = false, newChat_ = false;
+    TextField prompt_;
+    std::wstring agentError_;
+    bool newChat_ = false;
     HWND prevForeground_ = nullptr;
     uint32_t agentVersionSeen_ = 0;
     std::function<bool(AgentTool, const std::wstring&, const std::wstring&, const std::wstring&, bool, std::wstring&)> agentSend_;
@@ -368,13 +381,36 @@ private:
     void AutoPickAgent();
     void DrawAgents(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
     ID2D1Bitmap1* Logo(AgentTool tool);
-    void FocusPrompt();
-    void BlurPrompt(bool restoreWindow);
     void SendPrompt();
-    void PromptInsert(const std::wstring& text);
+    void UpdateAgentTimer();
+    // ---- typing (the Agents prompt, the reminder boxes): one box has the keyboard at a time
+    TextField* field_ = nullptr;                 // the box being typed in (null: none; the island never takes focus then)
+    void Focus(TextField& field);                // the island takes the keyboard (it lets go of it again in Blur)
+    void Blur(bool restoreWindow);               // restoreWindow: back to the window the user was in
     void OnKey(WPARAM vk);
     void OnChar(wchar_t ch);
-    void UpdateAgentTimer();
+    void DrawField(ID2D1DeviceContext* dc, TextField& field, const D2D1_RECT_F& box, const wchar_t* hint, float a, float right = 0);
+    // ---- Reminders tab (RemindersView.cpp)
+    ReminderSnapshot reminders_;
+    TextField reminderWhat_, reminderNote_;
+    bool reminderFlip_ = false;                  // the user flipped the guessed AM / PM of what is typed
+    int reminderScroll_ = 0;                     // first visible row
+    std::function<void(const std::wstring&, const std::wstring&, int64_t, Repeat, int)> reminderAdd_;
+    std::function<void(uint32_t)> reminderRemove_, reminderDismiss_;
+    std::function<void(uint32_t, int)> reminderSnooze_;
+    struct RemindersLayout {
+        D2D1_RECT_F list, what, note, add, preview;
+        int rows = 0;                            // rows that fit in the list
+    };
+    RemindersLayout RemindersGeometry(const D2D1_RECT_F& island) const;
+    When ReminderPreview() const;                // what is typed, understood
+    void DrawReminders(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);
+    void DrawAlarm(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alpha);   // the card while a reminder rings
+    std::array<D2D1_RECT_F, 2> AlarmButtons(const D2D1_RECT_F& island) const;   // snooze, dismiss
+    int RemindersHit(D2D1_POINT_2F p, const D2D1_RECT_F& island) const;
+    void RemindersClick(int id);
+    bool RemindersKey(WPARAM vk);                // Enter / Tab / Esc in a reminder box (true when handled)
+    void AddReminder();
     std::vector<Activity> activities_;
     std::function<void(const std::wstring&)> activityDismiss_;
     bool Live() const { return !activities_.empty(); }

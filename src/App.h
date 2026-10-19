@@ -12,6 +12,8 @@
 #include "island/IslandWindow.h"
 #include "services/ActivityMonitor.h"
 #include "services/AgentMonitor.h"
+#include "services/AlarmSound.h"
+#include "services/ReminderStore.h"
 #include "services/ShelfStore.h"
 #include "mascot/MascotRenderer.h"
 #include "services/AudioDevices.h"
@@ -53,6 +55,10 @@ private:
     void OnActivityChanged();
     void OnAgentsChanged();
     void OnShelfChanged();
+    // Reminders: Tick rings what is due and sets the timer for the next one; the islands and Solu get the new list.
+    void TickReminders();
+    void OnRemindersChanged();
+    void OnSoluReminder(const SoluAppEvent& e);  // "remind me ..." said to Solu
     void PushActivities();
     void OnSoluAppEvent(const SoluAppEvent& e);
     void StartFocus(int focusMinutes, int breakMinutes, int rounds);
@@ -108,6 +114,10 @@ private:
     std::unique_ptr<ActivityMonitor> activityMonitor_;
     std::unique_ptr<AgentMonitor> agents_;
     std::unique_ptr<ShelfStore> shelf_;
+    ReminderStore reminders_;
+    AlarmSound alarm_;
+    std::vector<Alert> ringingWas_;                    // what was ringing at the last update (a new one starts the chime)
+    std::string lastReminderContext_;
     AgentSnapshot agentSnap_;
     std::map<std::wstring, AgentStatus> agentWas_;     // per session: to notice when one finishes
     uint64_t hookCheck_ = 0;
