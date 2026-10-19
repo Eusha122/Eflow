@@ -21,6 +21,7 @@
 #include "services/HookInstaller.h"
 #include "services/LyricsService.h"
 #include "services/MediaService.h"
+#include "services/NotificationMutes.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 #include "services/SoluService.h"
@@ -140,6 +141,9 @@ private:
     int busyChecks_ = 0;
     int nudgeSeq_ = 0;
     uint64_t seenArrivals_ = 0;                        // arrivals already announced to the islands
+    std::set<uint32_t> seenNotifications_;             // ids in the last snapshot: the rest are new
+    NotificationMutes mutes_;                          // apps that may not open the island (Settings > Notifications)
+    void PushMutes();
     bool shoot_ = false;                               // filming: the islands show only the director's content
     uint32_t shootSeq_ = 0;
     NotificationSnapshot shootNotifs_;

@@ -15,6 +15,7 @@
 #include "services/CameraService.h"
 #include "services/LyricsService.h"
 #include "services/MediaService.h"
+#include "services/NotificationMutes.h"
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 #include "core/Activity.h"
@@ -59,7 +60,7 @@ public:
     void SetSuppressed(bool suppressed);   // hidden while a fullscreen app owns this monitor
     void SetMascotState(Mascot::State state);    // test/debug entry point mapping onto the setters below
     void SetMusicPlaying(bool playing);          // ambient mood; never opens or closes the panel
-    void OnNotification();                       // opens briefly on the Notifications tab
+    void OnNotification(int count);              // `count` new notifications: opens briefly on the Notifications tab
     void SetPermissionPending(bool pending);     // opens on the AI tab and stays open until resolved
     void SetMedia(const MediaInfo& media);
     void SetLyrics(const Lyrics& lyrics);
@@ -70,6 +71,12 @@ public:
     void SetNotificationHandlers(std::function<void(uint32_t)> dismiss, std::function<void()> clearAll) {
         dismissHandler_ = std::move(dismiss);
         clearAllHandler_ = std::move(clearAll);
+    }
+    // Settings > Notifications: which apps may open the island (muted ones stay in the list, quietly).
+    void SetNotificationMutes(const NotificationMutes& mutes);
+    void SetMuteHandlers(std::function<void(const std::wstring&, const std::wstring&, bool)> app, std::function<void(bool)> all) {
+        muteApp_ = std::move(app);
+        muteAll_ = std::move(all);
     }
     void SetSystem(const SystemSnapshot& snapshot);
     void SetAudio(const AudioSnapshot& snapshot);
@@ -84,7 +91,6 @@ public:
     }
     void SetCamera(const CameraSnapshot& snapshot);
     void SetSolu(const SoluSnapshot& snapshot);
-    void PostClickAway();                        // called by the global mouse hook
     void ShowForSolu();
     // The Agents tab: Claude Code and Codex sessions, what they are doing, and a box to send them a prompt.
     void SetAgents(const AgentSnapshot& snapshot);
@@ -162,6 +168,12 @@ private:
     D2D1_POINT_2F ToDip(POINT clientPx) const { return {clientPx.x / scale_, clientPx.y / scale_}; }
     bool CursorInIsland(float slackDip) const;
     void SetHitRegion(bool full);                // clickable shape: whole window, or just the idle bar
+    // Closed, the island is click-through (every click reaches the app below; a middle click opens it, see MouseHook.h).
+    // Only while a mouse button is held does the closed bar take the pointer, so files dragged onto it can be dropped.
+    void ApplyClickThrough();
+    void UpdateMouseHook();                      // tell the hook where the closed island is
+    bool holding_ = false;                       // a button has been held for a moment: maybe files are being carried
+    ULONGLONG wheelOpenedAt_ = 0;                // when a wheel turn opened the island
 
     // state machine
     void Expand();
@@ -169,6 +181,15 @@ private:
     void OnMouseMove(D2D1_POINT_2F p);
     int HitTest(D2D1_POINT_2F p) const;          // -1 = none, 0..2 = tabs, kHitPrev.. = media controls
     void OnClick(int id);
+    // Something wants a tab (a notification, an approval card, a ringing reminder). While the user is using the island
+    // (pointer on it, a menu open, typing) it never switches under them: the tab gets a dot instead, and a card that needs
+    // them (important) is shown as soon as they let go. Returns true when it switched now.
+    bool UserBusy() const;
+    bool Present(Section section, bool important);
+    void ShowPending();                          // the user let go: show the card that waited
+    int pendingSection_ = -1;                    // a card waiting for the user to finish (-1: none)
+    std::array<int, kSectionCount> tabDot_{};    // per tab: 0 nothing, 1 something new, 2 something needs you
+    int notifBadge_ = 0;                         // "+3" on the Notifications tab: arrived while the user was on another tab
 
     // animation + rendering
     void Animate();                              // queue a frame now (vsync-paced while the panel moves)
@@ -220,7 +241,7 @@ private:
     void ToggleTest(int side);
     void StopRunningTest();
     int MenuRows(int side) const {
-        if (side == 3) return 5;    // Settings: the options, or Solu's voices
+        if (side == 3) return settingsPage_ == 0 ? 6 : settingsPage_ == 1 ? 5 : 1 + static_cast<int>(MuteRows().size());
         return std::max<int>(1, static_cast<int>(side == 2 ? camera_.devices.size() : VoiceSide(side).devices.size()));
     }
     int MaxRows(int side) const;                 // rows visible at once
@@ -281,7 +302,6 @@ private:
     bool frameQueued_ = false;
     bool panelMoving_ = false;
     bool tracking_ = false;
-    bool openPending_ = false;
     bool fullRegion_ = false;
     bool autoClosePending_ = false;              // opened itself for a notification; closes on a timer
     int hover_ = -1;
@@ -413,14 +433,31 @@ private:
     void AddReminder();
     std::vector<Activity> activities_;
     std::function<void(const std::wstring&)> activityDismiss_;
-    bool Live() const { return !activities_.empty(); }
+    // ---- the closed island: it shows one thing (a "glimpse"); anything else going on waits as a small icon at its right
+    // end. Activities come first (an agent at work, a download, the focus timer), then the music. A middle click on an icon
+    // brings that one to the front; the one shown takes its place among the icons.
+    struct Glimpse {
+        std::wstring id;                         // an activity's id, or L"music"
+        std::wstring glyph;
+        D2D1_COLOR_F tint;
+    };
+    std::vector<Glimpse> Glimpses() const;
+    std::wstring FrontGlimpse() const;           // the one shown: the user's pick while it lasts, else the first
+    const Activity* FrontActivity() const;       // ... when that is an activity
+    std::vector<D2D1_RECT_F> GlimpseIcons(const D2D1_RECT_F& pill) const;   // the others' icons, right to left
+    float GlimpseIconsW() const;
+    void DrawGlimpseIcons(ID2D1DeviceContext* dc, const D2D1_RECT_F& pill, float a);
+    void OnMiddleClick(POINT screen);            // on an icon: to the front; on the close mark: dismiss; elsewhere: open
+    bool MusicGlimpse() const;                   // music is playing (with lyrics or not)
+    std::wstring frontGlimpse_;
+    bool Live() const { return FrontActivity() != nullptr; }   // the closed island shows an activity
     bool LyricsReady() const;                    // synced lyrics for the playing song, and lyrics are on
-    bool LyricsPill() const;                     // the closed island shows the line being sung
+    bool MusicPill() const;                      // the closed island shows the music (the line being sung, or the song)
     float LyricShift() const;                    // how much lower the Music tab's bar and buttons sit for the lyric lines
     void UpdateLyricLine();                      // which line is being sung now; schedules the next change
     void RefreshCollapsed();                     // the closed island's size follows what it shows
     D2D1_POINT_2F LyricsButton(const D2D1_RECT_F& island) const;
-    void DrawLyricPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float alpha);
+    void DrawMusicPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float alpha);
     void DrawLyricLines(ID2D1DeviceContext* dc, float x0, float x1, float top, float alpha);
     float CollapsedW() const;                    // the idle bar, or the wider live pill
     float CollapsedH() const;
@@ -428,7 +465,11 @@ private:
     void DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float alpha);               // the user picked a tab / menu during a conversation: the live view steps aside until it ends
     std::function<void()> soluTalk_, soluStop_;
     std::function<void(const std::wstring&)> soluVoice_;
-    int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices
+    int settingsPage_ = 0;                       // the gear's menu: 0 the options, 1 Solu's voices, 2 notifications
+    NotificationMutes mutes_;
+    std::function<void(const std::wstring&, const std::wstring&, bool)> muteApp_;
+    std::function<void(bool)> muteAll_;
+    std::vector<MutedApp> MuteRows() const;      // the apps on the notifications page: the ones seen now, then muted ones
     float barLevel_ = 0, micImpulse_ = 0;        // the thin bar's voice meter and the last burst of the microphone
     float captionT_ = 0;                         // the live conversation view fades in over the tab content
     bool soluWake_ = false;                      // the island opened for Solu: stay open until it is awake
@@ -446,7 +487,7 @@ private:
     float popoverT_ = 0;                         // 0 closed .. 1 open
     int voiceScroll_ = 0;                        // first visible row of the open menu
     std::array<float, 4> audioHover_{}, audioOpen_{}, voiceLevel_{}, muteAnim_{1, 1, 1, 1};
-    std::array<float, 6> popRowHover_{};
+    std::array<float, 6> popRowHover_{};          // (the settings menu shows up to 6 rows)
     float popFooterHover_ = 0;
 
     SystemSnapshot system_;

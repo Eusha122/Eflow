@@ -102,6 +102,7 @@ int App::Run() {
     shelf_ = std::make_unique<ShelfStore>(msgWnd_, WM_APP_SHELF);
     shelf_->Load();
     reminders_.Load();
+    mutes_ = NotificationMutes::Load();
     agents_ = std::make_unique<AgentMonitor>(msgWnd_, WM_APP_AGENTS);
     agents_->Start();
     activityMonitor_ = std::make_unique<ActivityMonitor>(msgWnd_, WM_APP_ACTIVITY);
@@ -285,6 +286,12 @@ void App::OnSoluHotkey() {
 // ---- live activities -------------------------------------------------------------------------
 
 // ---- agents (Claude Code and Codex) ------------------------------------------------------------
+
+void App::PushMutes() {
+    mutes_.Save();                                                   // (the banners follow in OnNotificationsChanged)
+    for (auto& island : islands_) island->SetNotificationMutes(mutes_);
+    OnNotificationsChanged();                                        // Solu's view of the notifications follows
+}
 
 // ---- reminders ---------------------------------------------------------------------------------
 
@@ -692,12 +699,23 @@ void App::OnNotificationsChanged() {
     Log("notifications: access=%d count=%zu arrivals=%llu", static_cast<int>(snap.access), snap.items.size(),
         static_cast<unsigned long long>(snap.arrivals));
 #endif
-    const bool arrived = snap.arrivals > seenArrivals_;
+    // Something new arrived from an app that is not muted: only then does the island open for it.
+    int arrived = 0;
+    if (snap.arrivals > seenArrivals_)
+        for (const auto& n : snap.items)
+            if (!seenNotifications_.count(n.id) && !mutes_.IsMuted(n.appId, n.app)) ++arrived;
+    std::vector<MutedApp> senders;                                 // Windows' banners follow the mute list (a new app too)
+    for (const auto& n : snap.items) senders.push_back({n.appId.empty() ? n.app : n.appId, n.app});
+    if (mutes_.SyncBanners(senders)) mutes_.Save();
     seenArrivals_ = snap.arrivals;
+    seenNotifications_.clear();
+    for (const auto& n : snap.items) seenNotifications_.insert(n.id);
     if (solu_) {                                                     // what Solu may mention: who wrote, in which app (not the text)
         std::string json = "{\"notifications\":[";
-        for (size_t i = 0; i < snap.items.size() && i < 30; ++i) {
+        size_t told = 0;
+        for (size_t i = 0; i < snap.items.size() && told < 30; ++i) {
             const auto& n = snap.items[i];
+            if (mutes_.IsMuted(n.appId, n.app)) continue;                // muted apps are not Solu's business either
             auto esc = [](const std::wstring& w) {
                 std::string out;
                 for (wchar_t c : w) {
@@ -712,13 +730,13 @@ void App::OnNotificationsChanged() {
                 }
                 return out;
             };
-            json += std::string(i ? "," : "") + "{\"app\":\"" + esc(n.app) + "\",\"title\":\"" + esc(n.title) + "\"}";
+            json += std::string(told++ ? "," : "") + "{\"app\":\"" + esc(n.app) + "\",\"title\":\"" + esc(n.title) + "\"}";
         }
         solu_->SendContext(json + "]}");
     }
     for (auto& island : islands_) {
         island->SetNotifications(snap);
-        if (arrived) island->OnNotification();
+        if (arrived) island->OnNotification(arrived);
     }
 }
 
@@ -842,6 +860,17 @@ void App::BuildIslands() {
             dismissed_.insert(id);
             PushActivities();
         });
+        island->SetNotificationMutes(mutes_);
+        island->SetMuteHandlers(
+            [this](const std::wstring& id, const std::wstring& name, bool muted) {
+                mutes_.Set(id, name, muted);
+                PushMutes();
+            },
+            [this](bool all) {
+                mutes_.all = all;
+                ++mutes_.version;
+                PushMutes();
+            });
         island->SetReminderHandlers(
             [this](const std::wstring& title, const std::wstring& note, int64_t at, Repeat repeat, int early) {
                 reminders_.Add(title, note, at, repeat, early);

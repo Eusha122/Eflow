@@ -163,7 +163,7 @@ void App::OnShootCommand(const std::string& text) {
         const bool quiet = Bool(v, "quiet");                      // set up the list without the island opening
         for (auto& island : islands_) {
             island->SetNotifications(shootNotifs_);
-            if (!quiet) island->OnNotification();
+            if (!quiet) island->OnNotification(1);
         }
     } else if (cmd == L"notifs_clear") {
         shootNotifs_.items.clear();

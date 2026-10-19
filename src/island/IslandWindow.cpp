@@ -17,6 +17,7 @@
 #include "core/Log.h"
 #include "core/Messages.h"
 #include "island/IslandStyle.h"
+#include "island/MouseHook.h"
 #include "mascot/MascotRenderer.h"
 
 namespace eflow {
@@ -35,9 +36,8 @@ constexpr float kLeaveSlack = 6.0f;        // how far outside the panel still co
 constexpr float kTabPadX = 14.0f;
 constexpr float kTabGap = 4.0f;
 
-constexpr UINT kOpenDelayMs = 70;          // hover intent before opening
 constexpr UINT kCloseDelayMs = 380;        // grace period before closing
-constexpr UINT_PTR kOpenTimer = 1;
+constexpr UINT_PTR kHoldTimer = 1;         // a button held this long over the closed bar: it may be carrying files
 constexpr UINT_PTR kCloseTimer = 2;
 constexpr UINT_PTR kMascotTimer = 3;       // paces mascot frames while the panel is open and still
 constexpr UINT_PTR kAutoCloseTimer = 4;    // closes a panel that opened itself for a notification
@@ -65,7 +65,7 @@ constexpr int kHitOutput = 16;                              // the "playing on" 
 constexpr int kHitSeek = 13;                                // the progress bar (click or drag to seek)
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
 constexpr int kHitRing = 40;                                 // + metric index (System tab)
-constexpr float kMaxPanelH = 344.0f;                        // tallest the panel grows (Solu's menu)
+constexpr float kMaxPanelH = 384.0f;                        // tallest the panel grows (the settings menu)
 constexpr int kHitAudioButton = 60;                         // + 0 microphone, + 1 speaker (round buttons on the tab row)
 constexpr int kHitPopAway = 71;                             // anywhere else on the island while a menu is open: dismiss
 constexpr int kHitPopRow = 1000;                            // + visible row in the open device menu
@@ -368,8 +368,7 @@ private:
 };
 
 IslandWindow::~IslandWindow() {
-    captionsYielded_ = true;
-    UpdateClickAway();
+    if (hwnd_) mousehook::Unregister(hwnd_);
     if (watching_ && systemWatchHandler_) systemWatchHandler_(false);
     if (audioWatching_ && audioWatchHandler_) audioWatchHandler_(false);
     if (hwnd_) {
@@ -396,9 +395,11 @@ bool IslandWindow::Create() {
         if (!RegisterClassExW(&wc)) return false;
         registered = true;
     }
-    hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+    hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                             kClassName, L"Eflow", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, this);
     if (!hwnd_) return false;
+    SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);              // (layered only so it can be click-through: fully opaque)
+    mousehook::Register(hwnd_);
 
     UpdateScale();
     Place();
@@ -531,31 +532,11 @@ std::string IslandWindow::DebugLayout() const {
 }
 #endif
 
-namespace {
-std::vector<IslandWindow*> g_clickAway;
-HHOOK g_clickHook = nullptr;
-LRESULT CALLBACK ClickAwayProc(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN))
-        for (IslandWindow* w : g_clickAway) w->PostClickAway();
-    return CallNextHookEx(g_clickHook, code, wp, lp);
-}
-} // namespace
-
-void IslandWindow::PostClickAway() {
-    if (hwnd_) PostMessageW(hwnd_, WM_APP_CLICKAWAY, 0, 0);
-}
-
 void IslandWindow::UpdateClickAway() {
     const bool want = CaptionsShown() && expanded_;
     if (want == clickAwayOn_) return;
     clickAwayOn_ = want;
-    if (want) {
-        g_clickAway.push_back(this);
-        if (!g_clickHook) g_clickHook = SetWindowsHookExW(WH_MOUSE_LL, ClickAwayProc, GetModuleHandleW(nullptr), 0);
-    } else {
-        g_clickAway.erase(std::remove(g_clickAway.begin(), g_clickAway.end(), this), g_clickAway.end());
-        if (g_clickAway.empty() && g_clickHook) UnhookWindowsHookEx(g_clickHook), g_clickHook = nullptr;
-    }
+    UpdateMouseHook();
 }
 
 bool IslandWindow::Pinned() const {
@@ -623,6 +604,28 @@ void IslandWindow::SetHitRegion(bool full) {
         rgn = CreateRectRgn(px(x0), 0, px(x1), px(y1));
     }
     SetWindowRgn(hwnd_, rgn, TRUE);   // the system owns rgn from here
+    ApplyClickThrough();
+    UpdateMouseHook();
+}
+
+void IslandWindow::ApplyClickThrough() {
+    const bool through = !expanded_ && !holding_;
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    const LONG_PTR want = through ? (ex | WS_EX_TRANSPARENT) : (ex & ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT));
+    if (want != ex) SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, want);
+}
+
+void IslandWindow::UpdateMouseHook() {
+    RECT closed{};                                               // where a middle click opens it (screen pixels)
+    if (!expanded_ && !suppressed_) {
+        RECT wr;
+        GetWindowRect(hwnd_, &wr);
+        const float winW = pxW_ / scale_;
+        const float x0 = (winW - CollapsedW()) / 2.0f - kHotSlackX, x1 = x0 + CollapsedW() + 2 * kHotSlackX;
+        const float y1 = TopInset() + CollapsedH() + kHotSlackY;
+        closed = {wr.left + std::lround(x0 * scale_), wr.top, wr.left + std::lround(x1 * scale_), wr.top + std::lround(y1 * scale_)};
+    }
+    mousehook::Update(hwnd_, closed, clickAwayOn_);
 }
 
 // ---- state machine ---------------------------------------------------------------------------
@@ -674,9 +677,9 @@ void IslandWindow::SetSuppressed(bool suppressed) {
     if (suppressed) {
         KillTimer(hwnd_, kMascotTimer);       // nothing renders while hidden
         KillTimer(hwnd_, kAutoCloseTimer);
-        KillTimer(hwnd_, kOpenTimer);
+        KillTimer(hwnd_, kHoldTimer);
         KillTimer(hwnd_, kCloseTimer);
-        openPending_ = false;
+        holding_ = false;
         expanded_ = false;
         hover_ = pressed_ = -1;
         w_.Snap(kCollapsedW);
@@ -690,6 +693,7 @@ void IslandWindow::SetSuppressed(bool suppressed) {
     } else {
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        UpdateMouseHook();
         Animate();
     }
 }
@@ -719,7 +723,7 @@ void IslandWindow::UpdateAudioWatch() {
     if (audioWatchHandler_) audioWatchHandler_(want);
 }
 
-int IslandWindow::MaxRows(int side) const { return side == 3 ? 5 : kPopMaxRows; }
+int IslandWindow::MaxRows(int side) const { return side == 3 ? 6 : kPopMaxRows; }
 
 void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     const bool wasActive = SoluActive();
@@ -747,7 +751,7 @@ void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     ApplyHeightTarget();                                               // the live view grows with the answer
     UpdateClickAway();
     RefreshCollapsed();                                                // a conversation hides the lyric pill, and brings it back after
-    if (!expanded_ && (Live() || LyricsPill()) && solu_.state == before) return;   // a pill covers the bar: its voice meter is not on screen
+    if (!expanded_ && (Live() || MusicPill()) && solu_.state == before) return;   // a pill covers the bar: its voice meter is not on screen
     Animate();
 }
 
@@ -864,7 +868,7 @@ void IslandWindow::SetMascotState(Mascot::State state) {
     if (!mascot_) return;
     using State = Mascot::State;
     switch (state) {
-    case State::Notify: OnNotification(); break;
+    case State::Notify: OnNotification(1); break;
     case State::Permission: SetPermissionPending(true); break;
     case State::Music: SetMusicPlaying(true); break;
     default:
@@ -880,14 +884,18 @@ void IslandWindow::SetMusicPlaying(bool playing) {
     Animate();
 }
 
-void IslandWindow::OnNotification() {
+void IslandWindow::OnNotification(int count) {
     // Worth attention: open by itself on the Notifications tab, and close again after a moment unless
     // the user has the pointer on it (or it was already open).
     if (mascot_) mascot_->Notify();
     notifScrollTarget_ = 0;                      // newest first: show it
     if (!reminders_.ringing.empty()) return;     // a ringing reminder keeps the island until it is answered
     const bool wasOpen = expanded_;
-    OnClick(static_cast<int>(Section::Notifications));
+    if (!Present(Section::Notifications, false)) {        // the user is busy on another tab: only "+1" on its tab
+        notifBadge_ += count;
+        tabDot_[static_cast<size_t>(Section::Notifications)] = 0;   // (the count takes the dot's place)
+        return;
+    }
     Expand();
     KillTimer(hwnd_, kAutoCloseTimer);
     autoClosePending_ = !wasOpen;
@@ -913,6 +921,7 @@ void IslandWindow::SetNotifications(const NotificationSnapshot& snapshot) {
 }
 
 void IslandWindow::OnWheel(int delta) {
+    if (GetTickCount64() - wheelOpenedAt_ < 400) return;          // still the turn of the wheel that opened the island
     if (expanded_ && section_ == Section::System && hover_ >= kHitRing && hover_ < kHitRing + kMetricCount) {
         CyclePage(hover_ - kHitRing, delta > 0 ? -1 : +1);          // wheel flips the ring under the pointer
         return;
@@ -954,9 +963,9 @@ void IslandWindow::SetPermissionPending(bool pending) {
     mascot_->SetPermissionPending(pending);
     if (pending && !was) {                       // open on the AI tab and stay until it is answered
         const bool yielded = captionsYielded_;
-        OnClick(static_cast<int>(Section::Ai));
+        const bool now = Present(Section::Ai, true);
         captionsYielded_ = yielded;              // not the user's choice: the live view comes back after the card
-        Expand();
+        if (now) Expand();
         KillTimer(hwnd_, kAutoCloseTimer);
         autoClosePending_ = false;
     } else if (!pending && was && expanded_ && !CursorInIsland(kLeaveSlack)) {
@@ -966,17 +975,6 @@ void IslandWindow::SetPermissionPending(bool pending) {
 }
 
 int IslandWindow::HitTest(D2D1_POINT_2F p) const {
-    if (!expanded_ && Live()) {                                       // the live pill: its close button, or open the island
-        const D2D1_RECT_F r = IslandRect();
-        const D2D1_RECT_F x = LiveClose(r);
-        if (activities_.front().dismissible && p.x >= x.left && p.x <= x.right && p.y >= x.top - 4 && p.y <= x.bottom + 4) return kHitLiveClose;
-        if (p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom + 4) return kHitLive;
-        return -1;
-    }
-    if (!expanded_ && LyricsPill()) {                               // the lyric pill: open on the Music tab
-        const D2D1_RECT_F r = IslandRect();
-        return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom + 4 ? kHitLive : -1;
-    }
     if (!expanded_ || h_.x < kExpandedH * 0.85f) return -1;
     const D2D1_RECT_F island = IslandRect();
     const auto tabs = TabRects(island);
@@ -994,7 +992,7 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
             if (inside(D2D1::RectF(g.card.left, g.rowsTop + i * kPopRowH, g.card.right, g.rowsTop + (i + 1) * kPopRowH)))
                 return kHitPopRow + i;
         if (inside(g.footer)) return kHitPopFooter;
-        if (popover_ == 3 && settingsPage_ == 1 && inside(D2D1::RectF(g.card.left - 6, g.card.top - 4, g.card.left + 130, g.card.top + 28))) return kHitPopBack;
+        if (popover_ == 3 && settingsPage_ != 0 && inside(D2D1::RectF(g.card.left - 6, g.card.top - 4, g.card.left + 130, g.card.top + 28))) return kHitPopBack;
         if (popover_ < 2) {
             const D2D1_RECT_F pill = TestPill(g, popover_);
             if (inside(D2D1::RectF(pill.left - 4, pill.top - 4, pill.right + 4, pill.bottom + 4))) return kHitPopTest;
@@ -1114,13 +1112,7 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
         TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
         tracking_ = TrackMouseEvent(&tme) != FALSE;
     }
-    if (!expanded_) {
-        if (!openPending_) {
-            openPending_ = true;
-            SetTimer(hwnd_, kOpenTimer, Live() || LyricsPill() ? 800 : kOpenDelayMs, nullptr);   // a live pill can be clicked (or closed) first
-        }
-        return;
-    }
+    if (!expanded_) return;                      // (closed it only takes the pointer while files are carried over it)
     const bool inside = InsideZone(p, kLeaveSlack);
     if (inside) KillTimer(hwnd_, kCloseTimer);
     else if (!Pinned()) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
@@ -1131,6 +1123,31 @@ void IslandWindow::OnMouseMove(D2D1_POINT_2F p) {
         hover_ = shown;
         Animate();
     }
+}
+
+bool IslandWindow::UserBusy() const {
+    return expanded_ && (field_ || popover_ >= 0 || CursorInIsland(kLeaveSlack));
+}
+
+bool IslandWindow::Present(Section section, bool important) {
+    const int id = static_cast<int>(section);
+    if (!UserBusy() || section_ == section) {
+        OnClick(id);
+        return true;
+    }
+    tabDot_[static_cast<size_t>(id)] = std::max(tabDot_[static_cast<size_t>(id)], important ? 2 : 1);
+    if (important) pendingSection_ = id;
+    Animate();
+    return false;
+}
+
+void IslandWindow::ShowPending() {
+    if (pendingSection_ < 0) return;
+    const int id = pendingSection_;
+    pendingSection_ = -1;
+    const bool stillNeeded = (id == static_cast<int>(Section::Ai) && !permissions_.empty()) ||
+                             (id == static_cast<int>(Section::Reminders) && !reminders_.ringing.empty());
+    if (stillNeeded) OnClick(id);                // (answered meanwhile, by voice or in the tool: nothing to show)
 }
 
 void IslandWindow::OnClick(int id) {
@@ -1220,20 +1237,20 @@ void IslandWindow::OnClick(int id) {
         return;
     }
     if (id == kHitLive) {
-        KillTimer(hwnd_, kOpenTimer);
-        openPending_ = false;
-        const bool agent = !activities_.empty() && activities_.front().id.rfind(L"agent", 0) == 0;
-        const bool task = !activities_.empty() && activities_.front().id.rfind(L"task", 0) == 0;
+        const std::wstring front = FrontGlimpse();
+        const bool agent = front.rfind(L"agent", 0) == 0, task = front.rfind(L"task", 0) == 0;
         Expand();
         if (agent) OnClick(static_cast<int>(Section::Ai));             // a pill about an agent: straight to its tab
         else if (task) OnClick(static_cast<int>(Section::Solu));       // a task: the Solu tab lists it
-        else if (activities_.empty()) OnClick(static_cast<int>(Section::Music));   // the lyric pill: the song
+        else if (front == L"music") OnClick(static_cast<int>(Section::Music));   // the music pill: the song
         return;
     }
     if (id == kHitLiveClose) {
-        if (!activities_.empty()) {
-            const std::wstring gone = activities_.front().id;
-            std::vector<Activity> rest(activities_.begin() + 1, activities_.end());
+        if (const Activity* shown = FrontActivity()) {
+            const std::wstring gone = shown->id;
+            std::vector<Activity> rest;
+            for (const Activity& a : activities_)
+                if (a.id != gone) rest.push_back(a);
             if (activityDismiss_) activityDismiss_(gone);
             SetActivities(rest);
         }
@@ -1280,7 +1297,7 @@ void IslandWindow::OnClick(int id) {
         ShellExecuteW(nullptr, L"open", page, nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
-    if (id >= kHitPopRow && id < kHitPopRow + 5) {
+    if (id >= kHitPopRow && id < kHitPopRow + 6) {
         if (popover_ == 3) {                                       // the gear's menu
             const int k = voiceScroll_ + (id - kHitPopRow);
             if (settingsPage_ == 0) {
@@ -1296,11 +1313,23 @@ void IslandWindow::OnClick(int id) {
                 } else if (k == 3) {                               // screen help
                     solu_.screen = !solu_.screen;
                     if (soluScreen_) soluScreen_(solu_.screen);
-                } else if (k == 4) {                               // Voice >
-                    settingsPage_ = 1;
+                } else if (k == 4 || k == 5) {                     // Voice >, Notifications >
+                    settingsPage_ = k == 4 ? 1 : 2;
                     voiceScroll_ = 0;
                     ApplyHeightTarget();
                 }
+            } else if (settingsPage_ == 2) {                       // mute all, or one app
+                const auto apps = MuteRows();
+                if (k == 0) {
+                    mutes_.all = !mutes_.all;
+                    if (muteAll_) muteAll_(mutes_.all);
+                } else if (!mutes_.all && k - 1 < static_cast<int>(apps.size())) {   // (with "Mute all" on, every app already is)
+                    const MutedApp& app = apps[static_cast<size_t>(k - 1)];
+                    const bool muted = !mutes_.IsMuted(app.id, app.name);
+                    mutes_.Set(app.id, app.name, muted);
+                    if (muteApp_) muteApp_(app.id, app.name, muted);
+                }
+                ApplyHeightTarget();
             } else if (k >= 0 && k < 5) {                          // a voice: Solu says hello in it
                 solu_.voice = kSoluVoices[k].id;
                 if (soluVoice_) soluVoice_(solu_.voice);
@@ -1413,6 +1442,9 @@ void IslandWindow::OnClick(int id) {
     const bool boxOnTab = (field_ == &prompt_ && id == static_cast<int>(Section::Ai)) ||
                           ((field_ == &reminderWhat_ || field_ == &reminderNote_) && id == static_cast<int>(Section::Reminders));
     if (field_ && !boxOnTab) Blur(false);        // the box being typed in is not on the new tab
+    tabDot_[static_cast<size_t>(id)] = 0;
+    if (id == static_cast<int>(Section::Notifications)) notifBadge_ = 0;
+    if (pendingSection_ == id) pendingSection_ = -1;
     section_ = static_cast<Section>(id);
     popover_ = -1;                               // switching tabs dismisses an open menu
     UpdateSystemWatch();
@@ -1659,10 +1691,11 @@ void IslandWindow::DrawIsland(ID2D1DeviceContext* dc, float progress) {
 
     if (progress < 0.34f) {
         const float liveIn = Clamp01((h_.x - kCollapsedH) / (kLiveH - kCollapsedH));
+        if ((Live() || MusicPill()) && !expanded_) DrawGlimpseIcons(dc, r, (1.0f - progress / 0.34f));
         if (Live() && !expanded_) DrawLive(dc, r, liveIn * (1.0f - progress / 0.34f));
         else if (Live() && expanded_ && progress < 0.2f) DrawLive(dc, r, (1.0f - progress / 0.2f) * liveIn);
-        else if (LyricsPill() && !expanded_)
-            DrawLyricPill(dc, r, Clamp01((h_.x - kCollapsedH) / (kLyricPillH - kCollapsedH)) * (1.0f - progress / 0.34f));
+        else if (MusicPill() && !expanded_)
+            DrawMusicPill(dc, r, Clamp01((h_.x - kCollapsedH) / (kLyricPillH - kCollapsedH)) * (1.0f - progress / 0.34f));
         else DrawSoluBar(dc, r, 1.0f - progress / 0.34f);                        // Solu is awake: the bar shows it
     }
     const float contentAlpha = SmoothStep(0.62f, 1.0f, progress);
@@ -1714,6 +1747,19 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             }
         }
         DrawText(dc, kTabLabels[i], tabFont, labelRect, WithAlpha(kText, std::min(a, 0.96f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (i == static_cast<int>(Section::Notifications) && notifBadge_ > 0) {   // "+3": new while the user was elsewhere
+            const std::wstring count = L"+" + std::to_wstring(std::min(notifBadge_, 99));
+            IDWriteTextFormat* badgeFont = gfx_.Text(9.5f, DWRITE_FONT_WEIGHT_BOLD);
+            const float w = std::max(16.0f, std::ceil(gfx_.MeasureWidth(count.c_str(), badgeFont)) + 8.0f);
+            const D2D1_RECT_F badge = D2D1::RectF(tabs[i].right - w + 4.0f, tabs[i].top - 3.0f, tabs[i].right + 4.0f, tabs[i].top + 11.0f);
+            brush_->SetColor(D2D1::ColorF(kRed.r, kRed.g, kRed.b, alpha));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{badge, 7.0f, 7.0f}, brush_.Get());
+            DrawText(dc, count.c_str(), badgeFont, badge, D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else if (tabDot_[static_cast<size_t>(i)] > 0) {               // news on a tab the user is not on
+            const D2D1_COLOR_F c = tabDot_[static_cast<size_t>(i)] == 2 ? kAmber : kAccent;
+            brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, alpha));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tabs[i].right - 6.0f, tabs[i].top + 7.0f), 3.2f, 3.2f), brush_.Get());
+        }
     }
 
     DrawAudioButtons(dc, base, alpha);
@@ -2018,6 +2064,23 @@ void IslandWindow::SetPermissions(const std::vector<PermissionRequest>& pending)
     Animate();
 }
 
+void IslandWindow::SetNotificationMutes(const NotificationMutes& mutes) {
+    mutes_ = mutes;
+    if (popover_ == 3 && settingsPage_ == 2) ApplyHeightTarget();
+    Animate();
+}
+
+std::vector<MutedApp> IslandWindow::MuteRows() const {
+    std::vector<MutedApp> rows;
+    auto add = [&](const std::wstring& id, const std::wstring& name) {
+        const std::wstring key = id.empty() ? name : id;
+        if (!name.empty() && std::none_of(rows.begin(), rows.end(), [&](const MutedApp& r) { return r.id == key; })) rows.push_back({key, name});
+    };
+    for (const NotificationItem& n : notifications_.items) add(n.appId, n.app);   // the apps sending notifications now
+    for (const MutedApp& a : mutes_.apps) add(a.id, a.name);                      // ... and the muted ones, even when quiet
+    return rows;
+}
+
 void IslandWindow::SetReminders(const ReminderSnapshot& snapshot) {
     const bool newAlert = std::any_of(snapshot.ringing.begin(), snapshot.ringing.end(), [&](const Alert& a) {
         return std::none_of(reminders_.ringing.begin(), reminders_.ringing.end(), [&](const Alert& b) { return a.id == b.id && a.early == b.early; });
@@ -2026,8 +2089,7 @@ void IslandWindow::SetReminders(const ReminderSnapshot& snapshot) {
     reminders_ = snapshot;
     if (newAlert && !suppressed_) {                              // something rings: open on it, and keep it open until answered
         if (mascot_) mascot_->Notify();
-        Expand();
-        OnClick(static_cast<int>(Section::Reminders));
+        if (Present(Section::Reminders, true)) Expand();
         KillTimer(hwnd_, kAutoCloseTimer);
         autoClosePending_ = false;
     }
@@ -2760,11 +2822,11 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
     const D2D1_RECT_F area = g.card;
     IDWriteTextFormat* quiet = gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
     IDWriteTextFormat* mainFont = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
-    const bool voicePage = settingsPage_ == 1;
+    const bool voicePage = settingsPage_ == 1, mutePage = settingsPage_ == 2;
     const float headTop = area.top;
 
     // ---- header ----------------------------------------------------------------------------------------------
-    if (voicePage) {                                                // "< Voice": tap to go back
+    if (voicePage || mutePage) {                                    // "< Voice" / "< Notifications": tap to go back
         const float hot = hover_ == kHitPopBack ? 1.0f : 0.0f;
         if (hot > 0) {
             brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.075f * a));
@@ -2773,7 +2835,7 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
         brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.78f + 0.2f * hot) * a));
         dc->DrawLine(D2D1::Point2F(area.left + 10, headTop + 7), D2D1::Point2F(area.left + 4, headTop + 13), brush_.Get(), 1.9f, roundStroke_.Get());
         dc->DrawLine(D2D1::Point2F(area.left + 4, headTop + 13), D2D1::Point2F(area.left + 10, headTop + 19), brush_.Get(), 1.9f, roundStroke_.Get());
-        DrawText(dc, L"Voice", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(area.left + 22, headTop, area.left + 130, headTop + 26),
+        DrawText(dc, mutePage ? L"Notifications" : L"Voice", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(area.left + 22, headTop, area.left + 160, headTop + 26),
                  WithAlpha(kText, a));
     } else {
         DrawText(dc, L"", gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(area.left, headTop, area.left + 24, headTop + 26),
@@ -2811,7 +2873,7 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
         }
         std::wstring title, note;
         bool isSwitch = false, on = false, chevron = false, selected = false;
-        if (!voicePage) {
+        if (!voicePage && !mutePage) {                             // the options page
             switch (k) {
             case 0: title = L"Solu AI"; note = soluNote; isSwitch = true; on = solu_.enabled; break;
             case 1: title = L"Live captions"; note = L"Show the conversation on the island"; isSwitch = true; on = solu_.captions; break;
@@ -2819,8 +2881,28 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
                     isSwitch = true; on = solu_.headphones; break;
             case 3: title = L"Screen help"; note = solu_.screen ? L"Say \u201cSolu, look at this\u201d \u00B7 only when you ask" : L"Solu will not look at your screen";
                     isSwitch = true; on = solu_.screen; break;
-            default: title = L"Voice"; note = voiceName + L" · " + voiceNote; chevron = true; break;
+            case 4: title = L"Voice"; note = voiceName + L" · " + voiceNote; chevron = true; break;
+            default: {
+                title = L"Notifications";
+                const size_t muted = mutes_.apps.size();
+                note = mutes_.all ? L"All muted · they stay in the list" : muted == 0 ? L"Every app can open the island"
+                       : muted == 1 ? mutes_.apps.front().name + L" is muted" : std::to_wstring(muted) + L" apps are muted";
+                chevron = true;
+                break;
             }
+            }
+        } else if (mutePage) {
+            if (k == 0) {
+                title = L"Mute all";
+                note = mutes_.all ? L"Nothing opens the island" : L"New notifications open the island";
+                on = mutes_.all;
+            } else {
+                const MutedApp app = MuteRows()[static_cast<size_t>(k - 1)];
+                title = app.name;
+                on = mutes_.IsMuted(app.id, app.name);
+                note = mutes_.all ? L"Muted with all" : on ? L"Muted · stays in the list" : L"Opens the island";
+            }
+            isSwitch = true;
         } else {
             title = kSoluVoices[k].name;
             note = kSoluVoices[k].description;
@@ -2866,7 +2948,7 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
     // ---- footer: only a hint -----------------------------------------------------------------------------------------
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * a));
     dc->DrawLine(D2D1::Point2F(area.left, g.footer.top - 0.5f), D2D1::Point2F(area.right, g.footer.top - 0.5f), brush_.Get(), 1.0f);
-    DrawText(dc, voicePage ? L"Solu says hello in the voice you pick" : L"Say “Solu” to talk · or press Ctrl+Alt+Space", quiet, g.footer,
+    DrawText(dc, voicePage ? L"Solu says hello in the voice you pick" : mutePage ? L"Muted apps stay quiet on Windows and the island" : L"Say “Solu” to talk · or press Ctrl+Alt+Space", quiet, g.footer,
              WithAlpha(kTextDim, 1.15f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
@@ -3565,6 +3647,7 @@ void IslandWindow::Blur(bool restoreWindow) {
     if (restoreWindow && prevForeground_ && IsWindow(prevForeground_)) SetForegroundWindow(prevForeground_);   // back to what you were doing
     prevForeground_ = nullptr;
     UpdateAgentTimer();
+    if (!CursorInIsland(kLeaveSlack)) ShowPending();
     if (expanded_ && !Pinned() && !CursorInIsland(kLeaveSlack)) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
     Animate();
 }
@@ -3658,15 +3741,17 @@ void IslandWindow::SendPrompt() {
 // ---- live pills ------------------------------------------------------------------------------
 
 float IslandWindow::CollapsedW() const {
-    if (Live()) return kLiveW;
-    if (LyricsPill()) {                                              // as wide as the line, within reason
-        const std::wstring& text = lyrics_.lines[static_cast<size_t>(lyricLine_)].text;
+    if (Live()) return kLiveW + GlimpseIconsW();
+    if (MusicPill()) {                                              // as wide as the line (or the song's name), within reason
+        const bool sung = LyricsReady() && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size());
+        const std::wstring text = sung ? lyrics_.lines[static_cast<size_t>(lyricLine_)].text
+                                       : media_.title + (media_.artist.empty() ? L"" : L"  ·  " + media_.artist);
         const float w = text.empty() ? 40.0f : gfx_.MeasureWidth(text.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD));
-        return std::clamp(std::ceil(w) + 64.0f, 150.0f, 460.0f);
+        return std::clamp(std::ceil(w) + 64.0f, 150.0f, 460.0f) + GlimpseIconsW();
     }
     return kCollapsedW;
 }
-float IslandWindow::CollapsedH() const { return Live() ? kLiveH : LyricsPill() ? kLyricPillH : kCollapsedH; }
+float IslandWindow::CollapsedH() const { return Live() ? kLiveH : MusicPill() ? kLyricPillH : kCollapsedH; }
 
 // ---- live lyrics ----------------------------------------------------------------------------
 
@@ -3674,9 +3759,101 @@ bool IslandWindow::LyricsReady() const {
     return lyricsOn_ && media_.hasSession && lyrics_.status == Lyrics::Status::Found && !lyrics_.lines.empty();
 }
 
-bool IslandWindow::LyricsPill() const {
-    return LyricsReady() && media_.playing && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size()) && !Live() &&
-           !SoluActive();                                            // a conversation, a live pill: they come first
+bool IslandWindow::MusicGlimpse() const {
+    if (!media_.hasSession || !media_.playing || SoluActive()) return false;   // (a conversation hides it)
+    return !LyricsReady() || (lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size()));   // lyrics: once the singing starts
+}
+
+bool IslandWindow::MusicPill() const { return MusicGlimpse() && FrontGlimpse() == L"music"; }
+
+std::vector<IslandWindow::Glimpse> IslandWindow::Glimpses() const {
+    std::vector<Glimpse> all;
+    for (const Activity& a : activities_) {
+        const D2D1_COLOR_F tint = D2D1::ColorF(((a.accent >> 16) & 0xFF) / 255.0f, ((a.accent >> 8) & 0xFF) / 255.0f, (a.accent & 0xFF) / 255.0f, 1.0f);
+        all.push_back({a.id, a.glyph, tint});
+    }
+    if (MusicGlimpse()) all.push_back({L"music", L"\uEC4F", kGreen});
+    return all;
+}
+
+std::wstring IslandWindow::FrontGlimpse() const {
+    const auto all = Glimpses();
+    if (all.empty()) return {};
+    for (const Glimpse& g : all)
+        if (g.id == frontGlimpse_) return g.id;                  // the user's pick, while it lasts
+    return all.front().id;
+}
+
+const Activity* IslandWindow::FrontActivity() const {
+    const std::wstring front = FrontGlimpse();
+    for (const Activity& a : activities_)
+        if (a.id == front) return &a;
+    return nullptr;
+}
+
+float IslandWindow::GlimpseIconsW() const {
+    const size_t others = std::min<size_t>(3, Glimpses().size() > 0 ? Glimpses().size() - 1 : 0);
+    return others ? others * 24.0f + 6.0f : 0.0f;
+}
+
+std::vector<D2D1_RECT_F> IslandWindow::GlimpseIcons(const D2D1_RECT_F& pill) const {
+    std::vector<D2D1_RECT_F> out;
+    const float cy = (pill.top + pill.bottom) / 2;
+    const size_t others = static_cast<size_t>(GlimpseIconsW() / 24.0f);
+    for (size_t i = 0; i < others; ++i) {
+        const float right = pill.right - 10.0f - i * 24.0f;
+        out.push_back(D2D1::RectF(right - 20.0f, cy - 10.0f, right, cy + 10.0f));
+    }
+    return out;
+}
+
+void IslandWindow::DrawGlimpseIcons(ID2D1DeviceContext* dc, const D2D1_RECT_F& pill, float a) {
+    const auto all = Glimpses();
+    const auto icons = GlimpseIcons(pill);
+    if (icons.empty()) return;
+    const std::wstring front = FrontGlimpse();
+    size_t k = 0;
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.12f * a));                // a hairline between what is shown and the rest
+    const float sepX = icons.back().left - 5.0f, cy = (pill.top + pill.bottom) / 2;
+    dc->DrawLine(D2D1::Point2F(sepX, cy - 7), D2D1::Point2F(sepX, cy + 7), brush_.Get(), 1.0f);
+    for (const Glimpse& g : all) {
+        if (g.id == front) continue;
+        if (k >= icons.size()) break;
+        const D2D1_RECT_F& r = icons[k++];
+        brush_->SetColor(D2D1::ColorF(g.tint.r, g.tint.g, g.tint.b, 0.20f * a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F((r.left + r.right) / 2, (r.top + r.bottom) / 2), 9.5f, 9.5f), brush_.Get());
+        DrawText(dc, g.glyph.c_str(), gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), r, WithAlpha(g.tint, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+}
+
+void IslandWindow::OnMiddleClick(POINT screen) {
+    POINT cl = screen;
+    ScreenToClient(hwnd_, &cl);
+    const D2D1_POINT_2F p = ToDip(cl);
+    const D2D1_RECT_F r = IslandRect();
+    auto in = [&](const D2D1_RECT_F& b) { return p.x >= b.left - 2 && p.x <= b.right + 2 && p.y >= b.top - 6 && p.y <= b.bottom + 6; };
+    const auto icons = GlimpseIcons(r);
+    size_t k = 0;
+    const std::wstring front = FrontGlimpse();
+    for (const Glimpse& g : Glimpses()) {                          // an icon: that one to the front
+        if (g.id == front) continue;
+        if (k >= icons.size()) break;
+        if (in(icons[k++])) {
+            frontGlimpse_ = g.id;
+            SetActivities(activities_);                          // (the pill's shape and timers follow)
+            return;
+        }
+    }
+    if (const Activity* shown = FrontActivity(); shown && shown->dismissible) {
+        D2D1_RECT_F x = LiveClose(r);
+        x.right -= GlimpseIconsW(), x.left -= GlimpseIconsW();
+        if (in(x)) {                                             // its close mark: dismiss it
+            OnClick(kHitLiveClose);
+            return;
+        }
+    }
+    if (Live() || MusicPill()) OnClick(kHitLive);                  // the pill: open on what it is about
+    else Expand();
 }
 
 float IslandWindow::LyricShift() const { return section_ == Section::Music && LyricsReady() ? kLyricLinesH : 0.0f; }
@@ -3733,8 +3910,18 @@ D2D1_POINT_2F IslandWindow::LyricsButton(const D2D1_RECT_F& island) const {
 }
 
 // The closed island as a slim pill with the line being sung: the old line drifts up and out, the new one rises in.
-void IslandWindow::DrawLyricPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float a) {
-    if (a < 0.01f || lyricLine_ < 0) return;
+void IslandWindow::DrawMusicPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, float a) {
+    if (a < 0.01f) return;
+    const D2D1_RECT_F r = D2D1::RectF(full.left, full.top, full.right - GlimpseIconsW(), full.bottom);   // (the icons sit at the end)
+    if (!LyricsReady() || lyricLine_ < 0) {                          // no lyrics: the song itself
+        const float cy = (r.top + r.bottom) / 2;
+        DrawText(dc, L"\u266A", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left + 10, cy - 9, r.left + 28, cy + 9),
+                 WithAlpha(kGreen, 0.9f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        const std::wstring song = media_.title + (media_.artist.empty() ? L"" : L"  ·  " + media_.artist);
+        DrawText(dc, song.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.left + 30, r.top, r.right - 16, r.bottom),
+                 WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
     const float cy = (r.top + r.bottom) / 2;
     DrawText(dc, L"\u266A", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left + 10, cy - 9, r.left + 28, cy + 9),
              WithAlpha(kGreen, 0.9f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -3791,26 +3978,22 @@ D2D1_RECT_F IslandWindow::LiveClose(const D2D1_RECT_F& pill) const {
 }
 
 void IslandWindow::SetActivities(const std::vector<Activity>& items) {
-    const bool was = Live();
     activities_ = items;
-    if (!expanded_ && was != Live()) {                                   // grow into the pill, or shrink back to the bar
-        SetOpenSprings(w_, h_);
-        w_.target = CollapsedW();
-        h_.target = CollapsedH();
-        SetHitRegion(false);
-    }
+    RefreshCollapsed();                                                  // grow into a pill, change it, or shrink back
     KillTimer(hwnd_, kLiveTimer);
-    if (Live()) {
-        const Activity& a = activities_.front();
+    if (const Activity* shown = FrontActivity()) {
+        const Activity& a = *shown;
         const bool moving = a.kind == Activity::Kind::Progress && a.progress < 0;    // the indeterminate shimmer
         SetTimer(hwnd_, kLiveTimer, moving ? 50 : 1000, nullptr);
     }
     Animate();
 }
 
-void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float a) {
-    if (a < 0.01f || activities_.empty()) return;
-    const Activity& act = activities_.front();
+void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, float a) {
+    const Activity* shown = FrontActivity();
+    if (a < 0.01f || !shown) return;
+    const Activity& act = *shown;
+    const D2D1_RECT_F r = D2D1::RectF(full.left, full.top, full.right - GlimpseIconsW(), full.bottom);   // (the icons sit at the end)
     const D2D1_COLOR_F accent = D2D1::ColorF(((act.accent >> 16) & 0xFF) / 255.0f, ((act.accent >> 8) & 0xFF) / 255.0f,
                                              (act.accent & 0xFF) / 255.0f, 1.0f);
     const float cy = (r.top + r.bottom) / 2;
@@ -3844,12 +4027,6 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& r, float 
         DrawText(dc, pct, gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.right - 60, cy - 9, r.right - 14, cy + 9),
                  WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_TRAILING);
         right = r.right - 64;
-    }
-    if (activities_.size() > 1) {                                        // more going on: "+2"
-        const std::wstring more = L"+" + std::to_wstring(activities_.size() - 1);
-        DrawText(dc, more.c_str(), gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(right - 26, cy - 9, right, cy + 9),
-                 WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
-        right -= 30;
     }
 
     // Title and detail on one line.
@@ -4065,12 +4242,32 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_MOUSELEAVE:
         tracking_ = false;
+        if (expanded_ && !field_) ShowPending();
         if (expanded_) {
             if (!Pinned()) SetTimer(hwnd_, kCloseTimer, kCloseDelayMs, nullptr);
             if (hover_ != -1) { hover_ = -1; Animate(); }
+        }
+        return 0;
+    case WM_APP_ISLAND_MIDDLE:                                    // middle click or wheel on the closed island
+        if (wp) wheelOpenedAt_ = GetTickCount64();               // the rest of that wheel flick must not scroll the tab
+        if (!expanded_ && !suppressed_) {
+            if (!wp) OnMiddleClick(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});   // a click: it matters where
+            else if (Live() || MusicPill()) OnClick(kHitLive);         // the wheel: open on what is shown
+            else Expand();
+        }
+        return 0;
+    case WM_MBUTTONDOWN:                                          // ... and on the open island: close it
+        if (expanded_ && !Pinned()) Collapse();
+        return 0;
+    case WM_APP_ISLAND_BUTTON:                                    // a button went down or up anywhere
+        if (wp) {
+            SetTimer(hwnd_, kHoldTimer, 150, nullptr);   // (the press itself has already reached the app below)
         } else {
-            KillTimer(hwnd_, kOpenTimer);
-            openPending_ = false;
+            KillTimer(hwnd_, kHoldTimer);
+            if (holding_) {
+                holding_ = false;
+                ApplyClickThrough();
+            }
         }
         return 0;
     case WM_MOUSEWHEEL:
@@ -4142,12 +4339,12 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             Animate();                                   // the test verdict has expired: show the normal status again
             return 0;
         }
-        if (wp == kOpenTimer) {
-            KillTimer(hwnd_, kOpenTimer);
-            openPending_ = false;
-            POINT pt;
-            GetCursorPos(&pt);
-            if (WindowFromPoint(pt) == hwnd_) Expand();   // still hovering after the intent delay
+        if (wp == kHoldTimer) {
+            KillTimer(hwnd_, kHoldTimer);
+            if (!expanded_ && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {   // still held: it may be files on their way to the Shelf
+                holding_ = true;
+                ApplyClickThrough();
+            }
         } else if (wp == kCloseTimer || wp == kAutoCloseTimer) {
             KillTimer(hwnd_, wp);
             if (wp == kAutoCloseTimer) autoClosePending_ = false;

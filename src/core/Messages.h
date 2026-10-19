@@ -23,6 +23,8 @@ constexpr UINT WM_APP_CAPTURED = WM_APP + 17;    // quick capture finished (the 
 constexpr UINT WM_APP_AGENTS = WM_APP + 18;      // agent monitor -> app: Claude Code / Codex sessions changed
 constexpr UINT WM_APP_LYRICS = WM_APP + 20;      // lyrics service -> app: lyrics for the playing song arrived (or are missing)
 constexpr UINT WM_APP_SHELF = WM_APP + 19;       // shelf store -> app: the held files or an icon changed
+constexpr UINT WM_APP_ISLAND_MIDDLE = WM_APP + 21;  // mouse hook -> island: middle click on the closed island (open it)
+constexpr UINT WM_APP_ISLAND_BUTTON = WM_APP + 22;  // mouse hook -> island: left / right button down (wParam 1) or up (0)
 constexpr UINT WM_APP_CAMERA = WM_APP + 12;      // camera service -> app: cameras, who uses them, or the privacy switch changed
 
 } // namespace eflow

@@ -35,6 +35,7 @@ add_executable(eflow WIN32
     src/core/When.cpp
     src/island/IslandWindow.cpp
     src/island/CaptureOverlay.cpp
+    src/island/MouseHook.cpp
     src/island/RemindersView.cpp
     src/mascot/Mascot.cpp
     src/mascot/MascotAsset.cpp
@@ -47,6 +48,7 @@ add_executable(eflow WIN32
     src/services/LyricsService.cpp
     src/services/MediaService.cpp
     src/services/NotificationService.cpp
+    src/services/NotificationMutes.cpp
     src/services/PermissionServer.cpp
     src/services/SoluService.cpp
     src/services/ActivityMonitor.cpp
