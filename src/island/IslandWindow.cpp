@@ -79,6 +79,7 @@ constexpr int kPopMaxRows = 4;                              // rows visible at o
 constexpr int kHitLive = 90, kHitLiveClose = 91;               // the live pill on the thin bar, and its close button
 constexpr UINT_PTR kLiveTimer = 7;                          // repaints a live pill (countdown, shimmer)
 constexpr float kLiveW = 352.0f, kLiveH = 32.0f;
+constexpr uint64_t kArrivalMs = 900;                        // something plugged in: its pill's arrival animation
 constexpr int kHitAgentTool = 3000;                         // + 0 Claude, + 1 Codex
 constexpr int kHitAgentPrev = 3010, kHitAgentNext = 3011;    // flip between an agent's sessions
 constexpr int kHitAgentGo = 3030;                           // the session header: go to the window where it runs
@@ -1238,10 +1239,14 @@ void IslandWindow::OnClick(int id) {
     }
     if (id == kHitLive) {
         const std::wstring front = FrontGlimpse();
-        const bool agent = front.rfind(L"agent", 0) == 0, task = front.rfind(L"task", 0) == 0;
+        const bool agent = front.rfind(L"agent", 0) == 0, task = front.rfind(L"task", 0) == 0, shot = front.rfind(L"shot:", 0) == 0;
         Expand();
         if (agent) OnClick(static_cast<int>(Section::Ai));             // a pill about an agent: straight to its tab
         else if (task) OnClick(static_cast<int>(Section::Solu));       // a task: the Solu tab lists it
+        else if (shot) {                                               // a screenshot: on the Shelf, ready to drag anywhere
+            OnClick(static_cast<int>(Section::Shelf));
+            if (activityDismiss_) activityDismiss_(front);            // (its pill has done its job)
+        }
         else if (front == L"music") OnClick(static_cast<int>(Section::Music));   // the music pill: the song
         return;
     }
@@ -3133,6 +3138,14 @@ D2D1_RECT_F IslandWindow::ShelfCard(const D2D1_RECT_F& island, int index) const 
     return D2D1::RectF(x, area.top, x + kCardW, area.top + kCardH);
 }
 
+ID2D1Bitmap1* IslandWindow::Thumb(const ImageBGRA& image) {
+    if (auto it = thumbs_.find(&image); it != thumbs_.end()) return it->second.Get();
+    Com<ID2D1Bitmap1> bitmap;
+    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(dc_->CreateBitmap(D2D1::SizeU(image.width, image.height), image.pixels.data(), image.width * 4, &props, &bitmap))) return nullptr;
+    return thumbs_.emplace(&image, std::move(bitmap)).first->second.Get();
+}
+
 ID2D1Bitmap1* IslandWindow::ShelfBitmap(const ShelfItem& item) {
     auto it = shelfBitmaps_.find(item.path);
     if (it != shelfBitmaps_.end()) return it->second.Get();
@@ -3742,10 +3755,8 @@ void IslandWindow::SendPrompt() {
 
 float IslandWindow::CollapsedW() const {
     if (Live()) return kLiveW + GlimpseIconsW();
-    if (MusicPill()) {                                              // as wide as the line (or the song's name), within reason
-        const bool sung = LyricsReady() && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size());
-        const std::wstring text = sung ? lyrics_.lines[static_cast<size_t>(lyricLine_)].text
-                                       : media_.title + (media_.artist.empty() ? L"" : L"  ·  " + media_.artist);
+    if (MusicPill()) {                                              // as wide as the line, within reason
+        const std::wstring& text = lyrics_.lines[static_cast<size_t>(lyricLine_)].text;
         const float w = text.empty() ? 40.0f : gfx_.MeasureWidth(text.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD));
         return std::clamp(std::ceil(w) + 64.0f, 150.0f, 460.0f) + GlimpseIconsW();
     }
@@ -3761,7 +3772,7 @@ bool IslandWindow::LyricsReady() const {
 
 bool IslandWindow::MusicGlimpse() const {
     if (!media_.hasSession || !media_.playing || SoluActive()) return false;   // (a conversation hides it)
-    return !LyricsReady() || (lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size()));   // lyrics: once the singing starts
+    return LyricsReady() && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size());   // only the lyrics, once the singing starts
 }
 
 bool IslandWindow::MusicPill() const { return MusicGlimpse() && FrontGlimpse() == L"music"; }
@@ -3847,10 +3858,15 @@ void IslandWindow::OnMiddleClick(POINT screen) {
     if (const Activity* shown = FrontActivity(); shown && shown->dismissible) {
         D2D1_RECT_F x = LiveClose(r);
         x.right -= GlimpseIconsW(), x.left -= GlimpseIconsW();
-        if (in(x)) {                                             // its close mark: dismiss it
-            OnClick(kHitLiveClose);
+        if (in(x)) {                                             // its close mark: eject a drive, dismiss anything else
+            if (shown->mark == Activity::Mark::Close) OnClick(kHitLiveClose);
+            else if (mark_) mark_(*shown);
             return;
         }
+    }
+    if (const Activity* shown = FrontActivity(); shown && !shown->open.empty()) {   // a drive: open it
+        ShellExecuteW(nullptr, L"open", shown->open.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
     }
     if (Live() || MusicPill()) OnClick(kHitLive);                  // the pill: open on what it is about
     else Expand();
@@ -3913,15 +3929,7 @@ D2D1_POINT_2F IslandWindow::LyricsButton(const D2D1_RECT_F& island) const {
 void IslandWindow::DrawMusicPill(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, float a) {
     if (a < 0.01f) return;
     const D2D1_RECT_F r = D2D1::RectF(full.left, full.top, full.right - GlimpseIconsW(), full.bottom);   // (the icons sit at the end)
-    if (!LyricsReady() || lyricLine_ < 0) {                          // no lyrics: the song itself
-        const float cy = (r.top + r.bottom) / 2;
-        DrawText(dc, L"\u266A", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left + 10, cy - 9, r.left + 28, cy + 9),
-                 WithAlpha(kGreen, 0.9f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
-        const std::wstring song = media_.title + (media_.artist.empty() ? L"" : L"  ·  " + media_.artist);
-        DrawText(dc, song.c_str(), gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.left + 30, r.top, r.right - 16, r.bottom),
-                 WithAlpha(kText, a), DWRITE_TEXT_ALIGNMENT_CENTER);
-        return;
-    }
+    if (!LyricsReady() || lyricLine_ < 0) return;                    // (fading out as the lyrics end)
     const float cy = (r.top + r.bottom) / 2;
     DrawText(dc, L"\u266A", gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(r.left + 10, cy - 9, r.left + 28, cy + 9),
              WithAlpha(kGreen, 0.9f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -3979,12 +3987,16 @@ D2D1_RECT_F IslandWindow::LiveClose(const D2D1_RECT_F& pill) const {
 
 void IslandWindow::SetActivities(const std::vector<Activity>& items) {
     activities_ = items;
+    std::erase_if(thumbs_, [&](const auto& t) {                          // (the pictures of pills that are gone)
+        return std::none_of(activities_.begin(), activities_.end(), [&](const Activity& x) { return x.thumb.get() == t.first; });
+    });
     RefreshCollapsed();                                                  // grow into a pill, change it, or shrink back
     KillTimer(hwnd_, kLiveTimer);
     if (const Activity* shown = FrontActivity()) {
         const Activity& a = *shown;
         const bool moving = a.kind == Activity::Kind::Progress && a.progress < 0;    // the indeterminate shimmer
-        SetTimer(hwnd_, kLiveTimer, moving ? 50 : 1000, nullptr);
+        const bool arriving = a.startedAt && GetTickCount64() - a.startedAt < kArrivalMs;   // just plugged in: the animation
+        SetTimer(hwnd_, kLiveTimer, arriving ? 16 : moving ? 50 : 1000, nullptr);
     }
     Animate();
 }
@@ -3999,11 +4011,29 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
     const float cy = (r.top + r.bottom) / 2;
     const uint64_t now = GetTickCount64();
 
-    // Icon in a soft accent circle.
-    brush_->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.22f * a));
-    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 19, cy), 10.5f, 10.5f), brush_.Get());
-    DrawText(dc, act.glyph.c_str(), gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(r.left + 8, cy - 9, r.left + 30, cy + 9),
-             WithAlpha(accent, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    // Icon in a soft accent circle. Just plugged in: it pops in, a ring pulses out once and the words slide in.
+    const float arrive = act.startedAt ? Clamp01(static_cast<float>(now - act.startedAt) / kArrivalMs) : 1.0f;
+    const float pop = 1.0f + 0.45f * std::sin(3.14159f * std::min(1.0f, arrive * 1.6f)) * (1.0f - arrive);
+    if (arrive < 1.0f) {
+        brush_->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.55f * (1.0f - arrive) * a));
+        const float ring = 10.5f + 16.0f * SmoothStep(0.0f, 1.0f, arrive);
+        dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 19, cy), ring, ring), brush_.Get(), 1.6f);
+    }
+    if (ID2D1Bitmap1* thumb = act.thumb && !act.thumb->empty() ? Thumb(*act.thumb) : nullptr) {   // a screenshot: the picture itself
+        const float h = 22.0f * pop, w = std::min(34.0f, h * act.thumb->width / std::max(1u, act.thumb->height));
+        const D2D1_RECT_F pic = D2D1::RectF(r.left + 20 - w / 2, cy - h / 2, r.left + 20 + w / 2, cy + h / 2);
+        Com<ID2D1RoundedRectangleGeometry> clip;
+        gfx_.d2dFactory()->CreateRoundedRectangleGeometry(D2D1_ROUNDED_RECT{pic, 4, 4}, &clip);
+        dc->PushLayer(D2D1::LayerParameters1(pic, clip.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), a), nullptr);
+        dc->DrawBitmap(thumb, pic, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        dc->PopLayer();
+    } else {
+        brush_->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.22f * a));
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 19, cy), 10.5f * pop, 10.5f * pop), brush_.Get());
+        DrawText(dc, act.glyph.c_str(), gfx_.Text(11.0f * pop, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(r.left + 4, cy - 12, r.left + 34, cy + 12),
+                 WithAlpha(accent, a), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    const float slide = (1.0f - SmoothStep(0.15f, 1.0f, arrive)) * 12.0f, textA = a * SmoothStep(0.1f, 0.8f, arrive);
 
     // Right side: countdown ring, percentage, or a close button.
     float right = r.right - 12;
@@ -4019,7 +4049,12 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
         right = r.right - 96;
     } else if (act.dismissible) {
         const D2D1_RECT_F x = LiveClose(r);
-        DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (act.mark == Activity::Mark::Eject)                            // a drive: its mark ejects it
+            DrawText(dc, L"\u23CF", gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_NORMAL), x, WithAlpha(kText, 0.85f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        else if (act.mark == Activity::Mark::Save)                        // a screenshot: its mark keeps it in Pictures\Screenshots
+            DrawText(dc, L"\uE74E", gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kText, 0.85f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        else
+            DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
         right = x.left - 4;
     } else if (act.progress >= 0) {
         wchar_t pct[8];
@@ -4032,11 +4067,11 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
     // Title and detail on one line.
     IDWriteTextFormat* strong = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     const float titleW = std::ceil(gfx_.MeasureWidth(act.title.c_str(), strong));
-    const float textLeft = r.left + 36;
-    DrawText(dc, act.title.c_str(), strong, D2D1::RectF(textLeft, cy - 9, std::min(right, textLeft + titleW + 2), cy + 9), WithAlpha(kText, a));
+    const float textLeft = r.left + 36 + slide;
+    DrawText(dc, act.title.c_str(), strong, D2D1::RectF(textLeft, cy - 9, std::min(right, textLeft + titleW + 2), cy + 9), WithAlpha(kText, textA));
     if (!act.detail.empty() && textLeft + titleW + 10 < right)
         DrawText(dc, act.detail.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(textLeft + titleW + 8, cy - 9, right, cy + 9),
-                 WithAlpha(kTextDim, 1.15f * a));
+                 WithAlpha(kTextDim, 1.15f * textA));
 
     // A thin progress line along the bottom (a moving shimmer when the size is unknown).
     if (act.kind == Activity::Kind::Progress) {
@@ -4331,6 +4366,8 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == kLiveTimer) {
+            if (const Activity* a = FrontActivity(); a && a->startedAt && GetTickCount64() - a->startedAt >= kArrivalMs)
+                SetActivities(activities_);              // the arrival animation is over: back to the calm pace
             Animate();                                   // the countdown or the shimmer moves on
             return 0;
         }

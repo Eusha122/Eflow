@@ -99,6 +99,11 @@ int App::Run() {
     if (!RegisterHotKey(msgWnd_, kPrivacyHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H')) Log("Ctrl+Alt+H is taken by another program");
     if (!RegisterHotKey(msgWnd_, kCaptureHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q')) Log("Ctrl+Alt+Q is taken by another program");
     if (!RegisterHotKey(msgWnd_, kAgentsHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A')) Log("Ctrl+Alt+A is taken by another program");
+    devices_ = std::make_unique<DeviceWatcher>(msgWnd_, WM_APP_USB_DEVICE);
+    shots_ = std::make_unique<ScreenshotCatcher>(msgWnd_, WM_APP_SCREENSHOT);
+    if (!AddClipboardFormatListener(msgWnd_)) Log("screenshots: no clipboard listener (%lu)", GetLastError());
+    for (const DeviceEvent& e : DeviceWatcher::CurrentDrives()) OnDeviceEvent(e);   // plugged in before Eflow started (no animation)
+    for (Activity& d : drives_) d.startedAt = 0;
     shelf_ = std::make_unique<ShelfStore>(msgWnd_, WM_APP_SHELF);
     shelf_->Load();
     reminders_.Load();
@@ -387,6 +392,14 @@ void App::OnShelfChanged() {
     if (!shelf_ || shoot_) return;
     const ShelfSnapshot snap = shelf_->Snapshot();
     for (auto& island : islands_) island->SetShelf(snap);
+    const size_t before = doneItems_.size();                           // a screenshot taken off the Shelf: its pill goes too, for good
+    std::erase_if(doneItems_, [&](const Activity& a) {
+        const bool gone = a.kind == Activity::Kind::Screenshot &&
+            std::none_of(snap.items.begin(), snap.items.end(), [&](const ShelfItem& i) { return L"shot:" + i.path == a.id; });
+        if (gone) dismissed_.insert(a.id);
+        return gone;
+    });
+    if (doneItems_.size() != before) PushActivities();
 }
 
 void App::OnAgentsChanged() {
@@ -486,7 +499,8 @@ void App::PushActivities() {
     std::erase_if(doneItems_, [&](const Activity& a) { return !alive(a); });
     std::erase_if(soluActivities_, [&](const Activity& a) { return !alive(a); });
     std::vector<Activity> all;
-    for (const Activity& a : doneItems_) all.push_back(a);                         // most important first
+    for (const Activity& a : doneItems_) all.push_back(a);                         // most important first (just plugged in, just done)
+    for (const Activity& a : drives_) if (a.startedAt && now - a.startedAt < 8000) all.push_back(a);   // a drive just plugged in
     for (const Activity& a : soluActivities_) if (a.kind == Activity::Kind::Nudge) all.push_back(a);
     if (focus_.on) {
         Activity f;
@@ -517,8 +531,11 @@ void App::PushActivities() {
     }
     if (activityMonitor_)
         for (const Activity& a : activityMonitor_->Snapshot()) all.push_back(a);
+    for (const Activity& a : drives_) if (!a.startedAt || now - a.startedAt >= 8000) all.push_back(a);   // drives: last, while plugged in
     for (auto& island : islands_) island->SetActivities(all);
-    const bool ticking = focus_.on || !doneItems_.empty() || std::any_of(soluActivities_.begin(), soluActivities_.end(),
+    const bool ticking = focus_.on || !doneItems_.empty() ||
+                         std::any_of(drives_.begin(), drives_.end(), [&](const Activity& d) { return d.startedAt && now - d.startedAt < 8000; }) ||
+                         std::any_of(soluActivities_.begin(), soluActivities_.end(),
                                                                          [](const Activity& a) { return a.expiresAt != 0; });
     if (ticking) SetTimer(msgWnd_, kActivityTimer, 1000, nullptr);
     else KillTimer(msgWnd_, kActivityTimer);
@@ -690,6 +707,111 @@ void App::OnAudioChanged() {
     if (!audio_ || shoot_) return;
     const AudioSnapshot snapshot = audio_->Snapshot();
     for (auto& island : islands_) island->SetAudio(snapshot);
+    if (!snapshot.valid) return;
+    std::set<std::wstring> now;
+    for (const AudioSide* side : {&snapshot.output, &snapshot.input})
+        for (const AudioDevice& d : side->devices) {
+            now.insert(d.id);
+            if (!audioSeen_ || audioKnown_.count(d.id)) continue;      // (the first list is what was already there)
+            const bool ears = d.form == 3 || d.form == 5;              // headphones / headset
+            const bool mic = side == &snapshot.input;
+            Flash(L"audio:" + d.id, ears ? L"\uE7F6" : mic ? L"\uE720" : L"\uE7F5",
+                  ears ? L"Headphones" : mic ? L"Microphone" : L"Speaker", d.name, 0x30D158);
+        }
+    audioKnown_ = std::move(now);
+    audioSeen_ = true;
+}
+
+// ---- things plugged in --------------------------------------------------------------------------
+
+void App::Flash(const std::wstring& id, const std::wstring& glyph, const std::wstring& title, const std::wstring& detail, uint32_t accent) {
+    Activity a;
+    a.id = L"flash:" + id + L":" + std::to_wstring(GetTickCount64());
+    a.kind = Activity::Kind::Device;
+    a.glyph = glyph;
+    a.title = title;
+    a.detail = detail;
+    a.accent = accent;
+    a.startedAt = GetTickCount64();
+    a.expiresAt = a.startedAt + 5000;
+    doneItems_.push_back(std::move(a));
+    PushActivities();
+}
+
+void App::OnScreenshot(const Screenshot& shot) {
+    if (shoot_ || dismissed_.count(L"shot:" + shot.path)) return;   // (one cleared away stays away)
+    std::erase_if(doneItems_, [](const Activity& a) { return a.kind == Activity::Kind::Screenshot; });   // the newest one only
+    Activity a;
+    a.id = L"shot:" + shot.path;
+    a.kind = Activity::Kind::Screenshot;
+    a.glyph = L"\uE722";                                                // (a camera: its icon among the others)
+    a.title = L"Screenshot";
+    a.detail = L"Middle-click to drag it anywhere";
+    a.accent = 0x64D2FF;
+    a.thumb = shot.thumb;
+    a.dismissible = true;                                               // its mark: save it to Pictures\Screenshots
+    a.mark = Activity::Mark::Save;
+    a.startedAt = GetTickCount64();
+    a.expiresAt = a.startedAt + 20 * 1000;                              // a glance, then it gets out of the way (it stays on the Shelf)
+    doneItems_.push_back(std::move(a));
+    if (shelf_) shelf_->Add({shot.path});                               // on the Shelf: from there it drags into any app
+    PushActivities();
+}
+
+void App::OnMark(const Activity& a) {
+    if (a.mark == Activity::Mark::Eject) {
+        DeviceWatcher::Eject(a.open, a.title, msgWnd_, WM_APP_EJECTED);
+    } else if (a.mark == Activity::Mark::Save && a.id.rfind(L"shot:", 0) == 0) {
+        const std::wstring saved = ScreenshotCatcher::SaveToScreenshots(a.id.substr(5));
+        if (saved.empty()) {
+            Flash(L"save-failed", L"\uE7BA", L"Could not save the screenshot", L"", 0xFF9F0A);
+            return;
+        }
+        dismissed_.insert(a.id);
+        Flash(L"saved", L"\uE73E", L"Saved to Screenshots", std::filesystem::path(saved).filename().wstring(), 0x30D158);
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + saved + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+    }
+}
+
+void App::OnDeviceEvent(const DeviceEvent& e) {
+    using Kind = DeviceEvent::Kind;
+    if (e.kind == Kind::DriveAdded) {
+        std::erase_if(drives_, [&](const Activity& d) { return d.open == e.root; });
+        Activity d;
+        d.id = L"drive:" + e.root;
+        d.kind = Activity::Kind::Device;
+        d.glyph = L"\uE88E";                                           // a USB drive
+        d.title = e.name;
+        d.detail = e.detail;
+        d.accent = 0x64D2FF;
+        d.open = e.root;                                                // middle click: open it
+        d.dismissible = true;                                           // its mark: eject
+        d.mark = Activity::Mark::Eject;
+        d.startedAt = GetTickCount64();
+        drives_.push_back(std::move(d));
+    } else if (e.kind == Kind::DriveRemoved) {
+        std::erase_if(drives_, [&](const Activity& d) { return d.open == e.root; });
+    } else if (e.kind == Kind::PhoneAdded) {
+        Flash(L"phone", L"\uE8EA", e.name, L"Connected", 0x64D2FF);
+        return;
+    } else if (e.kind == Kind::UsbAdded) {
+        using Usb = DeviceEvent::Usb;
+        if (e.usb == Usb::Storage) {                                    // a drive with a letter has its own pill already
+            const uint64_t now = GetTickCount64();
+            if (std::any_of(drives_.begin(), drives_.end(), [&](const Activity& d) { return d.startedAt && now - d.startedAt < 10000; })) return;
+            Flash(L"usb", L"\uE88E", e.name.empty() ? L"USB drive" : e.name, L"Connected, but Windows gave it no drive letter", 0x64D2FF);
+            return;
+        }
+        struct Look { const wchar_t* glyph; const wchar_t* title; };
+        static const Look looks[] = {{L"\uE88E", L"USB drive"}, {L"\uE701", L"Wi-Fi adapter"}, {L"\uE839", L"Network adapter"},
+                                     {L"\uE702", L"Bluetooth adapter"}, {L"\uE765", L"Keyboard"}, {L"\uE962", L"Mouse"},
+                                     {L"\uE7FC", L"Controller"}, {L"\uE722", L"Camera"}, {L"\uE749", L"Printer"},
+                                     {L"\uE88E", L"USB serial device"}, {L"\uE88E", L"USB device"}};   // (in DeviceEvent::Usb order)
+        const Look& look = looks[static_cast<int>(e.usb)];
+        Flash(L"usb", look.glyph, look.title, e.name.empty() ? L"Connected" : e.name, 0x64D2FF);
+        return;
+    }
+    PushActivities();
 }
 
 void App::OnNotificationsChanged() {
@@ -851,6 +973,7 @@ void App::BuildIslands() {
             AgentSession copy = s;
             std::thread([copy, openChat] { AgentMonitor::FocusHost(copy, openChat); }).detach();         // (it sleeps briefly: not on the UI thread)
         });
+        island->SetMarkHandler([this](const Activity& a) { OnMark(a); });
         island->SetActivityDismiss([this](const std::wstring& id) {
             if (shoot_) {
                 std::erase_if(shootActs_, [&](const Activity& a) { return a.id == id; });
@@ -1060,6 +1183,33 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHELF:
         OnShelfChanged();
         return 0;
+    case WM_DEVICECHANGE:                    // a drive or a phone came or went
+        if (devices_)
+            for (const DeviceEvent& e : devices_->OnDeviceChange(wp, lp)) OnDeviceEvent(e);
+        return TRUE;
+    case WM_CLIPBOARDUPDATE:                 // maybe a screenshot
+        if (shots_) shots_->OnClipboardUpdate();
+        return 0;
+    case WM_APP_SCREENSHOT: {
+        std::unique_ptr<Screenshot> shot(reinterpret_cast<Screenshot*>(lp));
+        OnScreenshot(*shot);
+        return 0;
+    }
+    case WM_APP_USB_DEVICE: {                // a USB device, identified
+        std::unique_ptr<DeviceEvent> e(reinterpret_cast<DeviceEvent*>(lp));
+        OnDeviceEvent(*e);
+        return 0;
+    }
+    case WM_APP_EJECTED: {
+        std::unique_ptr<DeviceWatcher::EjectResult> r(reinterpret_cast<DeviceWatcher::EjectResult*>(lp));
+        if (r->ok) {
+            std::erase_if(drives_, [&](const Activity& d) { return d.open == r->root; });
+            Flash(L"ejected", L"\uE73E", L"Safe to remove", r->name, 0x30D158);
+        } else {
+            Flash(L"eject-failed", L"\uE7BA", L"Can't eject " + r->name, L"Because " + r->why, 0xFF9F0A);
+        }
+        return 0;
+    }
     case WM_APP_CAPTURED:
         if (solu_ && !shoot_) {
             showAnswer_ = true;

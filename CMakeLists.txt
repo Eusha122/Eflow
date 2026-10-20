@@ -44,6 +44,7 @@ add_executable(eflow WIN32
     src/services/AudioDevices.cpp
     src/services/CameraService.cpp
     src/services/DeviceReadiness.cpp
+    src/services/DeviceWatcher.cpp
     src/services/HookInstaller.cpp
     src/services/LyricsService.cpp
     src/services/MediaService.cpp
@@ -54,6 +55,7 @@ add_executable(eflow WIN32
     src/services/ActivityMonitor.cpp
     src/services/AgentMonitor.cpp
     src/services/ShelfStore.cpp
+    src/services/ScreenshotCatcher.cpp
     src/services/ReminderStore.cpp
     src/services/AlarmSound.cpp
     src/services/SystemMonitor.cpp
@@ -76,7 +78,7 @@ target_compile_options(eflow PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus /EH
 set_source_files_properties(src/mascot/cgltf_impl.cpp PROPERTIES
     COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")
 target_link_libraries(eflow PRIVATE d3d11 dxgi d2d1 dwrite dcomp dxguid windowscodecs windowsapp shell32 user32
-    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32 winhttp winmm)
+    advapi32 shcore ole32 oleaut32 pdh iphlpapi wbemuuid setupapi ws2_32 winhttp winmm cfgmgr32)
 
 # The PermissionRequest hook command run by Claude Code / Codex; lives next to eflow.exe (it verifies
 # that the pipe it talks to is served by that eflow.exe).

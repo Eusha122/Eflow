@@ -128,6 +128,7 @@ public:
     // Live pills on the thin bar (downloads, copies, focus timer, research, nudges), most important first.
     void SetActivities(const std::vector<Activity>& items);
     void SetActivityDismiss(std::function<void(const std::wstring&)> dismiss) { activityDismiss_ = std::move(dismiss); }
+    void SetMarkHandler(std::function<void(const Activity&)> mark) { mark_ = std::move(mark); }   // a pill's eject / save mark was pressed
     void SetMood(Mascot::Mood mood) { if (mascot_) mascot_->SetMood(mood); }
     void Cheer() { if (mascot_) { mascot_->Cheer(); Animate(); } }                          // the hotkey was pressed: open so the conversation is visible
     void SetSoluHandlers(std::function<void(bool)> enable, std::function<void()> talk, std::function<void(const std::wstring&)> voice,
@@ -433,6 +434,9 @@ private:
     void AddReminder();
     std::vector<Activity> activities_;
     std::function<void(const std::wstring&)> activityDismiss_;
+    std::function<void(const Activity&)> mark_;
+    std::unordered_map<const ImageBGRA*, Com<ID2D1Bitmap1>> thumbs_;   // pill thumbnails (screenshots)
+    ID2D1Bitmap1* Thumb(const ImageBGRA& image);
     // ---- the closed island: it shows one thing (a "glimpse"); anything else going on waits as a small icon at its right
     // end. Activities come first (an agent at work, a download, the focus timer), then the music. A middle click on an icon
     // brings that one to the front; the one shown takes its place among the icons.

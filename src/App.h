@@ -18,6 +18,8 @@
 #include "mascot/MascotRenderer.h"
 #include "services/AudioDevices.h"
 #include "services/CameraService.h"
+#include "services/DeviceWatcher.h"
+#include "services/ScreenshotCatcher.h"
 #include "services/HookInstaller.h"
 #include "services/LyricsService.h"
 #include "services/MediaService.h"
@@ -61,6 +63,9 @@ private:
     void OnRemindersChanged();
     void OnSoluReminder(const SoluAppEvent& e);  // "remind me ..." said to Solu
     void PushActivities();
+    // Things plugged in: a short animated pill (phones, headphones), drives stay as a pill with Open and Eject.
+    void OnDeviceEvent(const DeviceEvent& e);
+    void Flash(const std::wstring& id, const std::wstring& glyph, const std::wstring& title, const std::wstring& detail, uint32_t accent);
     void OnSoluAppEvent(const SoluAppEvent& e);
     void StartFocus(int focusMinutes, int breakMinutes, int rounds);
     void StopFocus(bool finished);
@@ -128,7 +133,14 @@ private:
     RECT captured_{};
     std::wstring capturedMode_;
     std::vector<Activity> soluActivities_;          // research progress and nudges, from Solu
-    std::vector<Activity> doneItems_;               // short "Downloaded ..." flashes
+    std::vector<Activity> doneItems_;               // short "Downloaded ..." / "Connected" flashes
+    std::unique_ptr<DeviceWatcher> devices_;
+    std::unique_ptr<ScreenshotCatcher> shots_;      // a screenshot taken: a pill with the picture, and on the Shelf
+    void OnScreenshot(const Screenshot& shot);
+    void OnMark(const Activity& a);                 // a pill's mark was pressed: eject the drive, save the screenshot
+    std::vector<Activity> drives_;                  // removable drives plugged in now (their pills stay)
+    std::set<std::wstring> audioKnown_;              // audio endpoints already seen (a new one is announced)
+    bool audioSeen_ = false;
     std::set<std::wstring> dismissed_;
     struct Focus {
         bool on = false, onBreak = false;
