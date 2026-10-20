@@ -137,6 +137,7 @@ private:
     std::unique_ptr<DeviceWatcher> devices_;
     std::unique_ptr<ScreenshotCatcher> shots_;      // a screenshot taken: a pill with the picture, and on the Shelf
     void OnScreenshot(const Screenshot& shot);
+    void OnLoginCode(const NotificationItem& n, const std::wstring& code);   // a verification code arrived: its pill
     void OnMark(const Activity& a);                 // a pill's mark was pressed: eject the drive, save the screenshot
     std::vector<Activity> drives_;                  // removable drives plugged in now (their pills stay)
     std::set<std::wstring> audioKnown_;              // audio endpoints already seen (a new one is announced)

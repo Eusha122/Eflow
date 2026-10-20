@@ -11,7 +11,7 @@ namespace eflow {
 // a download or file copy, Solu's research, the focus timer, one of Solu's rare nudges, or something just plugged in.
 struct Activity {
     enum class Kind { Progress, Timer, Nudge, Done, Device, Screenshot };
-    enum class Mark { Close, Eject, Save };   // the mark at its right end (when dismissible): what a middle click on it does
+    enum class Mark { Close, Eject, Save, Copy };   // the mark at its right end (when dismissible): what a middle click on it does
     std::wstring id;                 // stable while it runs ("download:C:\...", "focus", "research", "nudge:3")
     Kind kind = Kind::Progress;
     std::wstring glyph = L"\uE896";  // Segoe Fluent Icons
@@ -27,6 +27,7 @@ struct Activity {
     uint64_t startedAt = 0;          // GetTickCount64() when it appeared: the arrival animation plays from here (0 = none)
     std::wstring open;               // what a middle click on the pill opens (a drive's root) instead of the island
     std::shared_ptr<const ImageBGRA> thumb;   // a picture in place of the icon (a screenshot)
+    std::wstring copy;               // Mark::Copy: the text a middle click anywhere on the pill copies (a login code)
 };
 
 } // namespace eflow

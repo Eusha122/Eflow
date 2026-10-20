@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "core/Log.h"
+#include "core/LoginCode.h"
 #include "core/Messages.h"
 #include "core/Utf8.h"
 
@@ -758,8 +759,66 @@ void App::OnScreenshot(const Screenshot& shot) {
     PushActivities();
 }
 
+void App::OnLoginCode(const NotificationItem& n, const std::wstring& code) {
+    std::erase_if(doneItems_, [](const Activity& a) { return a.mark == Activity::Mark::Copy; });   // the newest code only
+    Activity a;
+    a.id = L"code:" + std::to_wstring(n.id);
+    a.kind = Activity::Kind::Done;
+    a.glyph = L"\uE8D7";                                                // (a key)
+    a.title = SpacedCode(code);
+    a.detail = (n.app.empty() ? std::wstring(L"Login code") : n.app) + L" \u00B7 middle-click to copy";
+    a.accent = 0x30D158;
+    a.dismissible = true;
+    a.mark = Activity::Mark::Copy;
+    a.copy = code;
+    a.startedAt = GetTickCount64();
+    a.expiresAt = a.startedAt + 3 * 60 * 1000;                          // codes run out in minutes
+    doneItems_.push_back(std::move(a));
+    Log("notifications: a login code arrived (from %ls)", n.app.c_str());   // (never the code itself)
+    PushActivities();
+}
+
+// Text on the clipboard that Windows' clipboard history and cloud clipboard leave out (a login code is not kept).
+static bool CopyPrivateText(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t))) {
+        if (void* p = GlobalLock(mem)) {
+            memcpy(p, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+            GlobalUnlock(mem);
+            ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        }
+        if (!ok) GlobalFree(mem);
+    }
+    auto flag = [](const wchar_t* name, DWORD value) {
+        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD))) {
+            if (void* p = GlobalLock(mem)) {
+                memcpy(p, &value, sizeof(value));
+                GlobalUnlock(mem);
+                if (SetClipboardData(RegisterClipboardFormatW(name), mem)) return;
+            }
+            GlobalFree(mem);
+        }
+    };
+    if (ok) {
+        flag(L"ExcludeClipboardContentFromMonitorProcessing", 0);
+        flag(L"CanIncludeInClipboardHistory", 0);
+        flag(L"CanUploadToCloudClipboard", 0);
+    }
+    CloseClipboard();
+    return ok;
+}
+
 void App::OnMark(const Activity& a) {
-    if (a.mark == Activity::Mark::Eject) {
+    if (a.mark == Activity::Mark::Copy) {
+        if (!CopyPrivateText(msgWnd_, a.copy)) {
+            Flash(L"copy-failed", L"\uE7BA", L"Could not copy the code", L"Another app is using the clipboard", 0xFF9F0A);
+            return;
+        }
+        dismissed_.insert(a.id);
+        Flash(L"copied", L"\uE73E", L"Code copied", L"Paste it with Ctrl+V", 0x30D158);
+    } else if (a.mark == Activity::Mark::Eject) {
         DeviceWatcher::Eject(a.open, a.title, msgWnd_, WM_APP_EJECTED);
     } else if (a.mark == Activity::Mark::Save && a.id.rfind(L"shot:", 0) == 0) {
         const std::wstring saved = ScreenshotCatcher::SaveToScreenshots(a.id.substr(5));
@@ -824,8 +883,12 @@ void App::OnNotificationsChanged() {
     // Something new arrived from an app that is not muted: only then does the island open for it.
     int arrived = 0;
     if (snap.arrivals > seenArrivals_)
-        for (const auto& n : snap.items)
-            if (!seenNotifications_.count(n.id) && !mutes_.IsMuted(n.appId, n.app)) ++arrived;
+        for (const auto& n : snap.items) {
+            if (seenNotifications_.count(n.id)) continue;
+            // A login code shows as its own pill, ready to copy, even from a muted app: it only comes when you asked for it.
+            if (const std::wstring code = FindLoginCode(n.title + L"\n" + n.body); !code.empty()) OnLoginCode(n, code);
+            else if (!mutes_.IsMuted(n.appId, n.app)) ++arrived;
+        }
     std::vector<MutedApp> senders;                                 // Windows' banners follow the mute list (a new app too)
     for (const auto& n : snap.items) senders.push_back({n.appId.empty() ? n.app : n.appId, n.app});
     if (mutes_.SyncBanners(senders)) mutes_.Save();

@@ -56,6 +56,7 @@ add_executable(eflow WIN32
     src/services/AgentMonitor.cpp
     src/services/ShelfStore.cpp
     src/services/ScreenshotCatcher.cpp
+    src/core/LoginCode.cpp
     src/services/ReminderStore.cpp
     src/services/AlarmSound.cpp
     src/services/SystemMonitor.cpp
@@ -90,7 +91,7 @@ target_link_libraries(eflow-hook PRIVATE advapi32)
 add_dependencies(eflow eflow-hook)
 
 # Unit tests for the parts that need no window (run build\<config>\eflow-tests.exe).
-add_executable(eflow-tests tests/when_test.cpp src/core/When.cpp)
+add_executable(eflow-tests tests/when_test.cpp tests/login_code_test.cpp src/core/When.cpp src/core/LoginCode.cpp)
 target_include_directories(eflow-tests PRIVATE src)
 target_compile_definitions(eflow-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_compile_options(eflow-tests PRIVATE /W4 /permissive- /utf-8 /EHsc)

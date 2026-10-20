@@ -3864,6 +3864,10 @@ void IslandWindow::OnMiddleClick(POINT screen) {
             return;
         }
     }
+    if (const Activity* shown = FrontActivity(); shown && shown->mark == Activity::Mark::Copy) {   // a login code: anywhere copies it
+        if (mark_) mark_(*shown);
+        return;
+    }
     if (const Activity* shown = FrontActivity(); shown && !shown->open.empty()) {   // a drive: open it
         ShellExecuteW(nullptr, L"open", shown->open.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
@@ -4053,6 +4057,8 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
             DrawText(dc, L"\u23CF", gfx_.Text(13.0f, DWRITE_FONT_WEIGHT_NORMAL), x, WithAlpha(kText, 0.85f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
         else if (act.mark == Activity::Mark::Save)                        // a screenshot: its mark keeps it in Pictures\Screenshots
             DrawText(dc, L"\uE74E", gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kText, 0.85f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
+        else if (act.mark == Activity::Mark::Copy)                        // a login code: its mark copies it
+            DrawText(dc, L"\uE8C8", gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kText, 0.85f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
         else
             DrawText(dc, L"", gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL, true), x, WithAlpha(kTextDim, 1.2f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
         right = x.left - 4;

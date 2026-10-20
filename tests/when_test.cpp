@@ -8,6 +8,8 @@
 
 using eflow::Repeat;
 
+int LoginCodeTests();   // tests/login_code_test.cpp
+
 namespace {
 
 int failed = 0;
@@ -89,6 +91,7 @@ int main() {
     if (eflow::FormatCountdown(kNow + 3 * 86400, kNow) != L"in 3 days") ++failed, std::wprintf(L"[FAIL] FormatCountdown days\n");
     if (eflow::FormatEarly(15) != L"15 min before" || eflow::FormatEarly(60) != L"1 h before") ++failed, std::wprintf(L"[FAIL] FormatEarly\n");
 
+    failed += LoginCodeTests();
     std::wprintf(failed ? L"\n%d failed\n" : L"\nall passed\n", failed);
     return failed ? 1 : 0;
 }
