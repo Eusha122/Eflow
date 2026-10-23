@@ -39,16 +39,35 @@ std::wstring ProcessImage(DWORD pid) {
     return path;
 }
 
-// The pipe must be served by eflow.exe sitting next to this hook; anything else could be a
-// process pretending to be Eflow in order to approve requests.
+// The eflow.exe recorded next to this hook by Eflow (the copy at ~/.eflow/hook), or "".
+std::wstring RecordedEflow(const std::wstring& dir) {
+    HANDLE f = CreateFileW((dir + L"eflow-path.txt").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    char buf[MAX_PATH * 6];
+    DWORD n = 0;
+    const BOOL ok = ReadFile(f, buf, sizeof(buf), &n, nullptr);
+    CloseHandle(f);
+    if (!ok || n == 0 || n == sizeof(buf)) return {};
+    wchar_t path[MAX_PATH * 2];
+    const int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf, static_cast<int>(n), path, ARRAYSIZE(path));
+    return len > 0 ? std::wstring(path, static_cast<size_t>(len)) : std::wstring();
+}
+
+// The pipe must be served by the eflow.exe sitting next to this hook, or the one Eflow recorded for the copy at
+// ~/.eflow/hook; anything else could be a process pretending to be Eflow in order to approve requests. (That record
+// is no weaker than the tool's own settings file: whoever can rewrite one can rewrite the other.)
 bool ServerIsEflow(HANDLE pipe) {
     ULONG pid = 0;
     if (!GetNamedPipeServerProcessId(pipe, &pid)) return false;
+    const std::wstring image = ProcessImage(pid);
+    if (image.empty()) return false;
     wchar_t self[MAX_PATH * 2];
     const DWORD n = GetModuleFileNameW(nullptr, self, ARRAYSIZE(self));
-    std::wstring expected(self, n);
-    expected = expected.substr(0, expected.find_last_of(L"\\/") + 1) + L"eflow.exe";
-    return CompareStringOrdinal(ProcessImage(pid).c_str(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+    std::wstring dir(self, n);
+    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+    for (const std::wstring& expected : {dir + L"eflow.exe", RecordedEflow(dir)})
+        if (!expected.empty() && CompareStringOrdinal(image.c_str(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL) return true;
+    return false;
 }
 
 // Returns "allow", "deny", or "" (no decision).

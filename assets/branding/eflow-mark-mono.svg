@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="76 96 360 300">
+  <!-- Eflow mark in one colour (print, stamps, embroidery): the eyes are cut out, so it works on any background. -->
+  <defs>
+    <mask id="eyes">
+      <rect x="0" y="0" width="512" height="512" fill="#FFFFFF"/>
+      <g fill="none" stroke="#000000" stroke-width="22" stroke-linecap="round">
+        <path d="M176 300 Q204 266 232 300"/>
+        <path d="M280 300 Q308 266 336 300"/>
+      </g>
+    </mask>
+  </defs>
+  <g mask="url(#eyes)">
+    <g fill="#16171C" stroke="#16171C" stroke-width="36" stroke-linejoin="round">
+      <path d="M138 250 L166 130 L230 214 Z"/>
+      <path d="M374 250 L346 130 L282 214 Z"/>
+    </g>
+    <rect x="92" y="196" width="328" height="184" rx="92" fill="#16171C"/>
+  </g>
+</svg>

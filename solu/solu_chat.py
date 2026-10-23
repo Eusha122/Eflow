@@ -34,6 +34,7 @@ from approvals import ApprovalsMixin  # noqa: E402
 from audio import AudioMixin  # noqa: E402
 from audio import Vad  # noqa: E402
 from brain import BrainMixin  # noqa: E402
+import config  # noqa: E402
 from config import BRAIN, CTX, OLLAMA  # noqa: E402
 from jobs import JobsMixin  # noqa: E402
 from listening import ListeningMixin  # noqa: E402
@@ -102,7 +103,7 @@ class Solu(ListeningMixin, AudioMixin, BrainMixin, ApprovalsMixin, ScreenHelpMix
         self.vad = Vad()
         on_cpu = os.environ.get("SOLU_STT_CPU") == "1"                         # tests: a second copy must not take more of the graphics card
         self.stt = WhisperModel("small", device="cpu" if on_cpu else "cuda", compute_type="int8" if on_cpu else "float16")
-        self.tts = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+        self.tts = Kokoro(config.model("kokoro-v1.0.onnx"), config.model("voices-v1.0.bin"))
         speak(self.tts, args.voice, "Hi.")                                   # warm up
         list(self.stt.transcribe(np.zeros(16000, np.float32), language="en")[0])
         threading.Thread(target=self._load_brain, daemon=True).start()     # the brain is ready before the first question

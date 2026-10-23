@@ -9,6 +9,8 @@
 using eflow::Repeat;
 
 int LoginCodeTests();   // tests/login_code_test.cpp
+int ShareTests();       // tests/share_test.cpp
+int ShareTool(int argc, wchar_t** argv);   // ... and its command-line helpers
 
 namespace {
 
@@ -47,7 +49,8 @@ void ExpectNoTime(const wchar_t* text) {
 
 }  // namespace
 
-int main() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc > 1) return ShareTool(argc, argv);   // a helper for tools/safeshare_crosscheck.mjs
     // the user's own example, and its spellings
     Expect(L"Codeforces contest 4 March 8pm", L"Codeforces contest", Local(2027, 3, 4, 20, 0));
     Expect(L"codeforces contest at 4 march at 8", L"Codeforces contest", Local(2027, 3, 4, 8, 0), Repeat::None, 0, true);
@@ -92,6 +95,7 @@ int main() {
     if (eflow::FormatEarly(15) != L"15 min before" || eflow::FormatEarly(60) != L"1 h before") ++failed, std::wprintf(L"[FAIL] FormatEarly\n");
 
     failed += LoginCodeTests();
+    failed += ShareTests();
     std::wprintf(failed ? L"\n%d failed\n" : L"\nall passed\n", failed);
     return failed ? 1 : 0;
 }

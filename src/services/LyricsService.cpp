@@ -44,12 +44,31 @@ std::string UrlEncode(const std::wstring& w) {
     return out;
 }
 
+// The cache's folder. v2: since songs must match their artist, the answers kept before (some of them for videos that were
+// no song at all) are dropped once, in Run.
 std::filesystem::path CacheDir() {
     PWSTR base = nullptr;
     std::filesystem::path dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) dir = std::filesystem::path(base) / L"Eflow" / L"lyrics";
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) dir = std::filesystem::path(base) / L"Eflow" / L"lyrics" / L"v2";
     CoTaskMemFree(base);
     return dir;
+}
+
+// A name as it is compared: lower case, accents off ("Måneskin" = "maneskin"), letters and digits only.
+std::wstring Folded(const std::wstring& name) {
+    std::wstring decomposed(name.size() * 3 + 8, L'\0');
+    const int n = NormalizeString(NormalizationKD, name.c_str(), static_cast<int>(name.size()), decomposed.data(), static_cast<int>(decomposed.size()));
+    decomposed.resize(n > 0 ? static_cast<size_t>(n) : 0);
+    std::wstring out;
+    for (wchar_t c : decomposed)
+        if (iswalnum(c) && !(c >= 0x0300 && c <= 0x036F)) out += static_cast<wchar_t>(towlower(c));
+    return out;
+}
+
+// The song found is by the artist that is playing (one name may hold the other: "Måneskin" / "Måneskin & Iggy Pop").
+bool SameArtist(const std::wstring& found, const std::wstring& playing) {
+    const std::wstring a = Folded(found), b = Folded(playing);
+    return !a.empty() && !b.empty() && (a.find(b) != std::wstring::npos || b.find(a) != std::wstring::npos);
 }
 
 std::wstring CacheName(const std::wstring& key) {             // FNV-1a: short, stable, no personal text in file names
@@ -189,7 +208,7 @@ void LyricsService::Request(const std::wstring& rawTitle, const std::wstring& ra
                             const std::wstring& sourceApp) {
     std::wstring title = rawTitle, artist = rawArtist;
     Clean(title, artist, sourceApp);
-    const std::wstring key = title.empty() ? L"" : Lower(artist) + L"\x1f" + Lower(title);
+    const std::wstring key = title.empty() || artist.empty() ? L"" : Lower(artist) + L"\x1f" + Lower(title);   // (no artist: no song)
     {
         std::lock_guard<std::mutex> g(lock_);
         if (key == current_.key) return;                            // same song (a pause, a seek): nothing to do
@@ -212,7 +231,11 @@ Lyrics LyricsService::Snapshot() const {
 void LyricsService::Run() {
     const std::filesystem::path dir = CacheDir();
     std::error_code ec;
-    if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir, ec);
+        for (const auto& old : std::filesystem::directory_iterator(dir.parent_path(), ec))   // v1's answers, unchecked
+            if (old.is_regular_file(ec) && old.path().extension() == L".lrc") std::filesystem::remove(old.path(), ec);
+    }
     for (;;) {
         std::unique_ptr<Job> job;
         {
@@ -282,7 +305,8 @@ bool LyricsService::Fetch(const Job& job, std::vector<LyricLine>& out, bool& rea
         if (status == 200) {
             json::Value v;
             std::string err;
-            if (json::Parse(body, v, err) && synced(v)) return true;
+            const std::string* by = json::Parse(body, v, err) ? Text(v, "artistName") : nullptr;
+            if (by && SameArtist(FromUtf8(*by), job.artist) && synced(v)) return true;
         }
         if (!reachable) return false;
     }
@@ -295,7 +319,6 @@ bool LyricsService::Fetch(const Job& job, std::vector<LyricLine>& out, bool& rea
     for (int attempt = 0; attempt < 2; ++attempt) {
         const std::string path = attempt == 0 ? "/api/search?track_name=" + UrlEncode(title) + "&artist_name=" + UrlEncode(job.artist)
                                               : "/api/search?q=" + UrlEncode(job.artist + L" " + title);
-        if (attempt == 1 && job.artist.empty()) break;
         std::string body = HttpGet(path, status);
         reachable = reachable || status != 0;
         if (status != 200) {
@@ -309,7 +332,8 @@ bool LyricsService::Fetch(const Job& job, std::vector<LyricLine>& out, bool& rea
         double bestDiff = 1e9;
         for (json::Value& item : list.items) {
             const std::string* lrc = Text(item, "syncedLyrics");
-            if (!lrc || lrc->empty()) continue;
+            const std::string* by = Text(item, "artistName");
+            if (!lrc || lrc->empty() || !by || !SameArtist(FromUtf8(*by), job.artist)) continue;   // another artist's song
             const double diff = job.duration > 0 ? std::abs(Number(item, "duration") - job.duration) : 0;
             if (diff < bestDiff) { bestDiff = diff; best = &item; }
         }

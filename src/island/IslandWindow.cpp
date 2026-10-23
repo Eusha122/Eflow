@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cwctype>
 #include <string>
+#include <utility>
 
 #include "core/Log.h"
 #include "core/Messages.h"
@@ -65,7 +66,7 @@ constexpr int kHitOutput = 16;                              // the "playing on" 
 constexpr int kHitSeek = 13;                                // the progress bar (click or drag to seek)
 constexpr int kHitReject = 20, kHitApprove = 21, kHitDefer = 22;  // permission card hit ids
 constexpr int kHitRing = 40;                                 // + metric index (System tab)
-constexpr float kMaxPanelH = 384.0f;                        // tallest the panel grows (the settings menu)
+constexpr float kMaxPanelH = 426.0f;                        // tallest the panel grows (the settings menu, 7 rows)
 constexpr int kHitAudioButton = 60;                         // + 0 microphone, + 1 speaker (round buttons on the tab row)
 constexpr int kHitPopAway = 71;                             // anywhere else on the island while a menu is open: dismiss
 constexpr int kHitPopRow = 1000;                            // + visible row in the open device menu
@@ -107,7 +108,8 @@ constexpr float kArtSize = 92.0f;
 constexpr float kArtTop = 62.0f;
 constexpr float kControlsY = 145.0f;       // centre line of the transport buttons (from the panel top)
 
-const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"Agents", L"System", L"Shelf", L"Reminders"};
+const wchar_t* const kTabLabels[kSectionCount] = {L"Music", L"Notifications", L"Solu AI", L"Agents", L"System", L"Shelf", L"Reminders",
+                                                  L"SafeShare"};
 const wchar_t* const kEmptyTitle[kSectionCount] = {L"Nothing playing", L"You're all caught up", L"No new messages",
                                                    L"No pending requests", L"", L"", L""};
 const wchar_t* const kEmptyBody[kSectionCount] = {
@@ -331,9 +333,9 @@ IslandWindow::IslandWindow(Gfx& gfx, HMONITOR monitor, HWND owner, std::shared_p
 }
 
 // The OLE drop target: files dragged from Explorer (or anywhere) onto the island. It only forwards to the window.
-class ShelfDropTarget final : public IDropTarget {
+class FileDropTarget final : public IDropTarget {
 public:
-    explicit ShelfDropTarget(IslandWindow* window) : window_(window) {}
+    explicit FileDropTarget(IslandWindow* window) : window_(window) {}
     void Detach() { window_ = nullptr; }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
         if (riid == IID_IUnknown || riid == IID_IDropTarget) { *out = static_cast<IDropTarget*>(this); AddRef(); return S_OK; }
@@ -346,20 +348,20 @@ public:
         if (!n) delete this;
         return n;
     }
-    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
-        *effect = window_ ? window_->ShelfDragEnter(data) : DROPEFFECT_NONE;
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
+        *effect = window_ ? window_->FilesDragEnter(data, {pt.x, pt.y}) : DROPEFFECT_NONE;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
-        *effect = window_ ? window_->ShelfDragOver() : DROPEFFECT_NONE;
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD* effect) override {
+        *effect = window_ ? window_->FilesDragOver({pt.x, pt.y}) : DROPEFFECT_NONE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override {
-        if (window_) window_->ShelfDragLeave();
+        if (window_) window_->FilesDragLeave();
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
-        *effect = window_ ? window_->ShelfDrop(data) : DROPEFFECT_NONE;
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
+        *effect = window_ ? window_->FilesDrop(data, {pt.x, pt.y}) : DROPEFFECT_NONE;
         return S_OK;
     }
 
@@ -375,7 +377,7 @@ IslandWindow::~IslandWindow() {
     if (hwnd_) {
         RevokeDragDrop(hwnd_);
         if (dropTarget_) {
-            static_cast<ShelfDropTarget*>(dropTarget_)->Detach();
+            static_cast<FileDropTarget*>(dropTarget_)->Detach();
             dropTarget_->Release();
             dropTarget_ = nullptr;
         }
@@ -412,7 +414,7 @@ bool IslandWindow::Create() {
     tabW_.Snap(tabs[0].right - tabs[0].left);
 
     SetHitRegion(false);
-    dropTarget_ = new ShelfDropTarget(this);                           // files can be dropped on the island
+    dropTarget_ = new FileDropTarget(this);                            // files can be dropped on the island
     if (FAILED(RegisterDragDrop(hwnd_, dropTarget_))) Log("island: drag and drop is unavailable");
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     Animate();
@@ -469,6 +471,58 @@ void IslandWindow::DebugOpenTab(int section) {
         Collapse();
     }
     Animate();
+}
+
+void IslandWindow::DebugSettings(int page) {
+    debugPinned_ = page >= 0;
+    if (page < 0) {
+        OpenPopover(-1);
+        Collapse();
+        return;
+    }
+    Expand();
+    OpenPopover(3);
+    settingsPage_ = page;
+    voiceScroll_ = 0;
+    ApplyHeightTarget();
+    Animate();
+}
+
+void IslandWindow::DebugDropPreview(int zone) {
+    dragOver_ = zone >= 0;
+    dropZone_ = zone == 1 ? DropZone::SafeShare : DropZone::Shelf;
+    debugPinned_ = dragOver_;
+    if (dragOver_) Expand();
+    else Collapse();
+    Animate();
+}
+
+void IslandWindow::DebugSnapshot(const std::wstring& path) {
+    snapshotPath_ = path;                                              // written by the next frame, before it is shown
+    Animate();
+}
+
+// The island's own pixels (never the screen behind it), as the frame about to be presented: for layout checks.
+void IslandWindow::WriteSnapshot() {
+    const std::wstring path = std::exchange(snapshotPath_, std::wstring());
+    const D2D1_SIZE_U size = backbuffer_->GetPixelSize();
+    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                               D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    Com<ID2D1Bitmap1> cpu;
+    D2D1_MAPPED_RECT mapped{};
+    if (FAILED(dc_->CreateBitmap(size, nullptr, 0, &props, &cpu)) || FAILED(cpu->CopyFromBitmap(nullptr, backbuffer_.Get(), nullptr)) ||
+        FAILED(cpu->Map(D2D1_MAP_OPTIONS_READ, &mapped))) {
+        Log("snapshot: could not read the frame");
+        return;
+    }
+    ImageBGRA image;
+    image.width = size.width;
+    image.height = size.height;
+    image.pixels.resize(static_cast<size_t>(size.width) * size.height * 4);
+    for (UINT y = 0; y < size.height; ++y)
+        memcpy(&image.pixels[static_cast<size_t>(y) * size.width * 4], mapped.bits + static_cast<size_t>(y) * mapped.pitch, size.width * 4);
+    cpu->Unmap();
+    Log(SavePng(image, path.c_str()) ? "snapshot: %ls" : "snapshot: could not write %ls", path.c_str());
 }
 
 std::string IslandWindow::DebugLayout() const {
@@ -542,7 +596,7 @@ void IslandWindow::UpdateClickAway() {
 
 bool IslandWindow::Pinned() const {
     // A pending AI permission request keeps the panel open until it is answered.
-    return debugPinned_ || pressed_ >= 0 || field_ || !reminders_.ringing.empty() || dragOver_ || shelfDragging_ || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
+    return debugPinned_ || pressed_ >= 0 || field_ || (tourOn_ && expanded_) || !reminders_.ringing.empty() || dragOver_ || shelfDragging_ || (mascot_ && mascot_->permissionPending()) || CaptionsShown() ||
            (soluWake_ && solu_.state == SoluState::Loading);
 }
 
@@ -610,7 +664,7 @@ void IslandWindow::SetHitRegion(bool full) {
 }
 
 void IslandWindow::ApplyClickThrough() {
-    const bool through = !expanded_ && !holding_;
+    const bool through = !expanded_ && !holding_ && !TourInvite();   // (the tour's invitation opens on any click)
     const LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     const LONG_PTR want = through ? (ex | WS_EX_TRANSPARENT) : (ex & ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT));
     if (want != ex) SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, want);
@@ -634,6 +688,13 @@ void IslandWindow::UpdateMouseHook() {
 void IslandWindow::Expand() {
     if (expanded_ || suppressed_) return;
     expanded_ = true;
+    if (tourOn_ && tourStep_ == static_cast<int>(TourStep::Invite)) {   // opened from the invitation: lesson one learned
+        tourStep_ = tourSeen_ = std::max(tourSeen_, static_cast<int>(TourStep::Hello));
+        tourTime_ = 0;
+        tourSwap_ = 1;
+        TourEnter(TourStep::Hello);
+        Log("tour: opened from the invitation");
+    }
     AutoPickAgent();
     captionsYielded_ = false;                    // opening again during a conversation shows the live view again
     KillTimer(hwnd_, kCloseTimer);
@@ -724,7 +785,7 @@ void IslandWindow::UpdateAudioWatch() {
     if (audioWatchHandler_) audioWatchHandler_(want);
 }
 
-int IslandWindow::MaxRows(int side) const { return side == 3 ? 6 : kPopMaxRows; }
+int IslandWindow::MaxRows(int side) const { return side == 3 ? 7 : kPopMaxRows; }
 
 void IslandWindow::SetSolu(const SoluSnapshot& snapshot) {
     const bool wasActive = SoluActive();
@@ -891,6 +952,10 @@ void IslandWindow::OnNotification(int count) {
     if (mascot_) mascot_->Notify();
     notifScrollTarget_ = 0;                      // newest first: show it
     if (!reminders_.ringing.empty()) return;     // a ringing reminder keeps the island until it is answered
+    if (tourOn_) {                               // the welcome tour has the island: the message waits on its tab
+        notifBadge_ += count;
+        return;
+    }
     const bool wasOpen = expanded_;
     if (!Present(Section::Notifications, false)) {        // the user is busy on another tab: only "+1" on its tab
         notifBadge_ += count;
@@ -946,6 +1011,12 @@ void IslandWindow::OnWheel(int delta) {
         Animate();
         return;
     }
+    if (expanded_ && section_ == Section::SafeShare && shareSentView_) {    // scroll the rooms sent
+        shareScroll_ = std::clamp(shareScroll_ + (delta > 0 ? -1 : 1), 0,
+                                  std::max(0, static_cast<int>(shareSnap_.sent.size()) - ShareGeometry(IslandRect()).rows));
+        Animate();
+        return;
+    }
     if (expanded_ && section_ == Section::Ai && permissions_.empty()) {      // scroll the agent's feed
         if (const AgentSession* s = CurrentSession())
             agentScroll_ = std::clamp(agentScroll_ + (delta > 0 ? 1 : -1), 0, std::max(0, static_cast<int>(s->feed.size()) - 1));
@@ -978,6 +1049,7 @@ void IslandWindow::SetPermissionPending(bool pending) {
 int IslandWindow::HitTest(D2D1_POINT_2F p) const {
     if (!expanded_ || h_.x < kExpandedH * 0.85f) return -1;
     const D2D1_RECT_F island = IslandRect();
+    if (TourShown()) return TourHit(p, island);
     const auto tabs = TabRects(island);
     for (int i = 0; i < kSectionCount; ++i)
         if (p.x >= tabs[i].left && p.x <= tabs[i].right && p.y >= tabs[i].top && p.y <= tabs[i].bottom) return i;
@@ -1016,6 +1088,11 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
             if (p.x >= cell.left && p.x <= cell.right && p.y >= cell.top && p.y <= cell.bottom) return kHitRing + i;
         }
     }
+    if (section_ == Section::Solu && solu_.state == SoluState::Missing) {
+        const float left = island.left + 26, right = island.left + kExpandedW - (mascot_ ? kMascotLane : 26.0f);
+        const float top = island.top + kTabTop + kTabH + 14.0f;
+        if (p.x >= left && p.x <= right && p.y >= top && p.y <= top + 40.0f) return kHitSoluSetup;
+    }
     if (section_ == Section::Solu && SoluTaskRows() > 0 && !CaptionsShown()) {
         const float right = island.left + kExpandedW - kMascotLane;
         for (int i = 0; i < SoluTaskRows(); ++i) {
@@ -1047,6 +1124,7 @@ int IslandWindow::HitTest(D2D1_POINT_2F p) const {
         return -1;
     }
     if (section_ == Section::Reminders) return RemindersHit(p, island);
+    if (section_ == Section::SafeShare) return SafeShareHit(p, island);
     if (section_ == Section::Ai && permissions_.empty()) {          // the agents panel
         const AgentsLayout g = AgentsGeometry(island);
         auto in = [&](const D2D1_RECT_F& r) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; };
@@ -1147,14 +1225,31 @@ void IslandWindow::ShowPending() {
     const int id = pendingSection_;
     pendingSection_ = -1;
     const bool stillNeeded = (id == static_cast<int>(Section::Ai) && !permissions_.empty()) ||
-                             (id == static_cast<int>(Section::Reminders) && !reminders_.ringing.empty());
+                             (id == static_cast<int>(Section::Reminders) && !reminders_.ringing.empty()) ||
+                             (id == static_cast<int>(Section::SafeShare) && shareSnap_.phone.state == PhoneState::Asking);
     if (stillNeeded) OnClick(id);                // (answered meanwhile, by voice or in the tool: nothing to show)
 }
 
 void IslandWindow::OnClick(int id) {
+    if (id >= kHitTourFirst && id <= kHitTourLast) {
+        TourClick(id);
+        Animate();
+        return;
+    }
+    if (id == kHitSoluSetup) {
+        StartTour(TourStep::Solu);                   // the guided setup is the tour's Solu step
+        hover_ = -1;
+        Animate();
+        return;
+    }
     if (id >= kHitReminderFirst && id <= kHitReminderLast) {
         RemindersClick(id);
         hover_ = -1;
+        Animate();
+        return;
+    }
+    if (id >= kHitShareFirst && id <= kHitShareLast) {
+        SafeShareClick(id);
         Animate();
         return;
     }
@@ -1240,12 +1335,18 @@ void IslandWindow::OnClick(int id) {
     if (id == kHitLive) {
         const std::wstring front = FrontGlimpse();
         const bool agent = front.rfind(L"agent", 0) == 0, task = front.rfind(L"task", 0) == 0, shot = front.rfind(L"shot:", 0) == 0;
+        const bool shared = front.rfind(L"share:", 0) == 0;
         Expand();
         if (agent) OnClick(static_cast<int>(Section::Ai));             // a pill about an agent: straight to its tab
         else if (task) OnClick(static_cast<int>(Section::Solu));       // a task: the Solu tab lists it
         else if (shot) {                                               // a screenshot: on the Shelf, ready to drag anywhere
             OnClick(static_cast<int>(Section::Shelf));
             if (activityDismiss_) activityDismiss_(front);            // (its pill has done its job)
+        }
+        else if (shared) {                                             // a sent room was opened: the list of sent rooms
+            OnClick(static_cast<int>(Section::SafeShare));
+            shareSentView_ = true;
+            if (activityDismiss_) activityDismiss_(front);
         }
         else if (front == L"music") OnClick(static_cast<int>(Section::Music));   // the music pill: the song
         return;
@@ -1302,7 +1403,7 @@ void IslandWindow::OnClick(int id) {
         ShellExecuteW(nullptr, L"open", page, nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
-    if (id >= kHitPopRow && id < kHitPopRow + 6) {
+    if (id >= kHitPopRow && id < kHitPopRow + static_cast<int>(popRowHover_.size())) {
         if (popover_ == 3) {                                       // the gear's menu
             const int k = voiceScroll_ + (id - kHitPopRow);
             if (settingsPage_ == 0) {
@@ -1318,11 +1419,16 @@ void IslandWindow::OnClick(int id) {
                 } else if (k == 3) {                               // screen help
                     solu_.screen = !solu_.screen;
                     if (soluScreen_) soluScreen_(solu_.screen);
-                } else if (k == 4 || k == 5) {                     // Voice >, Notifications >
-                    settingsPage_ = k == 4 ? 1 : 2;
+                } else if (k >= 4 && k <= 6) {                     // Voice >, Notifications >, Closed island >
+                    settingsPage_ = k == 4 ? 1 : k == 5 ? 2 : 3;
                     voiceScroll_ = 0;
                     ApplyHeightTarget();
                 }
+            } else if (settingsPage_ == 3) {                       // what the closed island may show
+                if (k == 0) glimpseLyrics_ = !glimpseLyrics_;
+                else if (k == 1) glimpseAgents_ = !glimpseAgents_;
+                if (glimpseHandler_) glimpseHandler_(glimpseLyrics_, glimpseAgents_);
+                RefreshCollapsed();
             } else if (settingsPage_ == 2) {                       // mute all, or one app
                 const auto apps = MuteRows();
                 if (k == 0) {
@@ -1374,10 +1480,22 @@ void IslandWindow::OnClick(int id) {
         }
         Log("island: approval card '%ls %ls' -> %s", permissions_.front().source.c_str(), permissions_.front().action.c_str(),
             id == kHitApprove ? "Approve" : id == kHitReject ? "Reject" : "third button");
+        const PermissionRequest& front = permissions_.front();
+        // A question, or "Answer in ...": step aside and bring up the window it is waiting in.
+        if (front.isQuestion || id == kHitDefer) {
+            const AgentSession* host = nullptr;
+            for (const AgentSession& s : agents_.sessions) {
+                if ((front.source == L"Claude Code") != (s.tool == AgentTool::Claude)) continue;
+                if (!front.session.empty() && s.id == front.session) { host = &s; break; }
+                if (host) continue;
+                if (front.cwd.empty() || s.cwd == front.cwd || s.project == front.project) host = &s;
+            }
+            if (host && agentOpen_) agentOpen_(*host, false);
+        }
         const PermissionDecision d = id == kHitApprove ? PermissionDecision::Allow
                                    : id == kHitReject  ? PermissionDecision::Deny
                                                        : PermissionDecision::Defer;
-        const uint64_t answered = permissions_.front().id;
+        const uint64_t answered = front.id;
         permissions_.erase(permissions_.begin());     // the server confirms with a fresh list right away
         permissionHandler_(answered, d);              // (after the erase: that list may arrive inside this call)
         hover_ = -1;
@@ -1444,9 +1562,7 @@ void IslandWindow::OnClick(int id) {
         return;
     }
     if (id < 0 || id >= kSectionCount) return;
-    const bool boxOnTab = (field_ == &prompt_ && id == static_cast<int>(Section::Ai)) ||
-                          ((field_ == &reminderWhat_ || field_ == &reminderNote_) && id == static_cast<int>(Section::Reminders));
-    if (field_ && !boxOnTab) Blur(false);        // the box being typed in is not on the new tab
+    if (field_ && FieldSection(field_) != id) Blur(false);   // the box being typed in is not on the new tab
     tabDot_[static_cast<size_t>(id)] = 0;
     if (id == static_cast<int>(Section::Notifications)) notifBadge_ = 0;
     if (pendingSection_ == id) pendingSection_ = -1;
@@ -1494,6 +1610,8 @@ void IslandWindow::Frame() {
     if (moving) {                               // panel animating: run at the display's refresh rate
         frameQueued_ = true;
         PostMessageW(hwnd_, WM_APP_FRAME, 0, 0);
+    } else if (tourOn_ && !reducedMotion_) {    // the tour: its scenes play (the closed invitation glows at a gentler pace)
+        SetTimer(hwnd_, kMascotTimer, expanded_ ? kMascotActiveMs : kMascotCalmMs, nullptr);
     } else if (mascotVisible) {                 // open and still: only the mascot moves, at a gentler cadence
         SetTimer(hwnd_, kMascotTimer, mascot_->calm() ? kMascotCalmMs : kMascotActiveMs, nullptr);
     }                                           // closed and still: no frames at all
@@ -1523,7 +1641,10 @@ bool IslandWindow::StepAnimation(float dt) {
         moving |= Approach(controlHover_[i], hover_ == kHitPrev + i ? 1.0f : 0.0f, dt, 22.0f);
         moving |= Approach(permissionHover_[i], hover_ == kHitReject + i ? 1.0f : 0.0f, dt, 22.0f);
     }
+    moving |= TourAnimate(dt);
     moving |= Approach(dragT_, dragOver_ ? 1.0f : 0.0f, dt, 14.0f);
+    moving |= Approach(dropShare_, dropZone_ == DropZone::SafeShare ? 1.0f : 0.0f, dt, 18.0f);
+    if (dragOver_) moving = true;                                         // the zone under the files breathes
     if (expanded_ && section_ == Section::Shelf) {
         shelfHover_.resize(shelf_.items.size(), 0.0f);
         for (size_t i = 0; i < shelf_.items.size(); ++i) {
@@ -1533,7 +1654,6 @@ bool IslandWindow::StepAnimation(float dt) {
             float& pop = shelfPop_[shelf_.items[i].path];
             moving |= Approach(pop, 1.0f, dt, 12.0f);
         }
-        if (dragOver_) moving = true;                                         // the "+" breathes while files hover
     }
     for (int i = 0; i < kSectionCount; ++i) {
         moving |= Approach(tabHover_[i], (i == hover_ && i != static_cast<int>(section_)) ? 1.0f : 0.0f, dt, 22.0f);
@@ -1646,13 +1766,16 @@ void IslandWindow::Render() {
     dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
     if (!suppressed_) DrawIsland(dc_.Get(), progress);
     HRESULT hr = dc_->EndDraw();
-    const float mascotAlpha = mascot_ && !suppressed_ ? ContentAlpha() : 0.0f;
+    const float mascotAlpha = mascot_ && !suppressed_ ? ContentAlpha() * (1.0f - dragT_) : 0.0f;   // (it steps aside for a drop)
     if (SUCCEEDED(hr) && mascotAlpha > 0.003f) {
         DrawMascot(mascotAlpha);
         dc_->BeginDraw();
         DrawMascotEffects(dc_.Get(), mascotAlpha);
         hr = dc_->EndDraw();
     }
+#ifndef NDEBUG
+    if (SUCCEEDED(hr) && !snapshotPath_.empty()) WriteSnapshot();
+#endif
     if (SUCCEEDED(hr)) hr = swap_->Present(1, 0);
     if (hr == D2DERR_RECREATE_TARGET || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         deviceLost_ = true;
@@ -1696,12 +1819,16 @@ void IslandWindow::DrawIsland(ID2D1DeviceContext* dc, float progress) {
 
     if (progress < 0.34f) {
         const float liveIn = Clamp01((h_.x - kCollapsedH) / (kLiveH - kCollapsedH));
-        if ((Live() || MusicPill()) && !expanded_) DrawGlimpseIcons(dc, r, (1.0f - progress / 0.34f));
-        if (Live() && !expanded_) DrawLive(dc, r, liveIn * (1.0f - progress / 0.34f));
-        else if (Live() && expanded_ && progress < 0.2f) DrawLive(dc, r, (1.0f - progress / 0.2f) * liveIn);
-        else if (MusicPill() && !expanded_)
-            DrawMusicPill(dc, r, Clamp01((h_.x - kCollapsedH) / (kLyricPillH - kCollapsedH)) * (1.0f - progress / 0.34f));
-        else DrawSoluBar(dc, r, 1.0f - progress / 0.34f);                        // Solu is awake: the bar shows it
+        if (tourOn_ && (!expanded_ || progress < 0.2f)) {                       // the tour's invitation (fading as it opens)
+            DrawTourInvite(dc, r, liveIn * (expanded_ ? 1.0f - progress / 0.2f : 1.0f - progress / 0.34f));
+        } else {
+            if ((Live() || MusicPill()) && !expanded_) DrawGlimpseIcons(dc, r, (1.0f - progress / 0.34f));
+            if (Live() && !expanded_) DrawLive(dc, r, liveIn * (1.0f - progress / 0.34f));
+            else if (Live() && expanded_ && progress < 0.2f) DrawLive(dc, r, (1.0f - progress / 0.2f) * liveIn);
+            else if (MusicPill() && !expanded_)
+                DrawMusicPill(dc, r, Clamp01((h_.x - kCollapsedH) / (kLyricPillH - kCollapsedH)) * (1.0f - progress / 0.34f));
+            else DrawSoluBar(dc, r, 1.0f - progress / 0.34f);                    // Solu is awake: the bar shows it
+        }
     }
     const float contentAlpha = SmoothStep(0.62f, 1.0f, progress);
     if (contentAlpha > 0.003f) {
@@ -1724,6 +1851,10 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
     // Content drifts up slightly as it fades in, so the panel "settles" rather than pops.
     const float drift = (1.0f - alpha) * 6.0f;
     const D2D1_RECT_F base = D2D1::RectF(island.left, island.top + drift, island.left + kExpandedW, island.top + kExpandedH + drift);
+    if (TourShown()) {
+        DrawTour(dc, D2D1::RectF(base.left, base.top, base.right, std::max(base.bottom, island.bottom + drift)), alpha);
+        return;
+    }
     const auto tabs = TabRects(base);
 
     // Selection pill.
@@ -1742,14 +1873,12 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
         const float selected = sectionAlpha_[i];
         const float a = 0.50f + 0.45f * selected + 0.25f * tabHover_[i];
         D2D1_RECT_F labelRect = tabs[i];
-        if (i == static_cast<int>(Section::Solu)) {                  // a status dot: green awake, amber busy, none when off
+        if (i == static_cast<int>(Section::Solu)) {   // status dot, same colours as the buttons' lights: green awake, amber busy, grey off
             labelRect.left += 12.0f;
-            if (SoluAwake() || solu_.state == SoluState::Loading) {
-                const bool busy = solu_.state == SoluState::Loading || solu_.state == SoluState::Thinking;
-                const D2D1_COLOR_F c = busy ? kAmber : kGreen;
-                brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, std::min(a + 0.2f, 1.0f) * alpha));
-                dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tabs[i].left + 12.0f, (tabs[i].top + tabs[i].bottom) / 2), 3.0f, 3.0f), brush_.Get());
-            }
+            const bool busy = solu_.state == SoluState::Loading || solu_.state == SoluState::Thinking;
+            const D2D1_COLOR_F c = busy ? kAmber : SoluAwake() ? kGreen : kNeutral;
+            brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, std::min(a + 0.2f, 1.0f) * alpha));
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tabs[i].left + 12.0f, (tabs[i].top + tabs[i].bottom) / 2), 3.0f, 3.0f), brush_.Get());
         }
         DrawText(dc, kTabLabels[i], tabFont, labelRect, WithAlpha(kText, std::min(a, 0.96f) * alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
         if (i == static_cast<int>(Section::Notifications) && notifBadge_ > 0) {   // "+3": new while the user was elsewhere
@@ -1795,6 +1924,10 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
             DrawReminders(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
             continue;
         }
+        if (i == static_cast<int>(Section::SafeShare)) {
+            DrawSafeShare(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
+            continue;
+        }
         if (i == static_cast<int>(Section::Ai)) {
             DrawAgents(dc, D2D1::RectF(base.left, base.top + slide, base.right, std::max(base.bottom, island.bottom + drift) + slide), a);
             continue;
@@ -1838,6 +1971,7 @@ void IslandWindow::DrawContent(ID2D1DeviceContext* dc, D2D1_RECT_F island, float
     }
     DrawSoluCaption(dc, D2D1::RectF(base.left, base.top, base.right, std::max(base.bottom, island.bottom + drift)), alpha);   // the live view may be taller than a normal tab
     DrawAudioPopover(dc, base, alpha);
+    DrawDropChooser(dc, island, alpha);                              // files hovering: where shall they go (on top of all)
 }
 
 // ---- music -----------------------------------------------------------------------------------
@@ -2116,6 +2250,12 @@ std::array<D2D1_RECT_F, 3> IslandWindow::PermissionButtons(const D2D1_RECT_F& is
     const float x0 = island.left + 24;
     const float x1 = island.left + kExpandedW - (mascot_ ? kMascotLane : 24.0f);
     const float top = island.top + 96 + PermissionDetailH() + 6, bottom = top + 28;
+    // A question has nothing to approve: one wide button takes the user to the window where it is waiting.
+    if (!permissions_.empty() && permissions_.front().isQuestion) {
+        const D2D1_RECT_F go = D2D1::RectF(x1 - 210, top, x1, bottom);
+        const D2D1_RECT_F none = D2D1::RectF(-1, -1, -1, -1);     // off the window: never hit, never drawn
+        return {none, go, none};
+    }
     const D2D1_RECT_F approve = D2D1::RectF(x1 - 96, top, x1, bottom);
     const D2D1_RECT_F reject = D2D1::RectF(approve.left - 8 - 84, top, approve.left - 8, bottom);
     const D2D1_RECT_F defer = D2D1::RectF(x0, top, reject.left - 8, bottom);
@@ -2251,18 +2391,28 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
         dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{box, 8, 8}, brush_.Get(), 1.0f);
     }
     const std::wstring detail = r.detail.empty() ? r.tool : r.detail;
-    DrawText(dc, detail.c_str(), solu ? gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL) : gfx_.Mono(11.0f),   // an email reads better wrapped
-             D2D1::RectF(box.left + 10, box.top + (solu ? 5.0f : 3.0f), box.right - 10, box.bottom - 3), WithAlpha(kText, 0.92f * alpha),
-             DWRITE_TEXT_ALIGNMENT_LEADING, solu ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    const bool wrapped = solu || r.isQuestion;                   // an email, or a question, reads better wrapped
+    DrawText(dc, detail.c_str(), wrapped ? gfx_.Wrapped(12.5f, DWRITE_FONT_WEIGHT_NORMAL) : gfx_.Mono(11.0f),
+             D2D1::RectF(box.left + 10, box.top + (wrapped ? 5.0f : 3.0f), box.right - 10, box.bottom - 3), WithAlpha(kText, 0.92f * alpha),
+             DWRITE_TEXT_ALIGNMENT_LEADING, wrapped ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    const auto buttons = PermissionButtons(base);
+    IDWriteTextFormat* buttonFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    if (r.isQuestion) {                                          // one button: it goes to the window the question waits in
+        const float ha = permissionHover_[1];
+        brush_->SetColor(D2D1::ColorF(0.04f + 0.06f * ha, 0.47f + 0.06f * ha, 1.0f, alpha));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{buttons[1], 14, 14}, brush_.Get());
+        const std::wstring label = L"Answer in " + r.source;
+        DrawText(dc, label.c_str(), buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
 
     // Buttons: Reject, Approve, and a quiet way to answer in the tool itself instead.
-    const auto buttons = PermissionButtons(base);
     const float hr = permissionHover_[0], ha = permissionHover_[1], hd = permissionHover_[2];
     brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.10f + 0.06f * hr) * alpha));
     dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{buttons[0], 14, 14}, brush_.Get());
     brush_->SetColor(D2D1::ColorF(0.04f + 0.06f * ha, 0.47f + 0.06f * ha, 1.0f, alpha));   // accent blue
     dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{buttons[1], 14, 14}, brush_.Get());
-    IDWriteTextFormat* buttonFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     DrawText(dc, L"Reject", buttonFont, buttons[0], WithAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     DrawText(dc, L"Approve", buttonFont, buttons[1], D2D1::ColorF(1, 1, 1, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
     const std::wstring deferLabel = solu ? (r.canAlways ? L"Always allow" : L"") : L"Answer in " + r.source;
@@ -2272,12 +2422,14 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
 // ---- messages --------------------------------------------------------------------------------
 
 float IslandWindow::TargetHeight() const {
+    if (TourShown()) return kTourH;
     if (popover_ >= 0) return std::clamp(MenuHeight(popover_), kExpandedH, kMaxPanelH);
     if (section_ == Section::Ai && !permissions_.empty())         // a long approval card (an email) makes the island taller
         return std::clamp(96.0f + PermissionDetailH() + 6.0f + 28.0f + 14.0f, kExpandedH, kMaxPanelH);
     if (section_ == Section::Ai) return kAgentsH;                  // the agents panel
     if (section_ == Section::Shelf) return kShelfH;
     if (section_ == Section::Reminders) return reminders_.ringing.empty() ? kRemindersH : kAlarmH;
+    if (section_ == Section::SafeShare) return kShareH;
     if (section_ == Section::Solu && SoluTaskRows() > 0 && !CaptionsShown()) return kSoluTasksH;
     if (CaptionsShown() && !solu_.said.empty()) {                // the live view grows so the whole answer fits
         const float width = kExpandedW - 22.0f - (mascot_ ? kMascotLane : 22.0f);
@@ -2827,11 +2979,11 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
     const D2D1_RECT_F area = g.card;
     IDWriteTextFormat* quiet = gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
     IDWriteTextFormat* mainFont = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
-    const bool voicePage = settingsPage_ == 1, mutePage = settingsPage_ == 2;
+    const bool voicePage = settingsPage_ == 1, mutePage = settingsPage_ == 2, islandPage = settingsPage_ == 3;
     const float headTop = area.top;
 
     // ---- header ----------------------------------------------------------------------------------------------
-    if (voicePage || mutePage) {                                    // "< Voice" / "< Notifications": tap to go back
+    if (voicePage || mutePage || islandPage) {                      // "< Voice" / "< Notifications": tap to go back
         const float hot = hover_ == kHitPopBack ? 1.0f : 0.0f;
         if (hot > 0) {
             brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.075f * a));
@@ -2840,7 +2992,8 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
         brush_->SetColor(D2D1::ColorF(1, 1, 1, (0.78f + 0.2f * hot) * a));
         dc->DrawLine(D2D1::Point2F(area.left + 10, headTop + 7), D2D1::Point2F(area.left + 4, headTop + 13), brush_.Get(), 1.9f, roundStroke_.Get());
         dc->DrawLine(D2D1::Point2F(area.left + 4, headTop + 13), D2D1::Point2F(area.left + 10, headTop + 19), brush_.Get(), 1.9f, roundStroke_.Get());
-        DrawText(dc, mutePage ? L"Notifications" : L"Voice", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(area.left + 22, headTop, area.left + 160, headTop + 26),
+        DrawText(dc, mutePage ? L"Notifications" : islandPage ? L"Closed island" : L"Voice", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                 D2D1::RectF(area.left + 22, headTop, area.left + 160, headTop + 26),
                  WithAlpha(kText, a));
     } else {
         DrawText(dc, L"", gfx_.Text(15.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(area.left, headTop, area.left + 24, headTop + 26),
@@ -2878,15 +3031,22 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
         }
         std::wstring title, note;
         bool isSwitch = false, on = false, chevron = false, selected = false;
-        if (!voicePage && !mutePage) {                             // the options page
+        if (!voicePage && !mutePage && !islandPage) {              // the options page
             switch (k) {
             case 0: title = L"Solu AI"; note = soluNote; isSwitch = true; on = solu_.enabled; break;
-            case 1: title = L"Live captions"; note = L"Show the conversation on the island"; isSwitch = true; on = solu_.captions; break;
+            case 1: title = L"Solu's live captions"; note = L"Show your conversation with Solu on the island"; isSwitch = true; on = solu_.captions; break;
             case 2: title = L"Headphones mode"; note = solu_.headphones ? L"You can talk over Solu" : L"Solu waits until it has finished talking";
                     isSwitch = true; on = solu_.headphones; break;
             case 3: title = L"Screen help"; note = solu_.screen ? L"Say \u201cSolu, look at this\u201d \u00B7 only when you ask" : L"Solu will not look at your screen";
                     isSwitch = true; on = solu_.screen; break;
             case 4: title = L"Voice"; note = voiceName + L" · " + voiceNote; chevron = true; break;
+            case 6:
+                title = L"Closed island";
+                note = glimpseLyrics_ && glimpseAgents_ ? L"Shows song lyrics and agents at work"
+                       : glimpseLyrics_ ? L"Shows song lyrics · agents hidden"
+                       : glimpseAgents_ ? L"Shows agents at work · lyrics hidden" : L"Lyrics and agents hidden";
+                chevron = true;
+                break;
             default: {
                 title = L"Notifications";
                 const size_t muted = mutes_.apps.size();
@@ -2896,6 +3056,17 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
                 break;
             }
             }
+        } else if (islandPage) {
+            if (k == 0) {
+                title = L"Song lyrics";
+                note = glimpseLyrics_ ? L"The line being sung, while music plays" : L"Hidden (the Music tab still has them)";
+                on = glimpseLyrics_;
+            } else {
+                title = L"Agent progress";
+                note = glimpseAgents_ ? L"Claude Code and Codex at work, and when they finish" : L"Hidden (the Agents tab still has it)";
+                on = glimpseAgents_;
+            }
+            isSwitch = true;
         } else if (mutePage) {
             if (k == 0) {
                 title = L"Mute all";
@@ -2953,7 +3124,8 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
     // ---- footer: only a hint -----------------------------------------------------------------------------------------
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * a));
     dc->DrawLine(D2D1::Point2F(area.left, g.footer.top - 0.5f), D2D1::Point2F(area.right, g.footer.top - 0.5f), brush_.Get(), 1.0f);
-    DrawText(dc, voicePage ? L"Solu says hello in the voice you pick" : mutePage ? L"Muted apps stay quiet on Windows and the island" : L"Say “Solu” to talk · or press Ctrl+Alt+Space", quiet, g.footer,
+    DrawText(dc, voicePage ? L"Solu says hello in the voice you pick" : mutePage ? L"Muted apps stay quiet on Windows and the island"
+                 : islandPage ? L"What the thin bar may show when the island is closed" : L"Say “Solu” to talk · or press Ctrl+Alt+Space", quiet, g.footer,
              WithAlpha(kTextDim, 1.15f * a), DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
@@ -2973,7 +3145,7 @@ void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
         title = L"Solu is off";
         sub = solu_.error.empty() ? L"Switch it on in Settings (the gear) and just say “Solu”." : solu_.error;
         break;
-    case SoluState::Missing: title = L"Solu isn't installed"; sub = L"Run tools\\setup_solu.ps1 once, then switch it on."; tint = kRed; break;
+    case SoluState::Missing: title = L"Solu isn't set up yet"; sub = L"Tap to set it up"; tint = kAccent; break;
     case SoluState::Loading: title = L"Solu is waking up…"; sub = L"It loads its models, a few seconds."; tint = kAmber; break;
     case SoluState::Ready: title = L"Solu is listening"; sub = L"Say “Solu”, or press Ctrl+Alt+Space."; tint = kGreen; break;
     case SoluState::Listening: title = L"I'm listening"; sub = L"Go ahead."; tint = kGreen; break;
@@ -2983,7 +3155,9 @@ void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
     brush_->SetColor(D2D1::ColorF(tint.r, tint.g, tint.b, alpha));
     dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(left + 4, y + 11), 4.0f, 4.0f), brush_.Get());
     DrawText(dc, title.c_str(), gfx_.Text(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left + 18, y, right, y + 22), WithAlpha(kText, alpha));
-    DrawText(dc, sub.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(left + 18, y + 22, right, y + 40), WithAlpha(kTextDim, alpha));
+    const bool missingHot = solu_.state == SoluState::Missing && hover_ == kHitSoluSetup;
+    DrawText(dc, sub.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(left + 18, y + 22, right, y + 40),
+             solu_.state == SoluState::Missing ? WithAlpha(kAccent, (missingHot ? 1.0f : 0.85f) * alpha) : WithAlpha(kTextDim, alpha));
     y += 52.0f;
 
     if (const int rows = SoluTaskRows(); rows > 0) {                  // long tasks: what Solu is working on, with controls
@@ -3061,33 +3235,46 @@ bool HasFiles(IDataObject* data) {
 }
 } // namespace
 
-DWORD IslandWindow::ShelfDragEnter(IDataObject* data) {
+// The left half of the island is the Shelf, the right half SafeShare (by side only, so it works while the island opens).
+IslandWindow::DropZone IslandWindow::DropZoneAt(POINT screen) const {
+    POINT cl = screen;
+    ScreenToClient(hwnd_, &cl);
+    const D2D1_RECT_F r = IslandRect();
+    return ToDip(cl).x < (r.left + r.right) / 2 ? DropZone::Shelf : DropZone::SafeShare;
+}
+
+DWORD IslandWindow::FilesDragEnter(IDataObject* data, POINT screen) {
     if (shelfDragging_ || suppressed_ || !HasFiles(data)) return DROPEFFECT_NONE;      // not files, or our own drag coming back
     dragOver_ = true;
     dragOpened_ = !expanded_;
     KillTimer(hwnd_, kCloseTimer);
     KillTimer(hwnd_, kAutoCloseTimer);
+    popover_ = -1;                                                    // (a menu would sit on top of the zones)
     Expand();
-    if (section_ != Section::Shelf) OnClick(static_cast<int>(Section::Shelf));
-    Animate();
-    return DROPEFFECT_COPY;
+    return FilesDragOver(screen);
 }
 
-DWORD IslandWindow::ShelfDragOver() {
+DWORD IslandWindow::FilesDragOver(POINT screen) {
     if (!dragOver_) return DROPEFFECT_NONE;
     KillTimer(hwnd_, kCloseTimer);
-    return DROPEFFECT_COPY;
+    const DropZone zone = DropZoneAt(screen);
+    if (zone != dropZone_) {
+        dropZone_ = zone;
+        Animate();
+    }
+    return zone == DropZone::SafeShare && !ShareTakesDrops() ? DROPEFFECT_NONE : DROPEFFECT_COPY;
 }
 
-void IslandWindow::ShelfDragLeave() {
+void IslandWindow::FilesDragLeave() {
     if (!dragOver_) return;
     dragOver_ = false;
     if (dragOpened_ && expanded_) SetTimer(hwnd_, kCloseTimer, 700, nullptr);             // it opened for the drag: close again
     Animate();
 }
 
-DWORD IslandWindow::ShelfDrop(IDataObject* data) {
+DWORD IslandWindow::FilesDrop(IDataObject* data, POINT screen) {
     dragOver_ = false;
+    const DropZone zone = DropZoneAt(screen);
     std::vector<std::wstring> paths;
     FORMATETC fmt{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM medium{};
@@ -3102,6 +3289,19 @@ DWORD IslandWindow::ShelfDrop(IDataObject* data) {
         }
         ReleaseStgMedium(&medium);
     }
+    if (zone == DropZone::SafeShare) {                                // to send: the SafeShare tab, open, to fill in
+        if (!ShareTakesDrops() || paths.empty()) {
+            Animate();
+            return DROPEFFECT_NONE;
+        }
+        OnClick(static_cast<int>(Section::SafeShare));
+        shareSentView_ = false;
+        AddShareFiles(paths);
+        autoClosePending_ = false;                                    // it stays open: the email is still to be written
+        Animate();
+        return DROPEFFECT_COPY;
+    }
+    if (section_ != Section::Shelf) OnClick(static_cast<int>(Section::Shelf));   // to hold: the Shelf, briefly, then it closes
     if (!paths.empty() && shelfAdd_) shelfAdd_(paths);
     SetTimer(hwnd_, kAutoCloseTimer, 3200, nullptr);                  // it stays a moment, so you can see it landed
     autoClosePending_ = dragOpened_;
@@ -3242,33 +3442,56 @@ void IslandWindow::DrawShelf(ID2D1DeviceContext* dc, D2D1_RECT_F base, float a) 
         dc->DrawLine(D2D1::Point2F(m.x, m.y - 8), D2D1::Point2F(m.x, m.y + 8), brush_.Get(), 2.0f, roundStroke_.Get());
     }
     dc->PopAxisAlignedClip();
+}
 
-    // ---- files are hovering over the island: a big, breathing drop target covers the shelf
-    if (dragT_ > 0.01f) {
-        const float t = dragT_;
-        const float breathe = 1.0f + 0.05f * std::sin(now * 6.0f);
-        const D2D1_RECT_F z = D2D1::RectF(area.left - 6, base.top + 52, area.right + 6, area.bottom + 6);
-        brush_->SetColor(D2D1::ColorF(kIslandFill.r, kIslandFill.g, kIslandFill.b, t));          // opaque: what is underneath must not show through
-        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{z, 18, 18}, brush_.Get());
-        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, (0.18f + 0.07f * std::sin(now * 6.0f)) * t));
-        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{z, 18, 18}, brush_.Get());
-        Com<ID2D1StrokeStyle> dashed;                                       // a dashed accent outline
-        D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.0f,
-                                                                      D2D1_DASH_STYLE_DASH, 0.0f);
-        gfx_.d2dFactory()->CreateStrokeStyle(sp, nullptr, 0, &dashed);
-        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.95f * t));
-        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(z.left + 6, z.top + 6, z.right - 6, z.bottom - 6), 14, 14}, brush_.Get(), 1.8f, dashed.Get());
-        const D2D1_POINT_2F c = D2D1::Point2F((z.left + z.right) / 2, (z.top + z.bottom) / 2 - 12);
-        const float r = 21.0f * breathe;
-        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, 0.30f * t));
-        dc->FillEllipse(D2D1::Ellipse(c, r + 5, r + 5), brush_.Get());
-        brush_->SetColor(D2D1::ColorF(0.04f, 0.47f, 1.0f, t));
+// Files hovering over the island: two zones side by side, the Shelf (hold them, drag them out later) and SafeShare (send
+// them). The one under the files lights up and breathes; the cat has stepped aside (see Render) to make room.
+void IslandWindow::DrawDropChooser(ID2D1DeviceContext* dc, const D2D1_RECT_F& island, float alpha) {
+    const float t = dragT_ * alpha;
+    if (t < 0.01f) return;
+    const float now = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
+    const D2D1_RECT_F area = D2D1::RectF(island.left + 16, island.top + kTabTop + kTabH + 8, island.right - 16, island.bottom - 14);
+    if (area.bottom - area.top < 40) return;                          // (still opening)
+    brush_->SetColor(D2D1::ColorF(kIslandFill.r, kIslandFill.g, kIslandFill.b, t));          // opaque: the tab below must not show through
+    dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(area.left - 6, area.top - 6, area.right + 6, area.bottom + 6), 20, 20}, brush_.Get());
+
+    Com<ID2D1StrokeStyle> dashed;
+    const D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                        D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_DASH, 0.0f);
+    gfx_.d2dFactory()->CreateStrokeStyle(sp, nullptr, 0, &dashed);
+    const float mid = (area.left + area.right) / 2;
+    struct Zone {
+        D2D1_RECT_F box;
+        float hot;                                                    // 0..1: the files are over this one
+        bool open;                                                    // it takes the files now
+        const wchar_t *glyph, *title, *line;
+    };
+    const bool shareOpen = ShareTakesDrops();
+    const Zone zones[2] = {
+        {D2D1::RectF(area.left, area.top, mid - 6, area.bottom), 1.0f - dropShare_, true, L"", L"Shelf", L"Hold it here, drag it out later"},
+        {D2D1::RectF(mid + 6, area.top, area.right, area.bottom), dropShare_, shareOpen, L"", L"SafeShare",
+         shareOpen ? L"Send it by email or to your phone" : L"A send is on its way. Wait for it to finish"},
+    };
+    for (const Zone& z : zones) {
+        const float hot = z.open ? z.hot : 0.0f;
+        const D2D1_COLOR_F tint = z.open ? kAccent : kTextDim;
+        brush_->SetColor(D2D1::ColorF(tint.r, tint.g, tint.b, (0.05f + (0.14f + 0.05f * std::sin(now * 6.0f)) * hot) * t));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{z.box, 16, 16}, brush_.Get());
+        brush_->SetColor(D2D1::ColorF(tint.r, tint.g, tint.b, (0.30f + 0.65f * hot) * t));
+        dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{D2D1::RectF(z.box.left + 1, z.box.top + 1, z.box.right - 1, z.box.bottom - 1), 15, 15},
+                                 brush_.Get(), 1.0f + 0.8f * hot, dashed.Get());
+        const float cy = (z.box.top + z.box.bottom) / 2;
+        const D2D1_POINT_2F c = D2D1::Point2F((z.box.left + z.box.right) / 2, cy - 20);
+        const float r = 18.0f * (1.0f + 0.06f * hot * std::sin(now * 6.0f));
+        if (z.open) brush_->SetColor(D2D1::ColorF(0.04f, 0.47f, 1.0f, (0.35f + 0.65f * hot) * t));
+        else brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.10f * t));
         dc->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
-        brush_->SetColor(D2D1::ColorF(1, 1, 1, t));
-        dc->DrawLine(D2D1::Point2F(c.x - 8, c.y), D2D1::Point2F(c.x + 8, c.y), brush_.Get(), 2.6f, roundStroke_.Get());
-        dc->DrawLine(D2D1::Point2F(c.x, c.y - 8), D2D1::Point2F(c.x, c.y + 8), brush_.Get(), 2.6f, roundStroke_.Get());
-        DrawText(dc, L"Drop to hold on the shelf", gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-                 D2D1::RectF(z.left, c.y + 28, z.right, c.y + 50), WithAlpha(kText, t), DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(dc, z.glyph, gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_NORMAL, true), D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r),
+                 D2D1::ColorF(1, 1, 1, (z.open ? 1.0f : 0.5f) * t), DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(dc, z.title, gfx_.Text(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(z.box.left + 8, cy + 4, z.box.right - 8, cy + 24),
+                 WithAlpha(kText, (z.open ? 0.75f + 0.25f * hot : 0.5f) * t), DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawText(dc, z.line, gfx_.Text(11.5f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(z.box.left + 8, cy + 24, z.box.right - 8, cy + 42),
+                 WithAlpha(kTextDim, 1.15f * t), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
 
@@ -3673,7 +3896,7 @@ void IslandWindow::OnChar(wchar_t ch) {
         if (GetKeyState(VK_SHIFT) & 0x8000) prompt_.Insert(L"\n");
         else SendPrompt();
     } else if (ch == L'\r' || ch == L'\t') {
-        RemindersKey(ch == L'\r' ? VK_RETURN : VK_TAB);
+        ViewKey(ch == L'\r' ? VK_RETURN : VK_TAB);
     } else if (field_->OnChar(ch)) {
         if (field_ == &prompt_) agentError_.clear();
         if (field_ == &reminderWhat_) reminderFlip_ = false;                // a new time: the guess starts again
@@ -3687,16 +3910,26 @@ void IslandWindow::OnKey(WPARAM vk) {
         if (const AgentSession* s = CurrentSession())
             agentScroll_ = std::clamp(agentScroll_ + (vk == VK_UP ? 1 : -1), 0, std::max(0, static_cast<int>(s->feed.size()) - 1));
     } else if (field_ != &prompt_ && (vk == VK_UP || vk == VK_DOWN)) {
-        RemindersKey(vk);
+        ViewKey(vk);
     } else {
         field_->OnKey(vk, hwnd_);
     }
     Animate();
 }
 
+bool IslandWindow::ViewKey(WPARAM vk) { return RemindersKey(vk) || SafeShareKey(vk); }
+
+int IslandWindow::FieldSection(const TextField* field) const {
+    if (!field) return -1;
+    if (field == &prompt_) return static_cast<int>(Section::Ai);
+    if (field == &reminderWhat_ || field == &reminderNote_) return static_cast<int>(Section::Reminders);
+    if (field == &shareName_ || field == &shareEmail_ || field == &sharePassword_) return static_cast<int>(Section::SafeShare);
+    return -1;
+}
+
 // One line of editable text: hint when empty, the text scrolled so the caret stays in view, a blinking caret.
-// `right`: room kept free at the right end (for a chip drawn inside the box).
-void IslandWindow::DrawField(ID2D1DeviceContext* dc, TextField& field, const D2D1_RECT_F& box, const wchar_t* hint, float a, float right) {
+void IslandWindow::DrawField(ID2D1DeviceContext* dc, TextField& field, const D2D1_RECT_F& box, const wchar_t* hint, float a, float right,
+                             bool secret) {
     const bool focused = field_ == &field;
     const float radius = (box.bottom - box.top) / 2;
     brush_->SetColor(D2D1::ColorF(1, 1, 1, (focused ? 0.13f : 0.075f) * a));
@@ -3708,7 +3941,7 @@ void IslandWindow::DrawField(ID2D1DeviceContext* dc, TextField& field, const D2D
     }
     IDWriteTextFormat* input = gfx_.Text(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
     const float textLeft = box.left + 14, textRight = box.right - 12 - right, width = textRight - textLeft;
-    std::wstring shown = field.text;
+    std::wstring shown = secret ? std::wstring(field.text.size(), L'\u2022') : field.text;
     for (wchar_t& c : shown)
         if (c == L'\n') c = L'⏎';
     if (shown.empty()) {
@@ -3754,6 +3987,7 @@ void IslandWindow::SendPrompt() {
 // ---- live pills ------------------------------------------------------------------------------
 
 float IslandWindow::CollapsedW() const {
+    if (TourInvite()) return TourInviteW();
     if (Live()) return kLiveW + GlimpseIconsW();
     if (MusicPill()) {                                              // as wide as the line, within reason
         const std::wstring& text = lyrics_.lines[static_cast<size_t>(lyricLine_)].text;
@@ -3762,7 +3996,7 @@ float IslandWindow::CollapsedW() const {
     }
     return kCollapsedW;
 }
-float IslandWindow::CollapsedH() const { return Live() ? kLiveH : MusicPill() ? kLyricPillH : kCollapsedH; }
+float IslandWindow::CollapsedH() const { return TourInvite() || Live() ? kLiveH : MusicPill() ? kLyricPillH : kCollapsedH; }
 
 // ---- live lyrics ----------------------------------------------------------------------------
 
@@ -3770,8 +4004,15 @@ bool IslandWindow::LyricsReady() const {
     return lyricsOn_ && media_.hasSession && lyrics_.status == Lyrics::Status::Found && !lyrics_.lines.empty();
 }
 
+void IslandWindow::SetGlimpsePrefs(bool lyrics, bool agents) {
+    glimpseLyrics_ = lyrics;
+    glimpseAgents_ = agents;
+    RefreshCollapsed();
+    Animate();
+}
+
 bool IslandWindow::MusicGlimpse() const {
-    if (!media_.hasSession || !media_.playing || SoluActive()) return false;   // (a conversation hides it)
+    if (!glimpseLyrics_ || !media_.hasSession || !media_.playing || SoluActive()) return false;   // (a conversation hides it)
     return LyricsReady() && lyricLine_ >= 0 && lyricLine_ < static_cast<int>(lyrics_.lines.size());   // only the lyrics, once the singing starts
 }
 
@@ -4023,11 +4264,17 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
         const float ring = 10.5f + 16.0f * SmoothStep(0.0f, 1.0f, arrive);
         dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(r.left + 19, cy), ring, ring), brush_.Get(), 1.6f);
     }
+    float textLeft = r.left + 36;
     if (ID2D1Bitmap1* thumb = act.thumb && !act.thumb->empty() ? Thumb(*act.thumb) : nullptr) {   // a screenshot: the picture itself
-        const float h = 22.0f * pop, w = std::min(34.0f, h * act.thumb->width / std::max(1u, act.thumb->height));
-        const D2D1_RECT_F pic = D2D1::RectF(r.left + 20 - w / 2, cy - h / 2, r.left + 20 + w / 2, cy + h / 2);
+        // The picture takes the island's own shape: a capsule the same distance from the top, bottom and left edges,
+        // its rounded end concentric with the pill's, so it never runs into the curve.
+        const float h0 = std::min(24.0f, (r.bottom - r.top) - 12.0f), inset = ((r.bottom - r.top) - h0) / 2;
+        const float w0 = std::clamp(h0 * act.thumb->width / std::max(1u, act.thumb->height), h0, 40.0f);
+        const float cx = r.left + inset + w0 / 2, h = h0 * pop, w = w0 * pop;
+        const D2D1_RECT_F pic = D2D1::RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
+        textLeft = r.left + inset + w0 + 9;
         Com<ID2D1RoundedRectangleGeometry> clip;
-        gfx_.d2dFactory()->CreateRoundedRectangleGeometry(D2D1_ROUNDED_RECT{pic, 4, 4}, &clip);
+        gfx_.d2dFactory()->CreateRoundedRectangleGeometry(D2D1_ROUNDED_RECT{pic, h / 2, h / 2}, &clip);
         dc->PushLayer(D2D1::LayerParameters1(pic, clip.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), a), nullptr);
         dc->DrawBitmap(thumb, pic, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
         dc->PopLayer();
@@ -4073,7 +4320,7 @@ void IslandWindow::DrawLive(ID2D1DeviceContext* dc, const D2D1_RECT_F& full, flo
     // Title and detail on one line.
     IDWriteTextFormat* strong = gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     const float titleW = std::ceil(gfx_.MeasureWidth(act.title.c_str(), strong));
-    const float textLeft = r.left + 36 + slide;
+    textLeft += slide;
     DrawText(dc, act.title.c_str(), strong, D2D1::RectF(textLeft, cy - 9, std::min(right, textLeft + titleW + 2), cy + 9), WithAlpha(kText, textA));
     if (!act.detail.empty() && textLeft + titleW + 10 < right)
         DrawText(dc, act.detail.c_str(), gfx_.Text(12.0f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(textLeft + titleW + 8, cy - 9, right, cy + 9),
@@ -4292,7 +4539,8 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_ISLAND_MIDDLE:                                    // middle click or wheel on the closed island
         if (wp) wheelOpenedAt_ = GetTickCount64();               // the rest of that wheel flick must not scroll the tab
         if (!expanded_ && !suppressed_) {
-            if (!wp) OnMiddleClick(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});   // a click: it matters where
+            if (TourInvite()) Expand();                              // the tour's invitation: any way in is the right one
+            else if (!wp) OnMiddleClick(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});   // a click: it matters where
             else if (Live() || MusicPill()) OnClick(kHitLive);         // the wheel: open on what is shown
             else Expand();
         }
@@ -4347,6 +4595,10 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             Animate();
             return 0;
         }
+        if (!expanded_ && TourInvite()) {                     // a plain click on the invitation opens it too
+            Expand();
+            return 0;
+        }
         const int hit = HitTest(ToDip(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
         const int was = pressed_;
         pressed_ = -1;
@@ -4360,7 +4612,7 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         seeking_ = false;                                  // capture lost mid-drag: cancel, don't seek
         return 0;
     case WM_SETCURSOR:
-        SetCursor(LoadCursorW(nullptr, hover_ == kHitPrompt ? IDC_IBEAM : hover_ >= 0 ? IDC_HAND : IDC_ARROW));
+        SetCursor(LoadCursorW(nullptr, hover_ == kHitPrompt ? IDC_IBEAM : hover_ >= 0 || TourInvite() ? IDC_HAND : IDC_ARROW));
         return TRUE;
     case WM_TIMER:
         if (wp == kAgentTimer) {
@@ -4375,6 +4627,22 @@ LRESULT IslandWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             if (const Activity* a = FrontActivity(); a && a->startedAt && GetTickCount64() - a->startedAt >= kArrivalMs)
                 SetActivities(activities_);              // the arrival animation is over: back to the calm pace
             Animate();                                   // the countdown or the shimmer moves on
+            return 0;
+        }
+        if (wp == kTourTimer) {                          // the goodbye is over: the island tucks itself away
+            KillTimer(hwnd_, kTourTimer);
+            if (tourFinishing_) {
+                TourLeave(static_cast<TourStep>(tourStep_));
+                tourOn_ = tourFinishing_ = false;
+                Collapse();
+                if (tour_.finished) tour_.finished(true);
+            }
+            return 0;
+        }
+        if (wp == kShareTimer) {
+            KillTimer(hwnd_, kShareTimer);
+            if (GetTickCount64() >= shareConfirmUntil_) shareConfirm_.clear();
+            Animate();
             return 0;
         }
         if (wp == kTestTimer) {

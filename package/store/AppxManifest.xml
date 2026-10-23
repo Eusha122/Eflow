@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Microsoft Store package: unlike package\AppxManifest.xml (the sparse package a development build registers),
+     this one CONTAINS the app, and is what tools\build_store.ps1 packs into an .msix.
+
+     Identity, Publisher and PublisherDisplayName must match the app reserved in Partner Center exactly, or the Store
+     rejects the upload; build_store.ps1 fills them in from the values passed to it. -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap uap3 uap10 desktop rescap">
+  <Identity Name="{IDENTITY_NAME}" Publisher="{PUBLISHER}" Version="{VERSION}" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Eflow</DisplayName>
+    <PublisherDisplayName>{PUBLISHER_DISPLAY_NAME}</PublisherDisplayName>
+    <Logo>assets\StoreLogo.png</Logo>
+  </Properties>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application Id="Eflow" Executable="eflow.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements DisplayName="Eflow" Description="A living island at the top of your Windows screen."
+                          BackgroundColor="transparent" Square150x150Logo="assets\Square150x150Logo.png"
+                          Square44x44Logo="assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="assets\Wide310x150Logo.png" Square71x71Logo="assets\SmallTile.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Eflow belongs at the top of the screen from the moment you sign in; the tour's last step and the tray
+             menu both turn this off again. -->
+        <desktop:Extension Category="windows.startupTask" Executable="eflow.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="EflowStartup" Enabled="true" DisplayName="Eflow" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <!-- Reading the notifications Windows already shows is the whole point of the Notifications tab. Both of these are
+         restricted capabilities: the Store submission has to justify them in writing. -->
+    <uap3:Capability Name="userNotificationListener" />
+  </Capabilities>
+</Package>

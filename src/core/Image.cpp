@@ -50,4 +50,29 @@ bool DecodeImage(const uint8_t* bytes, size_t size, float scale, uint32_t maxSid
     return SUCCEEDED(source->CopyPixels(nullptr, sw * 4, static_cast<UINT>(out.pixels.size()), out.pixels.data()));
 }
 
+bool SavePng(const ImageBGRA& image, const wchar_t* path) {
+    using Microsoft::WRL::ComPtr;
+    if (image.empty() || image.pixels.size() != static_cast<size_t>(image.width) * image.height * 4) return false;
+    std::vector<uint8_t> straight(image.pixels);                         // PNG stores straight (not premultiplied) alpha
+    for (size_t i = 0; i < straight.size(); i += 4) {
+        const uint8_t alpha = straight[i + 3];
+        if (alpha == 0 || alpha == 255) continue;
+        for (size_t c = 0; c < 3; ++c) straight[i + c] = static_cast<uint8_t>(std::min(255, (straight[i + c] * 255 + alpha / 2) / alpha));
+    }
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    return SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+           SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(path, GENERIC_WRITE)) &&
+           SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+           SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+           SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+           SUCCEEDED(frame->SetSize(image.width, image.height)) && SUCCEEDED(frame->SetPixelFormat(&format)) &&
+           format == GUID_WICPixelFormat32bppBGRA &&
+           SUCCEEDED(frame->WritePixels(image.height, image.width * 4, static_cast<UINT>(straight.size()), straight.data())) &&
+           SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+}
+
 } // namespace eflow

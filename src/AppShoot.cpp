@@ -2,9 +2,10 @@
 // in by a director script (build/shoot/director.py) over WM_COPYDATA, one JSON command per message. While it is
 // on, the real notification, agent, Solu, permission, system, device, shelf and activity feeds are ignored and
 // the island's buttons only change the scripted state (nothing is really muted, approved or sent). Music stays real.
+// Only the director's commands are debug-only; the button handlers below are built everywhere, since App.cpp routes
+// to them whenever shoot_ is on (which only a debug build's commands can do).
 #include "App.h"
 
-#ifndef NDEBUG
 #include <fstream>
 #include <iterator>
 
@@ -15,6 +16,19 @@
 namespace eflow {
 namespace {
 
+std::shared_ptr<const ImageBGRA> LoadPicture(const std::wstring& path, uint32_t maxSide) {
+    if (path.empty()) return nullptr;
+    std::ifstream in(path, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto image = std::make_shared<ImageBGRA>();
+    if (bytes.empty() || !DecodeImage(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), 1.0f, maxSide, *image)) {
+        Log("shoot: could not load %ls", path.c_str());
+        return nullptr;
+    }
+    return image;
+}
+
+#ifndef NDEBUG
 using json::Value;
 
 const Value* Get(const Value& v, const char* key) {
@@ -37,18 +51,6 @@ const std::vector<Value>& Items(const Value& v, const char* key) {
     static const std::vector<Value> none;
     const Value* m = Get(v, key);
     return m && m->type == Value::Type::Array ? m->items : none;
-}
-
-std::shared_ptr<const ImageBGRA> LoadPicture(const std::wstring& path, uint32_t maxSide) {
-    if (path.empty()) return nullptr;
-    std::ifstream in(path, std::ios::binary);
-    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    auto image = std::make_shared<ImageBGRA>();
-    if (bytes.empty() || !DecodeImage(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), 1.0f, maxSide, *image)) {
-        Log("shoot: could not load %ls", path.c_str());
-        return nullptr;
-    }
-    return image;
 }
 
 ULONGLONG UnixMs() {
@@ -98,9 +100,11 @@ AudioSide ParseSide(const Value& v, int defaultForm) {
     side.muted = Bool(v, "muted");
     return side;
 }
+#endif
 
 } // namespace
 
+#ifndef NDEBUG
 void App::OnShootCommand(const std::string& text) {
     Value v;
     std::string error;
@@ -142,6 +146,113 @@ void App::OnShootCommand(const std::string& text) {
             OnShelfChanged();
             PushActivities();
         }
+        return;
+    }
+    if (cmd == L"safeshare_send") {                               // end-to-end tests: a real send, as if the tab's Send was pressed
+        ShareSendRequest request;
+        for (const Value& f : Items(v, "files")) request.paths.push_back(FromUtf8(f.text));
+        request.sender = Str(v, "sender");
+        request.email = Str(v, "email");
+        request.password = Str(v, "password");
+        request.maxDevices = static_cast<int>(Num(v, "maxDevices", 1));
+        if (safeShare_) safeShare_->Send(request);
+        return;
+    }
+    if (cmd == L"safeshare_cancel" || cmd == L"safeshare_dismiss") {   // end-to-end tests: as if Cancel / Done was pressed
+        if (safeShare_) cmd == L"safeshare_cancel" ? safeShare_->Cancel() : safeShare_->Dismiss();
+        return;
+    }
+    if (cmd == L"safeshare_state") {                              // written to `file` as JSON: the send's phase and error
+        if (!safeShare_) return;
+        const SafeShareSnapshot snap = safeShare_->Snapshot();
+        Value s = Value::Object();
+        s.Member("phase") = Value::Number(std::to_string(static_cast<int>(snap.transfer.phase)));
+        s.Member("error") = Value::String(ToUtf8(snap.transfer.error));
+        s.Member("done") = Value::Number(std::to_string(snap.transfer.done));
+        s.Member("total") = Value::Number(std::to_string(snap.transfer.total));
+        s.Member("sent") = Value::Number(std::to_string(snap.sent.size()));
+        std::ofstream(Str(v, "file"), std::ios::trunc) << json::Write(s);
+        return;
+    }
+    if (cmd == L"safeshare_event") {                              // end-to-end tests: as if a sent room was just opened
+        SafeShareService::Event e;
+        e.kind = Bool(v, "downloaded") ? SafeShareService::Event::Kind::Downloaded : SafeShareService::Event::Kind::Opened;
+        e.roomId = Str(v, "room", L"test");
+        e.title = Str(v, "title", L"report.pdf");
+        e.recipient = Str(v, "recipient", L"someone@example.com");
+        e.where = Str(v, "where");
+        OnSafeShareEvent(e);
+        return;
+    }
+    if (cmd == L"phone") {                                        // end-to-end tests: the phone link, as the tab's buttons drive it
+        if (!phone_) return;
+        const std::wstring act = Str(v, "do");
+        if (act == L"start" || act == L"start_public") phone_->Start(act == L"start_public");
+        else if (act == L"stop") phone_->Stop();
+        else if (act == L"allow" || act == L"deny") phone_->Allow(act == L"allow");
+        else if (act == L"offer") {
+            std::vector<std::wstring> paths;
+            for (const Value& f : Items(v, "files")) paths.push_back(FromUtf8(f.text));
+            phone_->Offer(paths);
+        } else if (act == L"state") {                             // written to `file` as JSON: state, url, device, received
+            const PhoneLink p = phone_->Snapshot();
+            Value s = Value::Object();
+            s.Member("state") = Value::Number(std::to_string(static_cast<int>(p.state)));
+            s.Member("url") = Value::String(ToUtf8(p.url));
+            s.Member("device") = Value::String(ToUtf8(p.device));
+            s.Member("reason") = Value::String(ToUtf8(p.reason));
+            s.Member("received") = Value::Number(std::to_string(p.received));
+            s.Member("qrSize") = Value::Number(std::to_string(p.qrSize));
+            std::ofstream(Str(v, "file"), std::ios::trunc) << json::Write(s);
+        }
+        return;
+    }
+    if (cmd == L"shelf_remove") {                                 // tests clean up what they put on the Shelf
+        if (shelf_) shelf_->Remove(Str(v, "file"));
+        return;
+    }
+    if (cmd == L"settings_preview") {                           // layout checks: the gear's menu on a page
+        for (auto& island : islands_) island->DebugSettings(static_cast<int>(Num(v, "page", -1)));
+        return;
+    }
+    if (cmd == L"drop_preview") {                               // layout checks: the drop zones, as if files hovered
+        for (auto& island : islands_) island->DebugDropPreview(static_cast<int>(Num(v, "zone", -1)));
+        return;
+    }
+    if (cmd == L"tour") {                                         // layout checks: the welcome tour on a step (0 the invitation, -1 ends it)
+        const int step = static_cast<int>(Num(v, "step", -1));
+        if (!islands_.empty()) {
+            if (step >= 0 && !tourIsland_) {
+                tourIsland_ = islands_.front().get();
+                PushTourStatus();
+            }
+            islands_.front()->DebugTour(step);
+            if (step < 0) tourIsland_ = nullptr;
+        }
+        return;
+    }
+    if (cmd == L"solu_setup_begin") {                             // dev tool: run SoluSetup directly, outside the tour
+        if (soluSetup_) {
+            soluSetupHandled_ = false;
+            soluSetup_->Begin(msgWnd_, Str(v, "model", L"qwen3:4b-instruct"));
+        }
+        return;
+    }
+    if (cmd == L"solu_setup_status") {                            // dev tool: the plan + live progress, logged
+        if (soluSetup_) {
+            const SoluSetupPlan plan = soluSetup_->Detect();
+            const SoluSetupProgress p = soluSetup_->Snapshot();
+            Log("solu setup: python=%d speech=%d ollamaInstalled=%d ollamaRunning=%d nvidia=%d vramMB=%llu "
+                "recommended=%ls capableReady=%d lighterReady=%d | stage=%d done=%llu total=%llu finished=%d ok=%d err=%ls",
+                plan.pythonReady, plan.speechModelsReady, plan.ollamaInstalled, plan.ollamaRunning, plan.hasNvidiaGpu,
+                static_cast<unsigned long long>(plan.vramBytes / (1024 * 1024)), plan.models[static_cast<size_t>(plan.recommended)].id.c_str(),
+                plan.models[0].ready, plan.models[1].ready, static_cast<int>(p.stage), static_cast<unsigned long long>(p.doneBytes),
+                static_cast<unsigned long long>(p.totalBytes), p.finished, p.ok, p.error.c_str());
+        }
+        return;
+    }
+    if (cmd == L"snapshot_now") {                                 // the island's pixels, as it is (open or closed)
+        if (!islands_.empty()) islands_.front()->DebugSnapshot(Str(v, "file"));
         return;
     }
     if (!shoot_) return;
@@ -330,6 +441,8 @@ void App::OnShootCommand(const std::string& text) {
             std::ofstream out(Str(v, "file"), std::ios::trunc);
             out << islands_.front()->DebugLayout();
         }
+    } else if (cmd == L"snapshot") {                              // the island's pixels as a PNG (layout checks)
+        if (!islands_.empty()) islands_.front()->DebugSnapshot(Str(v, "file"));
     } else if (cmd == L"tab") {
         for (auto& island : islands_) island->DebugOpenTab(static_cast<int>(Num(v, "section", -1)));
     } else if (cmd == L"cheer") {
@@ -341,6 +454,7 @@ void App::OnShootCommand(const std::string& text) {
         Log("shoot: unknown command %ls", cmd.c_str());
     }
 }
+#endif
 
 void App::ShootPushPermissions() {
     std::vector<PermissionRequest> all = shootPerms_;
@@ -419,4 +533,3 @@ void App::ShootMute(int side, bool muted) {
 }
 
 } // namespace eflow
-#endif

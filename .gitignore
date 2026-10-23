@@ -20,6 +20,9 @@ __pycache__/
 /solu/dev/
 /solu/*.log
 
+# The product website (its own project; lives here for convenience, not part of this repo's history)
+/website/
+
 # Blender backups
 *.blend1
 

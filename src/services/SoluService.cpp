@@ -139,8 +139,29 @@ std::wstring SoluService::FindDir() const {
     candidates.push_back(dir + L"\\solu");               // installed next to eflow.exe
     candidates.push_back(dir + L"\\..\\..\\solu");       // development: the repository's solu folder (from build\debug)
     for (const std::wstring& c : candidates)
-        if (Exists(c + L"\\solu_service.py") && Exists(c + L"\\venv\\Scripts\\python.exe")) return c;
+        // (the downloaded runtime counts only once SoluSetup has finished installing its packages: python.exe alone
+        // appears halfway through the setup, and starting Solu then makes it crash)
+        if (Exists(c + L"\\solu_service.py") &&
+            (Exists(c + L"\\venv\\Scripts\\python.exe") ||
+             (Exists(SoluDataDir() + L"\\pyruntime\\python.exe") && Exists(SoluDataDir() + L"\\pyruntime\\.packages-installed"))))
+            return c;
     return {};
+}
+
+// What SoluSetup downloads lives here, not next to the app: an installed Eflow's own folder is read-only.
+std::wstring SoluService::SoluDataDir() const { return AppDataDir() + L"\\solu"; }
+
+// The python.exe to run solu_service.py with: a development venv if there is one, else the runtime SoluSetup
+// downloaded (never the system Python).
+std::wstring SoluService::PythonExe(const std::wstring& dir) const {
+    if (Exists(dir + L"\\venv\\Scripts\\python.exe")) return dir + L"\\venv\\Scripts\\python.exe";
+    return SoluDataDir() + L"\\pyruntime\\python.exe";
+}
+
+// Where its speech models are: a development checkout keeps them in solu\models, an installed copy in its data folder.
+std::wstring SoluService::ModelsDir(const std::wstring& dir) const {
+    if (Exists(dir + L"\\models\\kokoro-v1.0.onnx")) return dir + L"\\models";
+    return SoluDataDir() + L"\\models";
 }
 
 bool SoluService::Launch() {
@@ -171,8 +192,14 @@ bool SoluService::Launch() {
         headphones = snapshot_.headphones ? L" --headphones" : L"";
         if (!snapshot_.screen) headphones += L" --no-screen";
     }
-    std::wstring command = L"\"" + dir + L"\\venv\\Scripts\\python.exe\" -u solu_service.py --voice " + voice + headphones;
+    std::wstring command = L"\"" + PythonExe(dir) + L"\" -u solu_service.py --voice " + voice + headphones;
     SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
+    // Never let this PC's other Python installs leak in: not their packages (a user-wide site-packages), not some
+    // unrelated project's PYTHONPATH. solu\pyruntime (SoluSetup.cpp) is meant to be fully self-contained.
+    SetEnvironmentVariableW(L"PYTHONNOUSERSITE", L"1");
+    SetEnvironmentVariableW(L"PYTHONPATH", nullptr);
+    SetEnvironmentVariableW(L"PYTHONHOME", nullptr);
+    SetEnvironmentVariableW(L"EFLOW_SOLU_MODELS", ModelsDir(dir).c_str());   // read-only app folder: they live elsewhere
     PROCESS_INFORMATION pi{};
     const BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
                                    dir.c_str(), &si, &pi);

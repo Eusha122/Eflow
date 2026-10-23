@@ -16,4 +16,7 @@ struct ImageBGRA {
 // COM must be initialised on the calling thread.
 bool DecodeImage(const uint8_t* bytes, size_t size, float scale, uint32_t maxSide, ImageBGRA& out);
 
+// Writes `image` (premultiplied BGRA) to `path` as a PNG (straight alpha) with WIC. COM must be initialised on the calling thread.
+bool SavePng(const ImageBGRA& image, const wchar_t* path);
+
 } // namespace eflow

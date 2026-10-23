@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Eflow app icon: the island as a happy face (a pill, two soft ears, closed smiling eyes) on a blurple tile. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C86FF"/>
+      <stop offset="1" stop-color="#3A42D8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#tile)"/>
+  <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="36" stroke-linejoin="round">
+    <path d="M138 250 L166 130 L230 214 Z"/>
+    <path d="M374 250 L346 130 L282 214 Z"/>
+  </g>
+  <rect x="92" y="196" width="328" height="184" rx="92" fill="#FFFFFF"/>
+  <g fill="none" stroke="#3A42D8" stroke-width="22" stroke-linecap="round">
+    <path d="M176 300 Q204 266 232 300"/>
+    <path d="M280 300 Q308 266 336 300"/>
+  </g>
+</svg>

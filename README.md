@@ -6,11 +6,10 @@ companion that reacts to what is happening.
 
 <p align="center"><img src="docs/media/mascot.webp" width="360" alt="Eflow mascot reacting to music"></p>
 
-> **Status: early development.** The island window (idle bar, hover-to-open panel, tabs, multi-monitor,
-> fullscreen auto-hide, tray icon), the animated mascot inside it and the Music tab (any app using
-> Windows media sessions: Spotify, YouTube and other sites in Chrome/Edge/Firefox, Media Player...) are
-> done, and so are AI permission requests from Claude Code and Codex, the Windows notification list and
-> the System tab (CPU, GPU, memory and network rings; click or scroll a ring for its next reading).
+> **Status: in development, not released yet.** The island (a thin bar that clicks pass straight through; a middle-click
+> or the scroll wheel opens it), the animated cat inside it, Music with live lyrics, notifications with per-app muting,
+> one-click login codes, Claude Code and Codex (their steps, a prompt box and approvals), the System tab, Solu, the
+> Shelf, Reminders, sending files with SafeShare, the phone link, device and screenshot pills are all working.
 
 ### The Music tab
 
@@ -68,7 +67,7 @@ then it works through it by itself in the background: looking at the screen, cli
 coding to Claude Code or Codex. It checks each step, tries another way when something fails, asks you when it is stuck, and never
 slows the conversation. Say "pause the task", "how's the task going", "stop the task", or use the buttons in the Solu AI tab.
 
-**Shelf:** drag files onto the island (it opens by itself and shows a big drop target) to hold them, then drag them out again into
+**Shelf:** drag files onto the island (it opens into two zones: Shelf and SafeShare) to hold them, then drag them out again into
 any folder, app or web page, one or several at a time. Double-click opens a file, right-click shows it in its folder.
 
 **Agents:** the island's *Agents* tab shows what Claude Code and Codex are doing (click a logo to switch; it opens on
@@ -87,17 +86,10 @@ permission prompts appear in the island with **Approve**, **Reject** and **Answe
 is closed, or you don't answer within about five minutes, the tool simply asks in its own window;
 nothing is ever approved automatically. Codex asks you to trust new hooks once: run `/hooks` in Codex.
 
-## Planned features
+## Still to come
 
-- **Island**: nearly invisible when idle, smooth spring-animated expansion on hover, every monitor,
-  high-DPI aware, hides during fullscreen apps, starts with Windows.
-- **Music**: Spotify, YouTube and browser media through Windows' media session API; artwork,
-  progress and playback controls.
-- **AI permission centre**: approve or reject Claude Code and OpenAI Codex permission requests from
-  the island, via each tool's official `PermissionRequest` hook. Nothing is ever auto-approved, and
-  if Eflow isn't running the tool falls back to its own prompt.
-- **Notifications**: incoming Windows notifications with history, per-app muting and privacy
-  options.
+- An installer (signed MSIX) and a settings window.
+- Solu ignoring sung vocals, so it never answers a song.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the feasibility study, the design and the
 phase plan.
@@ -110,11 +102,17 @@ asset built with Blender and played live by the app.
 ## Repository layout
 
 ```
-art/source/        generated character art (master + 4 expressions), the mascot's inputs
+art/source/        generated character art: master + 4 expressions (the mascot's inputs) and extra poses
+assets/branding/   the logo: app icon (and a bolder drawing for 16-24 px), marks for light/dark/one colour
 assets/mascot/     eflow.glb, the rigged, animated mascot loaded by the app
 docs/              architecture and design notes
-src/               the island app (C++)
-tools/             mascot build pipeline (Python + headless Blender)
+package/           the sparse package that gives Eflow an identity for Windows notifications
+solu/              Solu, the voice assistant (Python)
+src/               the island app (C++); src/eflow.ico is made from assets/branding
+tests/             unit tests (eflow-tests.exe)
+third_party/       cgltf, qrcodegen
+tools/             build scripts, the mascot pipeline (Python + headless Blender) and end-to-end tests
+website/           the product page, safeshare.co/eflow (React + Vite)
 ```
 
 ## Building the app
@@ -130,6 +128,22 @@ tools\build_app.ps1 release    # release build -> build\release\eflow.exe
 Eflow lives in the tray: right-click its icon for "Start with Windows" and "Quit Eflow". Only
 packaged builds (`-DEFLOW_PACKAGED=ON`, for the installer) turn on "Start with Windows" the first time
 they run; local builds never change it.
+
+## The website
+
+`website/` is Eflow's product page: the home page and a tour where a cursor acts out every feature on a live replica
+of the island. It is its own project (needs a current Node.js, e.g. 22 LTS), served under `/eflow/`.
+
+```powershell
+cd website
+npm install
+npm run dev      # http://127.0.0.1:5174/eflow/
+npm run build    # type-checks, then builds into website/dist/eflow
+```
+
+Any static host can serve `website/dist`; on Vercel, `website/vercel.json` already sets it up. To keep the address
+**safeshare.co/eflow**, the SafeShare project then forwards that path with one rewrite in its `vercel.json`:
+`{ "source": "/eflow/:path*", "destination": "https://<the Eflow site's address>/eflow/:path*" }`.
 
 ## Rebuilding the mascot
 

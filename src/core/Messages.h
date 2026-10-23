@@ -25,9 +25,15 @@ constexpr UINT WM_APP_LYRICS = WM_APP + 20;      // lyrics service -> app: lyric
 constexpr UINT WM_APP_SHELF = WM_APP + 19;       // shelf store -> app: the held files or an icon changed
 constexpr UINT WM_APP_ISLAND_MIDDLE = WM_APP + 21;  // mouse hook -> island: middle click on the closed island (open it)
 constexpr UINT WM_APP_ISLAND_BUTTON = WM_APP + 22;  // mouse hook -> island: left / right button down (wParam 1) or up (0)
+constexpr UINT WM_APP_SAFESHARE = WM_APP + 26;      // SafeShare service -> app: its snapshot changed
+constexpr UINT WM_APP_PHONE = WM_APP + 28;          // phone link -> app: its state changed
+constexpr UINT WM_APP_CODEX_TRUST = WM_APP + 30;    // Codex trust worker -> app: done (wParam: CodexTrust, lParam: heap std::wstring detail)
+constexpr UINT WM_APP_PHONE_FILE = WM_APP + 29;     // ... the phone sent a file (lParam: heap std::wstring path)
+constexpr UINT WM_APP_SAFESHARE_EVENT = WM_APP + 27;   // ... something sent was opened / downloaded (lParam: heap Event)
 constexpr UINT WM_APP_SCREENSHOT = WM_APP + 25;     // screenshot catcher -> app: a screenshot was taken (lParam: heap Screenshot)
 constexpr UINT WM_APP_USB_DEVICE = WM_APP + 24;     // device watcher -> app: a USB device was identified (lParam: heap DeviceEvent)
 constexpr UINT WM_APP_EJECTED = WM_APP + 23;        // device watcher -> app: an eject finished (lParam: heap EjectResult)
 constexpr UINT WM_APP_CAMERA = WM_APP + 12;      // camera service -> app: cameras, who uses them, or the privacy switch changed
+constexpr UINT WM_APP_SOLU_SETUP = WM_APP + 31;     // Solu setup worker -> app: progress (posted every step; read Snapshot())
 
 } // namespace eflow

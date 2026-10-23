@@ -22,6 +22,9 @@ struct PermissionRequest {
     std::wstring cwd;
     bool risky = false;       // matches a destructive-command pattern
     bool canAlways = false;   // Solu: the card may offer "Always allow" for this kind of action
+    bool isQuestion = false;  // AskUserQuestion: the card offers one button that goes to the tool's own window
+    std::wstring session;     // the tool's session id, when it sends one (Claude Code: matches AgentSession::id)
+    ULONGLONG arrived = 0;    // unix ms, to compare against that session's last activity
 };
 
 enum class PermissionDecision { Allow, Deny, Defer };

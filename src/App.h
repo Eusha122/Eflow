@@ -14,6 +14,8 @@
 #include "services/AgentMonitor.h"
 #include "services/AlarmSound.h"
 #include "services/ReminderStore.h"
+#include "services/PhoneShare.h"
+#include "services/SafeShareService.h"
 #include "services/ShelfStore.h"
 #include "mascot/MascotRenderer.h"
 #include "services/AudioDevices.h"
@@ -27,6 +29,7 @@
 #include "services/NotificationService.h"
 #include "services/PermissionServer.h"
 #include "services/SoluService.h"
+#include "services/SoluSetup.h"
 #include "services/SystemMonitor.h"
 
 namespace eflow {
@@ -75,6 +78,15 @@ private:
     void TogglePrivacy();
     void StartCapture(const std::wstring& mode);
     void ToggleAiTool(AiTool tool);
+    void UpdateAiHooks();                         // at startup: the hook at ~/.eflow/hook, and entries from older versions
+    void ConnectAiTools();                        // every AI tool used on this PC that isn't connected yet (the tour's Connect)
+    // The welcome tour: once on the first run (and again from the tray), on the island of the monitor with the pointer.
+    static bool TourDone();
+    void StartTour();
+    void OnTourFinished(bool completed);
+    void PushTourStatus();                        // what the tour's steps show: firewall, microphone, autostart, tools
+    void TrustCodexHook(bool announce);          // in the background; `announce`: say so in the island when it worked
+    void OnCodexTrust(int result, const std::wstring& detail);
     void RebuildGraphics();
     void UpdateFullscreenState();
     void AddTrayIcon();
@@ -86,6 +98,10 @@ private:
     void OnLyricsChanged();
     void SetLyricsOn(bool on);
     static std::wstring LyricsSettingPath();
+    // Settings > Closed island: song lyrics / agents at work on the thin bar. Kept in %LOCALAPPDATA%\Eflow\island.json.
+    bool glimpseLyrics_ = true, glimpseAgents_ = true;
+    void LoadGlimpsePrefs();
+    void SetGlimpsePrefs(bool lyrics, bool agents);
     // Shoot mode (debug builds, AppShoot.cpp): scripted island content for filming the launch video.
     void OnShootCommand(const std::string& json);
     void ShootPushAll();
@@ -101,6 +117,7 @@ private:
     UINT taskbarCreated_ = 0;
     bool appBar_ = false;
     NOTIFYICONDATAW tray_{};
+    HICON trayIcon_ = nullptr;                         // the app icon at the tray's size (app.rc)
     std::vector<HWINEVENTHOOK> hooks_;
     std::vector<std::unique_ptr<IslandWindow>> islands_;
     std::shared_ptr<const MascotAsset> mascotAsset_;   // null if the asset is missing or invalid
@@ -115,11 +132,21 @@ private:
     std::unique_ptr<AudioDevices> audio_;
     std::unique_ptr<CameraService> camera_;
     std::unique_ptr<SoluService> solu_;
+    std::unique_ptr<SoluSetup> soluSetup_;
+    bool soluPlanReady_ = false, soluSetupHandled_ = true;
+    SoluSetupPlan soluPlan_;
+    void DetectSoluPlan();
+    void OnSoluSetupChanged(bool planUpdate, SoluSetupPlan* plan);
     uint32_t soluApprovalsVersion_ = 0;            // last list of Solu's approval requests the islands were given
     bool hotkey_ = false;
     std::unique_ptr<ActivityMonitor> activityMonitor_;
     std::unique_ptr<AgentMonitor> agents_;
     std::unique_ptr<ShelfStore> shelf_;
+    std::unique_ptr<SafeShareService> safeShare_;      // the SafeShare tab: files sent by email through SafeShare
+    std::unique_ptr<PhoneShare> phone_;                // ... and to / from a phone on the same Wi-Fi
+    void OnPhoneFile(const std::wstring& path);        // the phone sent a file: on the Shelf, with a pill
+    void OnSafeShareChanged();
+    void OnSafeShareEvent(const SafeShareService::Event& e);   // what was sent was opened or downloaded: a pill
     ReminderStore reminders_;
     AlarmSound alarm_;
     std::vector<Alert> ringingWas_;                    // what was ringing at the last update (a new one starts the chime)
@@ -129,6 +156,10 @@ private:
     uint64_t hookCheck_ = 0;
     std::string lastAgentContext_;
     bool claudeHooked_ = false, codexHooked_ = false;
+    bool codexTrustAnnounce_ = false;               // the user just connected Codex: confirm when Codex trusts the hook
+    IslandWindow* tourIsland_ = nullptr;            // the island showing the tour (null: none)
+    FirewallAccess tourFirewall_ = FirewallAccess::Unknown;
+    uint64_t tourFirewallAt_ = 0, tourPhoneAskedAt_ = 0;   // when the firewall was last read / the user asked for the phone link
     CaptureOverlay capture_;
     RECT captured_{};
     std::wstring capturedMode_;

@@ -65,6 +65,7 @@ public:
     static std::wstring FocusHost(const AgentSession& session, bool openChat = false);
     bool Send(AgentTool tool, const std::wstring& sessionId, const std::wstring& cwd, const std::wstring& text, bool newSession,
               std::wstring& error);
+    std::wstring FindProgram(AgentTool tool) const;   // the agent's program (claude.exe / codex.exe), or empty
 
 private:
     struct Tracked {
@@ -82,7 +83,6 @@ private:
     void IngestCodex(Tracked& t, const std::string& line);
     void Refresh(Tracked& t, ULONGLONG now);
     void Changed();
-    std::wstring FindProgram(AgentTool tool) const;
 
     HWND notify_;
     UINT message_;

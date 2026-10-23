@@ -757,12 +757,19 @@ bool AgentMonitor::Send(AgentTool tool, const std::wstring& sessionId, const std
             const std::wstring settings = AppData() + L"\\agent-claude-settings.json";
             wchar_t exe[MAX_PATH * 2];
             const DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-            std::string hook = ToUtf8(fs::path(std::wstring(exe, n)).parent_path().wstring() + L"\\eflow-hook.exe");
-            std::string escaped;
-            for (char c : hook) escaped += c == '\\' ? std::string("/") : std::string(1, c);
+            Value command = Value::Object();
+            command.Member("type") = Value::String("command");
+            command.Member("command") = Value::String(HookInstaller::Command(AiTool::ClaudeCode, fs::path(std::wstring(exe, n)).parent_path() / L"eflow-hook.exe"));
+            command.Member("timeout") = Value::Number("120");
+            Value entry = Value::Object();
+            entry.Member("hooks") = Value::Array();
+            entry.Member("hooks").items.push_back(std::move(command));
+            Value root = Value::Object();
+            root.Member("hooks") = Value::Object();
+            root.Member("hooks").Member("PermissionRequest") = Value::Array();
+            root.Member("hooks").Member("PermissionRequest").items.push_back(std::move(entry));
             std::ofstream out(settings, std::ios::binary | std::ios::trunc);
-            out << "{\"hooks\":{\"PermissionRequest\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"\\\"" << escaped
-                << "\\\" --source claude-code\",\"timeout\":120}]}]}}";
+            out << json::Write(root);
             out.close();
             args += L" --settings " + QuoteArg(settings);
         }

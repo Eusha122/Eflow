@@ -41,7 +41,9 @@ public:
     NotificationService(const NotificationService&) = delete;
     NotificationService& operator=(const NotificationService&) = delete;
 
-    void Start();
+    // askNow false: Windows' consent prompt waits for AllowPrompt() (the welcome tour asks at its notifications step).
+    void Start(bool askNow = true);
+    void AllowPrompt();
     NotificationSnapshot Snapshot() const;
     void Dismiss(uint32_t id);
     void ClearAll();
@@ -56,6 +58,7 @@ private:
     std::condition_variable wake_;
     bool stop_ = false;
     bool refresh_ = true;
+    bool mayAsk_ = true;
     std::deque<Command> commands_;
     NotificationSnapshot snapshot_;
 };

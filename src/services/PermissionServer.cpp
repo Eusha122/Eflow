@@ -63,6 +63,7 @@ PermissionRequest Parse(const std::string& sourceId, const std::string& body) {
     r.source = SourceName(sourceId);
     const json::JsonObject root = json::JsonObject::Parse(winrt::to_hstring(body));
     r.tool = Str(root, L"tool_name");
+    r.session = Str(root, L"session_id");
     r.cwd = Str(root, L"cwd");
     if (const auto slash = r.cwd.find_last_of(L"\\/"); slash != std::wstring::npos) {
         r.project = r.cwd.substr(slash + 1);
@@ -103,6 +104,21 @@ PermissionRequest Parse(const std::string& sourceId, const std::string& body) {
     } else if (tool == L"webfetch") {
         r.action = L"fetch a web page";
         r.detail = Str(input, L"url");
+    } else if (tool == L"askuserquestion") {
+        // Nothing to approve here: the tool asks the user something, and the answer is given in the tool's own window.
+        r.action = L"ask you something";
+        r.isQuestion = true;
+        if (input && input.HasKey(L"questions") && input.GetNamedValue(L"questions").ValueType() == json::JsonValueType::Array) {
+            const json::JsonArray questions = input.GetNamedArray(L"questions");
+            for (uint32_t i = 0; i < questions.Size(); ++i) {
+                if (questions.GetAt(i).ValueType() != json::JsonValueType::Object) continue;
+                const std::wstring text = Str(questions.GetObjectAt(i), L"question");
+                if (text.empty()) continue;
+                if (!r.detail.empty()) r.detail += L"\n";
+                r.detail += questions.Size() > 1 ? std::to_wstring(i + 1) + L". " + text : text;
+            }
+        }
+        if (r.detail.empty()) r.detail = L"A question is waiting in " + r.source + L".";
     } else {
         r.action = L"use " + (r.tool.empty() ? std::wstring(L"a tool") : r.tool);
         r.detail = input ? std::wstring(input.Stringify()) : std::wstring();
@@ -274,19 +290,34 @@ void PermissionServer::Serve(HANDLE pipe) {
         {
             std::lock_guard lock(mutex_);
             slot->request.id = nextId_++;
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            const ULONGLONG t = (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            slot->request.arrived = t > 116444736000000000ull ? (t - 116444736000000000ull) / 10000 : 0;   // unix ms
             slots_.push_back(slot);
         }
-        Log("permissions: %ls asks to %ls", slot->request.source.c_str(), slot->request.action.c_str());
+        Log("permissions: %ls asks to %ls (session %ls)", slot->request.source.c_str(), slot->request.action.c_str(),
+            slot->request.session.empty() ? L"not given" : slot->request.session.c_str());
         PostMessageW(notify_, WM_APP_PERMISSION, 0, 0);
 
         // Wait for the user, while noticing if the tool gives up (answered elsewhere, cancelled, timed out).
         const HANDLE waits[] = {slot->decided, stop_};
         const ULONGLONG deadline = GetTickCount64() + permission::kDecisionTimeoutMs + 5000;
         bool decided = false;
+        const ULONGLONG asked = GetTickCount64();
         for (;;) {
             const DWORD w = WaitForMultipleObjects(2, waits, FALSE, 250);
             if (w == WAIT_OBJECT_0) { decided = true; break; }
-            if (w == WAIT_OBJECT_0 + 1 || ClientGone(pipe) || GetTickCount64() > deadline) break;
+            if (w == WAIT_OBJECT_0 + 1) break;
+            if (ClientGone(pipe)) {                    // the tool stopped waiting: answered in its own window, or cancelled
+                Log("permissions: %ls withdrew the request after %llu ms (answered in the tool, or cancelled)",
+                    slot->request.source.c_str(), GetTickCount64() - asked);
+                break;
+            }
+            if (GetTickCount64() > deadline) {
+                Log("permissions: the request from %ls timed out after %llu ms", slot->request.source.c_str(), GetTickCount64() - asked);
+                break;
+            }
         }
         if (decided) {
             const PermissionDecision d = slot->decision;

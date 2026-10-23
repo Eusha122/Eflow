@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Eflow app icon drawn for 16-24 px (tray, title bars): the same face a little larger, with bolder eyes, so it
+       stays readable when it is only a few pixels tall. Above 24 px use eflow-icon.svg. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C86FF"/>
+      <stop offset="1" stop-color="#3A42D8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#tile)"/>
+  <g transform="translate(256 266) scale(1.2) translate(-256 -266)">
+    <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="36" stroke-linejoin="round">
+      <path d="M138 250 L166 130 L230 214 Z"/>
+      <path d="M374 250 L346 130 L282 214 Z"/>
+    </g>
+    <rect x="92" y="196" width="328" height="184" rx="92" fill="#FFFFFF"/>
+    <g fill="none" stroke="#2E35C4" stroke-width="34" stroke-linecap="round">
+      <path d="M170 306 Q204 262 238 306"/>
+      <path d="M274 306 Q308 262 342 306"/>
+    </g>
+  </g>
+</svg>

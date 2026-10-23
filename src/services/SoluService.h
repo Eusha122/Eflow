@@ -109,6 +109,9 @@ private:
     void SaveSettings() const;
     void Changed(bool coalesce);
     std::wstring FindDir() const;
+    std::wstring PythonExe(const std::wstring& dir) const;
+    std::wstring SoluDataDir() const;            // %LOCALAPPDATA%\Eflow\solu: the runtime and models it downloads
+    std::wstring ModelsDir(const std::wstring& dir) const;
 
     HWND notify_;
     UINT message_;

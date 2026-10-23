@@ -243,6 +243,9 @@ float Chime(double t) {
     return static_cast<float>(0.20 * (note(0.0, 880.0, 0.6) + 0.9 * note(0.17, 1318.5, 0.75)));
 }
 
+
+} // namespace
+
 bool MicrophoneBlockedByPrivacy() {
     for (const wchar_t* key : {L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone",
                                L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged"}) {
@@ -253,8 +256,6 @@ bool MicrophoneBlockedByPrivacy() {
     }
     return false;
 }
-
-} // namespace
 
 AudioDevices::AudioDevices(HWND notify, UINT message) : notify_(notify), message_(message) {}
 
@@ -410,7 +411,7 @@ void AudioDevices::TestRun(bool input, std::wstring id, bool muted) {
     auto fill = [&]() -> float {                                        // top the buffer up with the next stretch of chime
         UINT32 padding = 0;
         if (FAILED(client->GetCurrentPadding(&padding))) return 0.0f;
-        const UINT32 room = std::min<UINT64>(bufferFrames - padding, total - produced);
+        const UINT32 room = static_cast<UINT32>(std::min<UINT64>(bufferFrames - padding, total - produced));   // (at most the buffer)
         if (!room) return 0.0f;
         BYTE* data = nullptr;
         if (FAILED(render->GetBuffer(room, &data))) return 0.0f;

@@ -11,13 +11,15 @@ import wave
 import numpy as np
 import onnxruntime as ort
 
+import config
+
 from voice_presets import speak
 
 
 SR_IN, FRAME = 16000, 512                       # 32 ms frames, what Silero expects
 class Vad:
     def __init__(self):
-        self.sess = ort.InferenceSession("models/silero_vad.onnx", providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(config.model("silero_vad.onnx"), providers=["CPUExecutionProvider"])
         self.reset()
 
     def reset(self):

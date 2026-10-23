@@ -1,0 +1,5 @@
+#include "resource.h"
+
+// The app icon: Eflow's happy island, every Windows size (16-256 px; 16-24 drawn bolder). Made from
+// assets/branding/eflow-icon.svg and eflow-icon-small.svg.
+IDI_EFLOW ICON "eflow.ico"

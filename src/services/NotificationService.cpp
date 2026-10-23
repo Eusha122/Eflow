@@ -63,7 +63,18 @@ NotificationService::~NotificationService() {
     if (worker_.joinable()) worker_.join();
 }
 
-void NotificationService::Start() { worker_ = std::thread([this] { Run(); }); }
+void NotificationService::Start(bool askNow) {
+    mayAsk_ = askNow;
+    worker_ = std::thread([this] { Run(); });
+}
+
+void NotificationService::AllowPrompt() {
+    {
+        std::lock_guard lock(mutex_);
+        mayAsk_ = true;
+    }
+    wake_.notify_all();
+}
 
 NotificationSnapshot NotificationService::Snapshot() const {
     std::lock_guard lock(mutex_);
@@ -112,8 +123,24 @@ void NotificationService::Run() {
     try {
         listener = wunm::UserNotificationListener::Current();
         auto status = listener.GetAccessStatus();
-        if (status == wunm::UserNotificationListenerAccessStatus::Unspecified)
+        if (status == wunm::UserNotificationListenerAccessStatus::Unspecified) {
+            bool wait;
+            {
+                std::lock_guard lock(mutex_);
+                wait = !mayAsk_;
+            }
+            if (wait) {                                             // not asked yet: until the user gets to it
+                publishAccess(NotificationAccess::Unknown);
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return stop_ || mayAsk_; });
+                if (stop_) {
+                    lock.unlock();
+                    winrt::uninit_apartment();
+                    return;
+                }
+            }
             status = listener.RequestAccessAsync().get();          // shows Windows' consent prompt once
+        }
         Log("notifications: access status %d", static_cast<int>(status));
         if (status != wunm::UserNotificationListenerAccessStatus::Allowed) {
             publishAccess(status == wunm::UserNotificationListenerAccessStatus::Denied ? NotificationAccess::Denied

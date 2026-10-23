@@ -11,6 +11,8 @@ import numpy as np
 import soundfile as sf
 from kokoro_onnx import Kokoro
 
+import config
+
 # name -> (voice blend {voice: weight}, pitch ratio, pace, description)
 PRESETS = {
     "cozy":   ({"af_heart": 0.6, "af_sky": 0.4},       1.10, 1.00, "Warm and gentle, like a purring friend"),
@@ -56,7 +58,7 @@ def f0(audio, sr):
 
 
 if __name__ == "__main__":
-    k = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+    k = Kokoro(config.model("kokoro-v1.0.onnx"), config.model("voices-v1.0.bin"))
     speak(k, "natural", "warm up")
     for name, (_, pitch, pace, desc) in PRESETS.items():
         t = time.perf_counter()

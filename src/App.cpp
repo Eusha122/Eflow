@@ -1,5 +1,6 @@
 #include "App.h"
 
+#include <commctrl.h>
 #include <shlobj.h>
 
 #include <algorithm>
@@ -7,14 +8,20 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <utility>
 
+#include "core/Clipboard.h"
+#include "core/Json.h"
 #include "core/Log.h"
 #include "core/LoginCode.h"
 #include "core/Messages.h"
 #include "core/Utf8.h"
+#include "resource.h"
+#include "services/CodexTrust.h"
+#include "core/Firewall.h"
 
 namespace eflow {
 namespace {
@@ -31,6 +38,7 @@ constexpr UINT kMenuAutostart = 1;
 constexpr UINT kMenuQuit = 2;
 constexpr UINT kMenuConnectClaude = 3;
 constexpr UINT kMenuConnectCodex = 4;
+constexpr UINT kMenuTour = 5;
 constexpr UINT kMenuMascotFirst = 10;           // Mascot test submenu: Idle, Music, Notification, AI request
 constexpr int kSoluHotkeyId = 1;                  // Ctrl+Alt+Space: start / end a conversation with Solu
 constexpr int kPrivacyHotkeyId = 2;               // Ctrl+Alt+H: hide everything, Solu stops listening (again: back)
@@ -40,6 +48,8 @@ constexpr UINT_PTR kActivityTimer = 2;            // 1 s while the focus timer o
 constexpr UINT_PTR kMoodTimer = 3;                // every 30 s: is it late, is the PC struggling?
 constexpr UINT_PTR kReminderTimer = 4;            // fires when the next reminder is due (at least once a minute)
 constexpr UINT_PTR kAlarmStopTimer = 5;           // a ringing chime stops by itself after a minute (the card stays)
+constexpr UINT_PTR kWelcomeTimer = 6;             // shortly after startup: the welcome tour (first run), never over a fullscreen app
+constexpr UINT_PTR kTourStatusTimer = 7;          // every second while the tour runs: what its steps show
 constexpr float kMascotTextureScale = 0.25f;    // 2048-px art -> 512 px: plenty for a ~40-DIP mascot at 300%
 
 std::wstring ExePath() {
@@ -70,6 +80,11 @@ bool CoversMonitor(HWND hwnd, HMONITOR monitor) {
            r.bottom >= mi.rcMonitor.bottom;
 }
 
+bool ForegroundIsFullscreen() {
+    HWND fg = GetForegroundWindow();
+    return CoversMonitor(fg, MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST));
+}
+
 } // namespace
 
 int App::Run() {
@@ -95,6 +110,7 @@ int App::Run() {
     camera_->Start();
     solu_ = std::make_unique<SoluService>(msgWnd_, WM_APP_SOLU);
     solu_->Start();                         // starts Solu again if it was switched on last time
+    soluSetup_ = std::make_unique<SoluSetup>();
     hotkey_ = RegisterHotKey(msgWnd_, kSoluHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE) != FALSE;
     if (!hotkey_) Log("Ctrl+Alt+Space is taken by another program; Solu can still be started from the island");
     if (!RegisterHotKey(msgWnd_, kPrivacyHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H')) Log("Ctrl+Alt+H is taken by another program");
@@ -105,16 +121,22 @@ int App::Run() {
     if (!AddClipboardFormatListener(msgWnd_)) Log("screenshots: no clipboard listener (%lu)", GetLastError());
     for (const DeviceEvent& e : DeviceWatcher::CurrentDrives()) OnDeviceEvent(e);   // plugged in before Eflow started (no animation)
     for (Activity& d : drives_) d.startedAt = 0;
+    LoadGlimpsePrefs();
     shelf_ = std::make_unique<ShelfStore>(msgWnd_, WM_APP_SHELF);
     shelf_->Load();
+    safeShare_ = std::make_unique<SafeShareService>(msgWnd_, WM_APP_SAFESHARE, WM_APP_SAFESHARE_EVENT);
+    phone_ = std::make_unique<PhoneShare>(msgWnd_, WM_APP_PHONE, WM_APP_PHONE_FILE);
     reminders_.Load();
     mutes_ = NotificationMutes::Load();
     agents_ = std::make_unique<AgentMonitor>(msgWnd_, WM_APP_AGENTS);
     agents_->Start();
+    UpdateAiHooks();
+    if (!TourDone()) SetTimer(msgWnd_, kWelcomeTimer, 300, nullptr);   // first run: the island becomes the invitation at once
     activityMonitor_ = std::make_unique<ActivityMonitor>(msgWnd_, WM_APP_ACTIVITY);
     activityMonitor_->Start();
     SetTimer(msgWnd_, kMoodTimer, 30000, nullptr);
     BuildIslands();
+    OnSafeShareChanged();
     TickReminders();                        // rings anything that came due while Eflow was closed
     media_ = std::make_unique<MediaService>(msgWnd_);
     media_->Start();
@@ -127,7 +149,7 @@ int App::Run() {
     permissions_ = std::make_unique<PermissionServer>(msgWnd_);
     permissions_->Start();
     notifications_ = std::make_unique<NotificationService>(msgWnd_);
-    notifications_->Start();
+    notifications_->Start(TourDone());          // first run: Windows asks at the tour's notifications step
 
     // Fullscreen guard, event-driven: the shell's own fullscreen notification (sent to app bars, the
     // same signal the taskbar uses) plus foreground/minimize changes. No polling, no per-move events.
@@ -170,6 +192,7 @@ int App::Run() {
     }
     islands_.clear();
     Shell_NotifyIconW(NIM_DELETE, &tray_);
+    if (trayIcon_) DestroyIcon(trayIcon_);
     OleUninitialize();
     CoUninitialize();
     ReleaseMutex(mutex);
@@ -219,6 +242,42 @@ void App::OnLyricsChanged() {
     if (!lyrics_) return;
     const Lyrics lyrics = lyrics_->Snapshot();
     for (auto& island : islands_) island->SetLyrics(lyrics);
+}
+
+static std::wstring IslandSettingPath() {
+    PWSTR base = nullptr;
+    std::wstring path;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) path = std::wstring(base) + L"\\Eflow\\island.json";
+    CoTaskMemFree(base);
+    return path;
+}
+
+void App::LoadGlimpsePrefs() {
+    std::ifstream in(IslandSettingPath(), std::ios::binary);
+    if (!in) return;                                                 // (first run: everything shows)
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    json::Value v;
+    std::string error;
+    if (!json::Parse(text, v, error) || v.type != json::Value::Type::Object) return;
+    if (const json::Value* m = v.Find("lyrics"); m && m->type == json::Value::Type::Bool) glimpseLyrics_ = m->boolean;
+    if (const json::Value* m = v.Find("agents"); m && m->type == json::Value::Type::Bool) glimpseAgents_ = m->boolean;
+}
+
+void App::SetGlimpsePrefs(bool lyrics, bool agents) {
+    glimpseLyrics_ = lyrics;
+    glimpseAgents_ = agents;
+    json::Value v = json::Value::Object();
+    auto flag = [](bool b) {
+        json::Value x;
+        x.type = json::Value::Type::Bool;
+        x.boolean = b;
+        return x;
+    };
+    v.Member("lyrics") = flag(lyrics);
+    v.Member("agents") = flag(agents);
+    std::ofstream(IslandSettingPath(), std::ios::trunc) << json::Write(v);
+    for (auto& island : islands_) island->SetGlimpsePrefs(lyrics, agents);
+    PushActivities();                                                // (the agents' pills come or go)
 }
 
 void App::SetLyricsOn(bool on) {
@@ -389,6 +448,43 @@ void App::OnSoluReminder(const SoluAppEvent& e) {
     solu_->ReminderReply(said);
 }
 
+void App::OnSafeShareChanged() {
+    if (!safeShare_ || shoot_) return;
+    SafeShareSnapshot snap = safeShare_->Snapshot();
+    if (phone_) snap.phone = phone_->Snapshot();
+    for (auto& island : islands_) island->SetSafeShare(snap);
+}
+
+void App::OnPhoneFile(const std::wstring& path) {
+    if (shelf_) shelf_->Add({path});                                // (from the Shelf it drags into any app)
+    Flash(L"phone-file", L"\uE8EA", std::filesystem::path(path).filename().wstring(), L"From your phone \u00B7 on the Shelf", 0x64D2FF);
+}
+
+void App::OnSafeShareEvent(const SafeShareService::Event& e) {
+    if (shoot_) return;
+    using Kind = SafeShareService::Event::Kind;
+    if (e.kind == Kind::CloseFailed) {
+        Flash(L"share-close", L"\uE7BA", L"Couldn't close " + e.title, e.where, 0xFF9F0A);
+        return;
+    }
+    // A pill that pops in like a drive plugged in, and stays (two minutes, or until its x) so it is not missed while the
+    // island is open. A middle click on it opens the list of sent rooms.
+    const bool opened = e.kind == Kind::Opened;
+    Activity a;
+    a.id = L"share:" + e.roomId + L":" + std::to_wstring(GetTickCount64());
+    a.kind = Activity::Kind::Done;
+    a.glyph = opened ? L"\uE890" : L"\uE896";                     // an eye / a download arrow
+    a.title = e.title + (opened ? L" was opened" : L" was downloaded");
+    a.detail = e.where.empty() ? L"by " + e.recipient : e.where;
+    a.accent = opened ? 0xFFB340 : 0x30D158;
+    a.dismissible = true;
+    a.startedAt = GetTickCount64();
+    a.expiresAt = a.startedAt + 2 * 60 * 1000;
+    doneItems_.push_back(std::move(a));
+    PushActivities();
+    OnSafeShareChanged();
+}
+
 void App::OnShelfChanged() {
     if (!shelf_ || shoot_) return;
     const ShelfSnapshot snap = shelf_->Snapshot();
@@ -414,6 +510,18 @@ void App::OnAgentsChanged() {
     }
     snap.claudeHooked = claudeHooked_;
     snap.codexHooked = codexHooked_;
+    // Answered in the tool's own window instead of here? The tool leaves its hook waiting (it is not killed), so the
+    // card would sit there for minutes. But that session carries on the moment it is answered, so new activity in it
+    // means this card is moot: let the hook go, and the tool's own answer stands.
+    if (permissions_)
+        for (const PermissionRequest& r : permissions_->Pending()) {
+            if (r.session.empty() || !r.arrived) continue;
+            for (const AgentSession& s : snap.sessions)
+                if (s.id == r.session && s.lastActivity > r.arrived + 1500) {        // (grace: the request's own entry)
+                    Log("permissions: %ls answered it in its own window; taking the card down", r.source.c_str());
+                    permissions_->Resolve(r.id, PermissionDecision::Defer);
+                }
+        }
     // A session that waits for an approval is "waiting for you".
     if (permissions_)
         for (const PermissionRequest& r : permissions_->Pending())
@@ -426,6 +534,10 @@ void App::OnAgentsChanged() {
         const bool was = it != agentWas_.end() && it->second == AgentStatus::Working;
         agentWas_[s.tool == AgentTool::Claude ? L"c:" + s.id : L"x:" + s.id] = s.status;
         if (was && s.status == AgentStatus::Idle) {
+            if (!glimpseAgents_) {                                         // (Settings > Closed island: agents hidden)
+                CheerAll();
+                continue;
+            }
             Activity a;
             a.id = L"agentdone:" + s.id + std::to_wstring(now);
             a.kind = Activity::Kind::Done;
@@ -516,20 +628,21 @@ void App::PushActivities() {
         all.push_back(std::move(f));
     }
     for (const Activity& a : soluActivities_) if (a.kind != Activity::Kind::Nudge) all.push_back(a);
-    for (const AgentSession& s : agentSnap_.sessions) {                                // an agent is working: its pill, with what it is doing
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        const ULONGLONG unixNow = (((static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000;
-        if (s.status != AgentStatus::Working || unixNow - std::min(unixNow, s.lastActivity) > 5 * 60 * 1000) continue;
-        Activity a;
-        a.id = L"agent:" + s.id;
-        a.kind = Activity::Kind::Progress;
-        a.glyph = s.tool == AgentTool::Claude ? L"" : L"";
-        a.title = s.tool == AgentTool::Claude ? L"Claude Code" : L"Codex";
-        a.detail = s.doing;
-        a.accent = s.tool == AgentTool::Claude ? 0xD97757 : 0x64D2FF;
-        all.push_back(std::move(a));
-    }
+    if (glimpseAgents_)                                                                    // (Settings > Closed island)
+        for (const AgentSession& s : agentSnap_.sessions) {                                // an agent at work: its pill
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            const ULONGLONG unixNow = (((static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000;
+            if (s.status != AgentStatus::Working || unixNow - std::min(unixNow, s.lastActivity) > 5 * 60 * 1000) continue;
+            Activity a;
+            a.id = L"agent:" + s.id;
+            a.kind = Activity::Kind::Progress;
+            a.glyph = s.tool == AgentTool::Claude ? L"" : L"";
+            a.title = s.tool == AgentTool::Claude ? L"Claude Code" : L"Codex";
+            a.detail = s.doing;
+            a.accent = s.tool == AgentTool::Claude ? 0xD97757 : 0x64D2FF;
+            all.push_back(std::move(a));
+        }
     if (activityMonitor_)
         for (const Activity& a : activityMonitor_->Snapshot()) all.push_back(a);
     for (const Activity& a : drives_) if (!a.startedAt || now - a.startedAt >= 8000) all.push_back(a);   // drives: last, while plugged in
@@ -778,41 +891,9 @@ void App::OnLoginCode(const NotificationItem& n, const std::wstring& code) {
     PushActivities();
 }
 
-// Text on the clipboard that Windows' clipboard history and cloud clipboard leave out (a login code is not kept).
-static bool CopyPrivateText(HWND owner, const std::wstring& text) {
-    if (!OpenClipboard(owner)) return false;
-    EmptyClipboard();
-    bool ok = false;
-    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t))) {
-        if (void* p = GlobalLock(mem)) {
-            memcpy(p, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
-            GlobalUnlock(mem);
-            ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
-        }
-        if (!ok) GlobalFree(mem);
-    }
-    auto flag = [](const wchar_t* name, DWORD value) {
-        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD))) {
-            if (void* p = GlobalLock(mem)) {
-                memcpy(p, &value, sizeof(value));
-                GlobalUnlock(mem);
-                if (SetClipboardData(RegisterClipboardFormatW(name), mem)) return;
-            }
-            GlobalFree(mem);
-        }
-    };
-    if (ok) {
-        flag(L"ExcludeClipboardContentFromMonitorProcessing", 0);
-        flag(L"CanIncludeInClipboardHistory", 0);
-        flag(L"CanUploadToCloudClipboard", 0);
-    }
-    CloseClipboard();
-    return ok;
-}
-
 void App::OnMark(const Activity& a) {
     if (a.mark == Activity::Mark::Copy) {
-        if (!CopyPrivateText(msgWnd_, a.copy)) {
+        if (!CopyText(msgWnd_, a.copy, true)) {        // (kept out of clipboard history)
             Flash(L"copy-failed", L"\uE7BA", L"Could not copy the code", L"Another app is using the clipboard", 0xFF9F0A);
             return;
         }
@@ -936,14 +1017,170 @@ void App::ToggleAiTool(AiTool tool) {
               L" asks as usual. Nothing is ever approved automatically.\n\nEflow will add one hook entry to:\n" + file +
               L"\n(a backup of the original is kept next to it)";
     if (tool == AiTool::Codex && !connected)
-        prompt += L"\n\nCodex asks you to trust new hooks: run /hooks in Codex once after connecting.";
+        prompt += L"\n\nEflow also marks its hook as trusted in Codex (the same as /hooks in Codex).";
     if (MessageBoxW(msgWnd_, prompt.c_str(), L"Eflow", MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND) != IDOK) return;
     std::wstring error;
     const bool ok = connected ? HookInstaller::Disconnect(tool, error) : HookInstaller::Connect(tool, error);
     if (!ok) MessageBoxW(msgWnd_, error.c_str(), L"Eflow", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    else if (!connected && tool == AiTool::Codex) TrustCodexHook(true);
+}
+
+void App::UpdateAiHooks() {
+    HookInstaller::Prepare();
+    for (AiTool tool : {AiTool::ClaudeCode, AiTool::Codex}) {
+        if (!HookInstaller::IsOutdated(tool)) continue;
+        std::wstring error;
+        if (!HookInstaller::Connect(tool, error)) Log("ai: could not update the hook entry (%ls)", error.c_str());
+        else if (tool == AiTool::Codex) TrustCodexHook(false);    // its command changed, and Codex trusts a hook by its command
+    }
+}
+
+namespace {
+
+HRESULT CALLBACK BringToFront(HWND hwnd, UINT notification, WPARAM, LPARAM, LONG_PTR) {
+    if (notification == TDN_CREATED) SetForegroundWindow(hwnd);
+    return S_OK;
+}
+
+} // namespace
+
+void App::ConnectAiTools() {
+    std::wstring errors;
+    std::error_code ec;
+    for (AiTool tool : {AiTool::ClaudeCode, AiTool::Codex}) {
+        if (!std::filesystem::exists(HookInstaller::ConfigPath(tool).parent_path(), ec) || HookInstaller::IsConnected(tool)) continue;
+        std::wstring error;
+        if (!HookInstaller::Connect(tool, error)) errors += error + L"\n";
+        else if (tool == AiTool::Codex) TrustCodexHook(true);
+    }
+    if (!errors.empty()) MessageBoxW(msgWnd_, errors.c_str(), L"Eflow", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    hookCheck_ = 0;                                  // the Agents tab (and the tour) show the new state right away
+    OnAgentsChanged();
+}
+
+bool App::TourDone() {
+    DWORD done = 0, size = sizeof(done);
+    return RegGetValueW(HKEY_CURRENT_USER, kAppKey, L"TourDone", RRF_RT_REG_DWORD, nullptr, &done, &size) == ERROR_SUCCESS && done;
+}
+
+void App::StartTour() {
+    if (islands_.empty() || shoot_) return;
+    DetectSoluPlan();
+    POINT pt;
+    GetCursorPos(&pt);
+    const HMONITOR here = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    IslandWindow* target = islands_.front().get();
+    for (auto& island : islands_)
+        if (island->monitor() == here) target = island.get();
+    for (auto& island : islands_)
+        if (island.get() != target) island->StopTour();
+    tourIsland_ = target;
+    tourFirewallAt_ = 0;
+    PushTourStatus();
+    target->StartTour();
+    SetTimer(msgWnd_, kTourStatusTimer, 1000, nullptr);
+}
+
+void App::PushTourStatus() {
+    if (!tourIsland_) return;
+    if (soluSetup_) tourIsland_->SetSoluSetup(soluPlanReady_, soluPlan_, soluSetup_->Snapshot());
+    const uint64_t now = GetTickCount64();
+    // The firewall's rules take a moment to read: every few seconds, every second while Windows is asking about them.
+    if (!tourFirewallAt_ || now - tourFirewallAt_ > 4000 || (tourPhoneAskedAt_ && now - tourPhoneAskedAt_ < 60000)) {
+        tourFirewall_ = InboundAccess(ExePath());
+        tourFirewallAt_ = now;
+    }
+    IslandWindow::TourStatus status;
+    status.firewall = tourFirewall_;
+    status.micBlocked = MicrophoneBlockedByPrivacy();
+    status.autostart = AutostartEnabled();
+    std::error_code ec;
+    status.claudeAvailable = std::filesystem::exists(HookInstaller::ConfigPath(AiTool::ClaudeCode).parent_path(), ec);
+    status.codexAvailable = std::filesystem::exists(HookInstaller::ConfigPath(AiTool::Codex).parent_path(), ec);
+    tourIsland_->SetTourStatus(status);
+    if (HookInstaller::IsConnected(AiTool::ClaudeCode) != claudeHooked_ || HookInstaller::IsConnected(AiTool::Codex) != codexHooked_) {
+        hookCheck_ = 0;                              // connected (or not) meanwhile: the Agents step follows
+        OnAgentsChanged();
+    }
+}
+
+void App::OnTourFinished(bool completed) {
+    KillTimer(msgWnd_, kTourStatusTimer);
+    tourIsland_ = nullptr;
+    tourPhoneAskedAt_ = 0;
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kAppKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        const DWORD done = 1;
+        RegSetValueExW(key, L"TourDone", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&done), sizeof(done));
+        RegCloseKey(key);
+    }
+    // Skipped before its notifications step: Windows still asks, once. ("Not now" there waits for the next start.)
+    if (!completed && notifications_) notifications_->AllowPrompt();
+    Log("tour: %s", completed ? "finished" : "skipped");
+}
+
+void App::TrustCodexHook(bool announce) {
+    codexTrustAnnounce_ = announce;
+    const std::wstring program = agents_ ? agents_->FindProgram(AgentTool::Codex) : std::wstring();
+    std::thread([to = msgWnd_, program] {
+        auto detail = std::make_unique<std::wstring>();
+        const CodexTrust result = TrustEflowHookInCodex(program, *detail);
+        if (PostMessageW(to, WM_APP_CODEX_TRUST, static_cast<WPARAM>(result), reinterpret_cast<LPARAM>(detail.get()))) detail.release();
+    }).detach();
+}
+
+void App::DetectSoluPlan() {
+    if (!soluSetup_) return;
+    soluPlanReady_ = false;
+    SoluSetup* setup = soluSetup_.get();
+    std::thread([to = msgWnd_, setup] {
+        auto plan = std::make_unique<SoluSetupPlan>(setup->Detect());
+        if (PostMessageW(to, WM_APP_SOLU_SETUP, 1, reinterpret_cast<LPARAM>(plan.get()))) plan.release();
+    }).detach();
+}
+
+void App::OnSoluSetupChanged(bool planUpdate, SoluSetupPlan* plan) {
+    if (planUpdate) {
+        if (plan) soluPlan_ = *plan;
+        soluPlanReady_ = true;
+    } else if (soluSetup_ && !soluSetupHandled_) {
+        const SoluSetupProgress snap = soluSetup_->Snapshot();
+        if (snap.finished) {
+            soluSetupHandled_ = true;
+            if (snap.ok) {
+                Log("solu setup: ready; turning Solu on");
+                if (solu_ && !shoot_) solu_->Enable(true);
+                DetectSoluPlan();                     // refresh: the tab and the tour now show it installed
+            }
+        }
+    }
+    PushTourStatus();
+}
+
+void App::OnCodexTrust(int result, const std::wstring& detail) {
+    const CodexTrust r = static_cast<CodexTrust>(result);
+    if (r == CodexTrust::Trusted || r == CodexTrust::AlreadyTrusted) {
+        if (codexTrustAnnounce_) Flash(L"codex-trust", L"\uE73E", L"Codex approvals are on", L"Start a new Codex chat to use them", 0x30D158);
+        return;
+    }
+    // Couldn't do it for the user: the one step left, in plain words.
+    const std::wstring content = L"Codex checks new hooks before it runs them, and Eflow couldn't confirm that for you (" + detail +
+                                 L").\n\nIn Codex, type /hooks and trust Eflow's hook. Until then, Codex asks in its own prompt as usual.";
+    TASKDIALOGCONFIG dialog{sizeof(dialog)};
+    dialog.hInstance = GetModuleHandleW(nullptr);
+    dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    dialog.dwCommonButtons = TDCBF_OK_BUTTON;
+    dialog.pszWindowTitle = L"Eflow";
+    dialog.pszMainIcon = MAKEINTRESOURCEW(IDI_EFLOW);
+    dialog.pszMainInstruction = L"One more step for Codex";
+    dialog.pszContent = content.c_str();
+    dialog.pfCallback = BringToFront;
+    TaskDialogIndirect(&dialog, nullptr, nullptr, nullptr);
 }
 
 void App::BuildIslands() {
+    const bool touring = tourIsland_ != nullptr;
+    tourIsland_ = nullptr;
     islands_.clear();
     std::vector<HMONITOR> monitors;
     EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
@@ -1037,6 +1274,8 @@ void App::BuildIslands() {
             std::thread([copy, openChat] { AgentMonitor::FocusHost(copy, openChat); }).detach();         // (it sleeps briefly: not on the UI thread)
         });
         island->SetMarkHandler([this](const Activity& a) { OnMark(a); });
+        island->SetGlimpsePrefs(glimpseLyrics_, glimpseAgents_);
+        island->SetGlimpseHandler([this](bool lyrics, bool agents) { SetGlimpsePrefs(lyrics, agents); });
         island->SetActivityDismiss([this](const std::wstring& id) {
             if (shoot_) {
                 std::erase_if(shootActs_, [&](const Activity& a) { return a.id == id; });
@@ -1065,6 +1304,24 @@ void App::BuildIslands() {
             [this](uint32_t id) { reminders_.Remove(id); TickReminders(); },
             [this](uint32_t id) { reminders_.Dismiss(id); TickReminders(); },
             [this](uint32_t id, int minutes) { reminders_.Snooze(id, minutes); TickReminders(); });
+        IslandWindow::SafeShareHandlers share;
+        share.send = [this](const ShareSendRequest& request) { if (safeShare_ && !shoot_) safeShare_->Send(request); };
+        share.cancel = [this] { if (safeShare_) safeShare_->Cancel(); };
+        share.done = [this] { if (safeShare_) safeShare_->Dismiss(); };
+        share.remove = [this](const std::wstring& room) { if (safeShare_) safeShare_->Close(room); };
+        share.copyLink = [this](const std::wstring& room) {     // the link holds the key: kept out of clipboard history
+            const std::wstring link = safeShare_ ? safeShare_->Link(room) : std::wstring();
+            return !link.empty() && CopyText(msgWnd_, link, true);
+        };
+        share.phone = [this](bool on) {
+            if (!phone_ || shoot_) return;
+            if (on) phone_->Start();
+            else phone_->Stop();
+        };
+        share.phoneAnyway = [this] { if (phone_ && !shoot_) phone_->Start(true); };
+        share.phoneAllow = [this](bool allow) { if (phone_) phone_->Allow(allow); };
+        share.offer = [this](const std::vector<std::wstring>& paths) { if (phone_) phone_->Offer(paths); };
+        island->SetSafeShareHandlers(std::move(share));
         island->SetPermissionHandler([this](uint64_t id, PermissionDecision decision) {
             if (shoot_) return ShootDecide(id);                 // filming: nothing is really approved
             if (id >= kSoluApprovalBase) {
@@ -1073,8 +1330,31 @@ void App::BuildIslands() {
             }
             if (permissions_) permissions_->Resolve(id, decision);
         });
+        IslandWindow::TourHandlers tour;
+        tour.allowNotifications = [this] { if (notifications_) notifications_->AllowPrompt(); };
+        tour.connectAgents = [this] { ConnectAiTools(); };
+        tour.allowPhone = [this] {
+            tourPhoneAskedAt_ = GetTickCount64();
+            AskInboundAccess();
+        };
+    tour.turnOnSolu = [this] { if (solu_ && !shoot_) solu_->Enable(true); };
+        tour.soluSetupBegin = [this](const std::wstring& modelId) {
+            if (soluSetup_ && !soluSetup_->Running()) {
+                soluSetupHandled_ = false;
+                soluSetup_->Begin(msgWnd_, modelId);
+                PushTourStatus();
+            }
+        };
+        tour.openSettings = [](const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); };
+        tour.autostart = [this](bool on) {
+            SetAutostart(on);
+            PushTourStatus();
+        };
+        tour.finished = [this](bool completed) { OnTourFinished(completed); };
+        island->SetTourHandlers(std::move(tour));
         islands_.push_back(std::move(island));
     }
+    if (touring) StartTour();                        // (the display changed mid-tour: it starts again on the new islands)
 }
 
 void App::RebuildGraphics() {
@@ -1085,6 +1365,7 @@ void App::RebuildGraphics() {
     }
     BuildIslands();
     OnShelfChanged();
+    OnSafeShareChanged();
     OnRemindersChanged();
     OnMediaChanged();                        // fresh islands start with the current track
     OnLyricsChanged();                       // ... and its lyrics (the lookup is not repeated for the same song)
@@ -1119,7 +1400,12 @@ void App::AddTrayIcon() {
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     tray_.uCallbackMessage = WM_APP_TRAY;
-    tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);   // placeholder until the app icon exists
+    if (!trayIcon_) {                                     // the app icon, at the tray's size for this screen's scale
+        const UINT dpi = GetDpiForSystem();
+        trayIcon_ = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_EFLOW), IMAGE_ICON,
+                                                  GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), 0));
+    }
+    tray_.hIcon = trayIcon_ ? trayIcon_ : LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(tray_.szTip, L"Eflow");
     Shell_NotifyIconW(NIM_ADD, &tray_);
     tray_.uVersion = NOTIFYICON_VERSION_4;
@@ -1141,6 +1427,7 @@ void App::ShowTrayMenu() {
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(test), L"Mascot test");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuTour, L"Take the tour");
     AppendMenuW(menu, MF_STRING, kMenuQuit, L"Quit Eflow");
     POINT pt;
     GetCursorPos(&pt);
@@ -1151,6 +1438,7 @@ void App::ShowTrayMenu() {
     else if (cmd == kMenuQuit) PostQuitMessage(0);
     else if (cmd == kMenuConnectClaude) ToggleAiTool(AiTool::ClaudeCode);
     else if (cmd == kMenuConnectCodex) ToggleAiTool(AiTool::Codex);
+    else if (cmd == kMenuTour) StartTour();
     else if (cmd >= kMenuMascotFirst && cmd < kMenuMascotFirst + 4)
         SetMascotState(static_cast<Mascot::State>(cmd - kMenuMascotFirst));
 }
@@ -1226,9 +1514,18 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateMood();
         } else if (wp == kReminderTimer) {
             TickReminders();
+        } else if (wp == kTourStatusTimer) {
+            PushTourStatus();
         } else if (wp == kAlarmStopTimer) {
             KillTimer(hwnd, kAlarmStopTimer);
             alarm_.Stop();
+        } else if (wp == kWelcomeTimer) {
+            if (ForegroundIsFullscreen() || shoot_) {
+                SetTimer(hwnd, kWelcomeTimer, 30000, nullptr);   // ask later, not over a game or a video
+            } else {
+                KillTimer(hwnd, kWelcomeTimer);
+                if (!TourDone()) StartTour();
+            }
         }
         return 0;
     case WM_POWERBROADCAST:                  // back from sleep: ring what came due meanwhile, re-arm the timer
@@ -1243,6 +1540,16 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_AGENTS:
         OnAgentsChanged();
         return 0;
+    case WM_APP_CODEX_TRUST: {
+        std::unique_ptr<std::wstring> detail(reinterpret_cast<std::wstring*>(lp));
+        OnCodexTrust(static_cast<int>(wp), *detail);
+        return 0;
+    }
+    case WM_APP_SOLU_SETUP: {
+        std::unique_ptr<SoluSetupPlan> plan(wp ? reinterpret_cast<SoluSetupPlan*>(lp) : nullptr);
+        OnSoluSetupChanged(wp != 0, plan.get());
+        return 0;
+    }
     case WM_APP_SHELF:
         OnShelfChanged();
         return 0;
@@ -1253,6 +1560,20 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLIPBOARDUPDATE:                 // maybe a screenshot
         if (shots_) shots_->OnClipboardUpdate();
         return 0;
+    case WM_APP_SAFESHARE:
+    case WM_APP_PHONE:
+        OnSafeShareChanged();
+        return 0;
+    case WM_APP_PHONE_FILE: {
+        std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lp));
+        OnPhoneFile(*path);
+        return 0;
+    }
+    case WM_APP_SAFESHARE_EVENT: {
+        std::unique_ptr<SafeShareService::Event> e(reinterpret_cast<SafeShareService::Event*>(lp));
+        OnSafeShareEvent(*e);
+        return 0;
+    }
     case WM_APP_SCREENSHOT: {
         std::unique_ptr<Screenshot> shot(reinterpret_cast<Screenshot*>(lp));
         OnScreenshot(*shot);

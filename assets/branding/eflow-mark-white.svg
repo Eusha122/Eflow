@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="76 96 360 300">
+  <!-- Eflow mark for blurple or dark backgrounds: white face, blurple eyes. -->
+  <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="36" stroke-linejoin="round">
+    <path d="M138 250 L166 130 L230 214 Z"/>
+    <path d="M374 250 L346 130 L282 214 Z"/>
+  </g>
+  <rect x="92" y="196" width="328" height="184" rx="92" fill="#FFFFFF"/>
+  <g fill="none" stroke="#404EED" stroke-width="22" stroke-linecap="round">
+    <path d="M176 300 Q204 266 232 300"/>
+    <path d="M280 300 Q308 266 336 300"/>
+  </g>
+</svg>

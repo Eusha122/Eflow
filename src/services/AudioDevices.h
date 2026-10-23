@@ -53,6 +53,9 @@ struct AudioSnapshot {
 // system default: the choice lives in that file, which Solu reads and follows. While somebody watches
 // (Watch(+1) while the island is open) the peak level, mute state, readiness and the apps using each device
 // are refreshed several times a second. Posts `message` to `notify` whenever the snapshot changes.
+// Windows' privacy switch keeps desktop apps (Solu) away from the microphone.
+bool MicrophoneBlockedByPrivacy();
+
 class AudioDevices {
 public:
     AudioDevices(HWND notify, UINT message);
