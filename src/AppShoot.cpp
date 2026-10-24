@@ -224,10 +224,31 @@ void App::OnShootCommand(const std::string& text) {
         if (!islands_.empty()) {
             if (step >= 0 && !tourIsland_) {
                 tourIsland_ = islands_.front().get();
+                DetectSoluPlan();                     // the Solu step needs the plan, as App::StartTour would have done
                 PushTourStatus();
             }
             islands_.front()->DebugTour(step);
             if (step < 0) tourIsland_ = nullptr;
+        }
+        return;
+    }
+    if (cmd == L"tour_hit") {                                     // layout checks: press a tour control by its hit id,
+        if (!islands_.empty()) islands_.front()->DebugTourHit(static_cast<int>(Num(v, "id", -1)));   // without the mouse
+        return;
+    }
+    if (cmd == L"solu_plan") {                                    // layout checks: the Solu step as a PC with nothing
+        if (soluSetup_) {                                         // installed sees it, optionally with another card
+            soluPlan_ = soluSetup_->Detect();
+            if (Has(v, "vramMB")) {
+                soluPlan_.vramBytes = static_cast<uint64_t>(Num(v, "vramMB")) * 1024 * 1024;
+                soluPlan_.hasDedicatedGpu = soluPlan_.vramBytes > 0;
+            }
+            if (Has(v, "ramMB")) soluPlan_.ramBytes = static_cast<uint64_t>(Num(v, "ramMB")) * 1024 * 1024;
+            soluSetup_->RateModels(soluPlan_);                    // re-rate the ladder for those numbers
+            soluPlan_.pythonReady = soluPlan_.speechModelsReady = false;
+            for (SoluModelChoice& m : soluPlan_.models) m.ready = false;
+            soluPlanReady_ = !Has(v, "checking") || !Bool(v, "checking");   // "checking": hold the step on its spinner
+            PushTourStatus();
         }
         return;
     }
@@ -242,12 +263,17 @@ void App::OnShootCommand(const std::string& text) {
         if (soluSetup_) {
             const SoluSetupPlan plan = soluSetup_->Detect();
             const SoluSetupProgress p = soluSetup_->Snapshot();
-            Log("solu setup: python=%d speech=%d ollamaInstalled=%d ollamaRunning=%d nvidia=%d vramMB=%llu "
-                "recommended=%ls capableReady=%d lighterReady=%d | stage=%d done=%llu total=%llu finished=%d ok=%d err=%ls",
-                plan.pythonReady, plan.speechModelsReady, plan.ollamaInstalled, plan.ollamaRunning, plan.hasNvidiaGpu,
-                static_cast<unsigned long long>(plan.vramBytes / (1024 * 1024)), plan.models[static_cast<size_t>(plan.recommended)].id.c_str(),
-                plan.models[0].ready, plan.models[1].ready, static_cast<int>(p.stage), static_cast<unsigned long long>(p.doneBytes),
+            Log("solu setup: python=%d speech=%d ollamaInstalled=%d ollamaRunning=%d gpu=%ls vramMB=%llu ramMB=%llu "
+                "recommended=%ls | stage=%d done=%llu total=%llu finished=%d ok=%d err=%ls",
+                plan.pythonReady, plan.speechModelsReady, plan.ollamaInstalled, plan.ollamaRunning,
+                plan.hasDedicatedGpu ? plan.gpuName.c_str() : L"(none)", static_cast<unsigned long long>(plan.vramBytes / (1024 * 1024)),
+                static_cast<unsigned long long>(plan.ramBytes / (1024 * 1024)), plan.models[static_cast<size_t>(plan.recommended)].id.c_str(),
+                static_cast<int>(p.stage), static_cast<unsigned long long>(p.doneBytes),
                 static_cast<unsigned long long>(p.totalBytes), p.finished, p.ok, p.error.c_str());
+            for (const SoluModelChoice& m : plan.models)          // the whole ladder, so a recommendation can be checked
+                Log("  %ls %-18ls %s%ls", m.ready ? L"[have]" : L"      ", m.id.c_str(),
+                    m.fit == SoluModelFit::Comfortable ? "comfortable " : m.fit == SoluModelFit::Tight ? "tight       " : "too big     ",
+                    m.fitNote.c_str());
         }
         return;
     }

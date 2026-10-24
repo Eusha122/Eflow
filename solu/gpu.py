@@ -21,7 +21,9 @@ import urllib.request
 KEEP = "3m"                     # how long the brain stays in memory after its last use
 RESERVE_GB = 1.5                # always left free for the user's other apps
 # per model: layers (blocks + output), GB per layer (weights + context cache), GB it needs beyond its layers
-SIZES = {"qwen3:8b": (37, 0.175, 0.2), "qwen3:4b-instruct": (37, 0.1, 0.3), "qwen3-vl:4b": (37, 0.12, 1.5)}
+SIZES = {"qwen3:0.6b": (29, 0.03, 0.2), "qwen3:1.7b": (29, 0.07, 0.2), "qwen3:4b-instruct": (37, 0.1, 0.3),
+         "qwen3:8b": (37, 0.175, 0.2), "qwen3:14b": (41, 0.28, 0.3), "qwen3:30b-a3b": (49, 0.45, 0.4),
+         "qwen3-vl:4b": (37, 0.12, 1.5)}
 API = "http://127.0.0.1:11434/api"
 SHARED = os.path.join(os.environ.get("LOCALAPPDATA", "."), "Eflow", "gpu_layers.json")
 SMI = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe")

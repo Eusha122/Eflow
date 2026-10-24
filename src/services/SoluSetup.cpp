@@ -1,7 +1,9 @@
 #include "services/SoluSetup.h"
 
 #include <windows.h>
+#include <dxgi.h>
 #include <shlobj.h>
+#include <wrl/client.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -35,6 +37,24 @@ constexpr ModelFile kSpeechModels[] = {
     {L"voices-v1.0.bin", L"https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin", 27u * 1024 * 1024},
     {L"silero_vad.onnx", L"https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx", 2u * 1024 * 1024},
 };
+
+// The ladder of brains Solu can run, smallest first, all from Ollama's own library. A PC that can only just manage
+// the first one still gets a Solu that answers; a PC with a big card gets a much better one. `gb` is the download.
+struct BrainChoice {
+    const wchar_t *id, *label, *note;
+    double gb;             // what Ollama downloads
+    double overheadGb;     // context cache and runtime, on top of the weights, while it is answering
+    bool cpuTolerable;     // honest about speed: bigger than this and a PC without a graphics card crawls
+};
+constexpr BrainChoice kBrains[] = {
+    {L"qwen3:0.6b", L"Tiny · 0.6B", L"For older or low-memory PCs. Short, simple answers, but quick.", 0.52, 0.4, true},
+    {L"qwen3:1.7b", L"Small · 1.7B", L"Runs on almost anything, including PCs without a graphics card.", 1.4, 0.5, true},
+    {L"qwen3:4b-instruct", L"Light · 4B", L"The everyday choice: fast, and good enough for most questions.", 2.5, 0.7, true},
+    {L"qwen3:8b", L"Balanced · 8B", L"Noticeably better answers. Wants a graphics card of its own.", 5.2, 1.0, false},
+    {L"qwen3:14b", L"Capable · 14B", L"Thinks things through properly. For a roomy graphics card.", 9.3, 1.2, false},
+    {L"qwen3:30b-a3b", L"Powerful · 30B", L"The best Solu can be, and still fast. For 24 GB cards.", 19.0, 1.6, false},
+};
+constexpr uint64_t kGb = 1024ull * 1024 * 1024;
 
 std::wstring ExePath() {
     std::wstring path(MAX_PATH, L'\0');
@@ -98,7 +118,7 @@ void WriteFileText(const fs::path& p, const std::string& text) {
 
 // The requirements Solu actually needs on this PC: the two CUDA packages only make sense (and are each hundreds of MB)
 // with an NVIDIA GPU, so a PC without one skips them entirely.
-std::vector<std::string> FilteredRequirements(const fs::path& source, bool hasNvidiaGpu) {
+std::vector<std::string> FilteredRequirements(const fs::path& source, bool hasDedicatedGpu) {
     std::string text;
     if (!ReadFile(source / L"requirements.txt", text)) return {};
     std::vector<std::string> out;
@@ -108,7 +128,7 @@ std::vector<std::string> FilteredRequirements(const fs::path& source, bool hasNv
         if (hash != std::string::npos) line.resize(hash);
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
         if (line.empty()) continue;
-        if (!hasNvidiaGpu && line.rfind("nvidia-", 0) == 0) continue;
+        if (!hasDedicatedGpu && line.rfind("nvidia-", 0) == 0) continue;
         out.push_back(line);
     }
     return out;
@@ -141,6 +161,38 @@ bool NvidiaVram(uint64_t& bytes) {
     }
     shutdown();
     return ok;
+}
+
+// The same question for any card, not only NVIDIA's: the biggest dedicated video memory DXGI reports, and the name
+// of that adapter. Integrated graphics report little or no dedicated memory, which is the honest answer here - they
+// share system memory, so a model on them is a model on the processor.
+bool DedicatedVram(uint64_t& bytes, std::wstring& name) {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    bool found = false;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc))) continue;
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;            // the WARP renderer is not a graphics card
+        if (desc.DedicatedVideoMemory <= bytes) continue;
+        bytes = desc.DedicatedVideoMemory;
+        name = desc.Description;
+        found = true;
+    }
+    return found;
+}
+
+uint64_t SystemRam() {
+    MEMORYSTATUSEX mem{};
+    mem.dwLength = sizeof(mem);
+    return GlobalMemoryStatusEx(&mem) ? mem.ullTotalPhys : 0;
+}
+
+// Where the setup remembers which brain it pulled, so Solu asks for that one and not a bigger one it never downloaded.
+fs::path ChosenModelFile() {
+    const fs::path dir = SoluDataDir();
+    return dir.empty() ? fs::path{} : dir / L"model.txt";
 }
 
 // ---- a small client for Ollama's local API (loopback only, so plain HTTP; handles the chunked responses its
@@ -324,6 +376,24 @@ bool OllamaReachable(int timeoutMs) {
     return got;
 }
 
+// Every model Ollama already has, in one request. Asking per model meant six round trips - and six 1.2 s timeouts
+// when Ollama was slow to answer - which is what made the Solu step sit on "Checking this PC".
+std::vector<std::string> OllamaInstalledModels() {
+    std::vector<std::string> names;
+    OllamaRequest("GET", "/api/tags", "", nullptr, 1200, [&](const std::string& line) {
+        json::Value v;
+        std::string error;
+        if (!json::Parse(line, v, error) || v.type != json::Value::Type::Object) return;
+        json::Value* models = v.Find("models");
+        if (!models || models->type != json::Value::Type::Array) return;
+        for (json::Value& m : models->items) {
+            json::Value* name = m.type == json::Value::Type::Object ? m.Find("name") : nullptr;
+            if (name && name->type == json::Value::Type::String) names.push_back(name->text);
+        }
+    });
+    return names;
+}
+
 bool OllamaHasModel(const std::wstring& modelId) {
     const std::string want = ToUtf8(modelId);
     bool found = false;
@@ -385,8 +455,58 @@ std::vector<wchar_t> IsolatedPythonEnv() {
 // Runs `exe args...` to completion, in a job object so Cancel (via *cancel) can kill it and anything it started.
 // Output goes to `logPath` for diagnosis; returns the exit code, or -1 if it could not be started / was cancelled.
 // `isolatedPython`: true for anything that runs solu\pyruntime's python.exe (see IsolatedPythonEnv).
+// What pip is busy with, read from the log it is writing: "Collecting faster-whisper" / "Downloading numpy-2.4.6..."
+// / "Installing collected packages: ...". Returns "" when there is nothing worth showing yet. Without this the step
+// is a sweeping bar with no sign of life, and a few minutes of that looks exactly like a freeze.
+std::wstring PipStep(const fs::path& logPath) {
+    std::string text;
+    {
+        HANDLE f = CreateFileW(logPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return {};
+        LARGE_INTEGER size{};
+        GetFileSizeEx(f, &size);
+        constexpr LONG tail = 8192;                       // only the end of it matters
+        if (size.QuadPart > tail) SetFilePointer(f, -tail, nullptr, FILE_END);
+        char buf[tail];
+        DWORD got = 0;
+        if (::ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) text.assign(buf, got);   // (::, not our own helper)
+        CloseHandle(f);
+    }
+    // pip redraws its progress bars with \r, so split on both.
+    std::string best;
+    for (size_t at = 0, start = 0; at <= text.size(); ++at) {
+        if (at != text.size() && text[at] != '\n' && text[at] != '\r') continue;
+        const std::string line = text.substr(start, at - start);
+        start = at + 1;
+        for (const char* prefix : {"Collecting ", "Downloading ", "Installing collected packages", "Building wheel"})
+            if (line.rfind(prefix, 0) == 0) best = line;
+    }
+    if (best.empty()) return {};
+    if (best.rfind("Installing collected packages", 0) == 0) return L"Installing Python packages, almost there...";
+
+    std::string name;
+    if (best.rfind("Building wheel", 0) == 0) {                 // "Building wheel for ctranslate2 (setup.py)"
+        const size_t at = best.find("for ");
+        if (at == std::string::npos) return {};
+        name = best.substr(at + 4);
+        name.resize(std::min(name.size(), name.find(' ')));
+    } else if (best.rfind("Collecting ", 0) == 0) {             // "Collecting faster-whisper==1.2.1" (a hyphen is part of it)
+        name = best.substr(11);
+        name.resize(std::min(name.size(), name.find_first_of("=<>[; ")));
+    } else {                                                     // "Downloading faster_whisper-1.2.1-py3-none-any.whl (16 kB)"
+        name = best.substr(best.find(' ') + 1);
+        for (size_t at = 0; at + 1 < name.size(); ++at)
+            if (name[at] == '-' && isdigit(static_cast<unsigned char>(name[at + 1]))) { name.resize(at); break; }
+        name.resize(std::min(name.size(), name.find(' ')));
+    }
+    if (name.empty()) return {};
+    return L"Installing Python packages: " + FromUtf8(name);
+}
+
+// `onTick` (optional) is called a few times a second while the tool runs, so a long step can say what it is doing.
 int RunTool(const std::wstring& exe, const std::wstring& args, const fs::path& workDir, const fs::path& logPath, const std::atomic<bool>* cancel,
-           bool isolatedPython = false) {
+           bool isolatedPython = false, const std::function<void()>& onTick = nullptr) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE log = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     HANDLE in = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
@@ -417,6 +537,7 @@ int RunTool(const std::wstring& exe, const std::wstring& args, const fs::path& w
             break;
         }
         if (WaitForSingleObject(pi.hProcess, 200) == WAIT_OBJECT_0) break;
+        if (onTick) onTick();
     }
     DWORD code = static_cast<DWORD>(-1);
     GetExitCodeProcess(pi.hProcess, &code);
@@ -446,6 +567,61 @@ uint64_t SoluSetupPlan::EstimateBytes(const std::wstring& modelId) const {
     return total;
 }
 
+void SoluSetup::RateModels(SoluSetupPlan& plan) const {
+    plan.models.clear();
+    // Never recommend a model that would take the whole card. Solu shares it with everything else the user has open,
+    // and a card with nothing left crashes THEM (while testing, a driver reset took VS Code down with it). The
+    // reserve is the one solu\gpu.py already runs with - 1.5 GB, or more on a big card - so a recommendation here
+    // means the brain really does fit whole, with the desktop, a browser and an editor still drawing.
+    const double cardBytes = static_cast<double>(plan.vramBytes);
+    // Two limits, whichever is stricter: a fixed reserve (small cards), and never more than about three quarters of
+    // the card (big ones, where a tenth is not enough to game or edit video beside it). The 8B brain measured 6.2 GB
+    // loaded whole (solu\gpu.py), and that is what an 8 GB card has been running all along - so it must still qualify.
+    const double vramRoom = plan.hasDedicatedGpu ? (std::min)(cardBytes - (std::max)(1.5 * kGb, cardBytes * 0.10), cardBytes * 0.82) : 0.0;
+    // With no card the processor answers, out of system memory - and it has to leave plenty for Windows and the apps.
+    const double ramRoom = static_cast<double>(plan.ramBytes) * 0.35;
+    for (const BrainChoice& b : kBrains) {
+        SoluModelChoice m;
+        m.id = b.id;
+        m.label = b.label;
+        m.note = b.note;
+        m.approxBytes = static_cast<uint64_t>(b.gb * kGb);
+        m.needBytes = static_cast<uint64_t>((b.gb + b.overheadGb) * kGb);
+        const double need = static_cast<double>(m.needBytes);
+        if (plan.hasDedicatedGpu) {
+            if (need <= vramRoom) {
+                m.fit = SoluModelFit::Comfortable;
+                m.fitNote = L"Fits on your graphics card, with room left over";
+            } else if (need <= cardBytes) {
+                m.fit = SoluModelFit::Tight;
+                m.fitNote = L"Would fill your card, leaving little for other apps";
+            } else if (need <= ramRoom + vramRoom) {
+                m.fit = SoluModelFit::Tight;
+                m.fitNote = L"Part of it would run on the processor, slowly";
+            } else {
+                m.fit = SoluModelFit::TooBig;
+                m.fitNote = L"Needs more memory than this PC has";
+            }
+        } else if (b.cpuTolerable && need <= ramRoom) {
+            m.fit = SoluModelFit::Comfortable;
+            m.fitNote = L"Runs on the processor, with memory to spare";
+        } else if (need <= ramRoom) {
+            m.fit = SoluModelFit::Tight;
+            m.fitNote = L"Runs, but answers slowly without a graphics card";
+        } else if (need <= static_cast<double>(plan.ramBytes)) {
+            m.fit = SoluModelFit::Tight;
+            m.fitNote = L"Would use most of this PC's memory";
+        } else {
+            m.fit = SoluModelFit::TooBig;
+            m.fitNote = L"Needs more memory than this PC has";
+        }
+        plan.models.push_back(m);
+    }
+    plan.recommended = 0;                                   // the largest comfortable one; the smallest if none is
+    for (size_t i = 0; i < plan.models.size(); ++i)
+        if (plan.models[i].fit == SoluModelFit::Comfortable) plan.recommended = static_cast<int>(i);
+}
+
 SoluSetupPlan SoluSetup::Detect() const {
     SoluSetupPlan plan;
     const fs::path source = SoluSourceDir();
@@ -467,19 +643,41 @@ SoluSetupPlan SoluSetup::Detect() const {
     }
     plan.ollamaInstalled = !FindOllamaExe().empty();
     plan.ollamaRunning = plan.ollamaInstalled && OllamaReachable(400);
-    plan.hasNvidiaGpu = NvidiaVram(plan.vramBytes);
-
-    SoluModelChoice capable{L"qwen3:8b", L"Capable (8B)", L"The fuller model: better answers, needs a decent graphics card.", 5200ull * 1024 * 1024};
-    SoluModelChoice lighter{L"qwen3:4b-instruct", L"Lighter (4B)", L"Smaller and faster; works on most PCs, including without a dedicated graphics card.",
-                            2600ull * 1024 * 1024};
-    if (plan.ollamaRunning) {
-        capable.ready = OllamaHasModel(capable.id);
-        lighter.ready = OllamaHasModel(lighter.id);
+    plan.ramBytes = SystemRam();
+    uint64_t vram = 0;
+    std::wstring gpu;
+    plan.hasDedicatedGpu = DedicatedVram(vram, gpu) && vram >= 2 * kGb;   // under 2 GB is integrated graphics in all but name
+    if (!plan.hasDedicatedGpu) {                                          // no DXGI answer: NVML still knows its own cards
+        uint64_t nv = 0;
+        if (NvidiaVram(nv) && nv >= 2 * kGb) {
+            plan.hasDedicatedGpu = true;
+            vram = nv;
+            if (gpu.empty()) gpu = L"your graphics card";
+        }
     }
-    plan.models = {capable, lighter};
-    // 12 GB+ is comfortable for an 8B model alongside everything else on the GPU; below that, the lighter model stays responsive.
-    plan.recommended = plan.hasNvidiaGpu && plan.vramBytes >= 12ull * 1024 * 1024 * 1024 ? 0 : 1;
+    plan.vramBytes = plan.hasDedicatedGpu ? vram : 0;
+    plan.gpuName = plan.hasDedicatedGpu ? gpu : std::wstring();
+
+    RateModels(plan);
+    if (plan.ollamaRunning) {                                  // which of the ladder this PC already downloaded
+        const std::vector<std::string> have = OllamaInstalledModels();
+        for (SoluModelChoice& m : plan.models) {
+            const std::string want = ToUtf8(m.id);
+            m.ready = std::find(have.begin(), have.end(), want) != have.end() ||
+                      std::find(have.begin(), have.end(), want + ":latest") != have.end();
+        }
+    }
+    Log("solu setup: %ls, %.1f GB of memory -> recommending %ls", plan.hasDedicatedGpu ? plan.gpuName.c_str() : L"no dedicated graphics card",
+        static_cast<double>(plan.ramBytes) / kGb, plan.models[static_cast<size_t>(plan.recommended)].id.c_str());
     return plan;
+}
+
+std::wstring SoluChosenModel() {
+    const fs::path file = ChosenModelFile();
+    std::string text;
+    if (file.empty() || !ReadFile(file, text)) return {};
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+    return FromUtf8(text);
 }
 
 void SoluSetup::Begin(HWND notify, const std::wstring& modelId) {
@@ -530,7 +728,7 @@ void SoluSetup::Run(HWND notify, std::wstring modelId) {
     if (source.empty()) return Finish(notify, false, L"Eflow's solu\\ folder is missing from this install.");
     std::error_code ec;
     uint64_t vram = 0;
-    const bool hasNvidiaGpu = NvidiaVram(vram);
+    const bool hasDedicatedGpu = NvidiaVram(vram);
 
     // ---- the Python runtime (never the system Python: a private copy of our own) -------------------------------
     const fs::path py = SoluRuntimeDir(source) / L"pyruntime";
@@ -578,10 +776,18 @@ void SoluSetup::Run(HWND notify, std::wstring modelId) {
 
         if (cancel_) return Finish(notify, false, L"Cancelled");
         Report(notify, SoluSetupStage::PythonPackages, L"Installing Python packages (a few minutes)...");
-        const std::vector<std::string> packages = FilteredRequirements(source, hasNvidiaGpu);
+        const std::vector<std::string> packages = FilteredRequirements(source, hasDedicatedGpu);
         std::wstring args = L"-m pip install --no-warn-script-location";
         for (const std::string& pkg : packages) args += L" " + FromUtf8(pkg);
-        if (RunTool(pyExe.wstring(), args, py, py / L"pip-install.log", &cancel_, true) != 0)
+        const fs::path pipLog = py / L"pip-install.log";
+        std::wstring lastStep;
+        auto tick = [&] {                                     // name what pip is on, so the wait shows signs of life
+            std::wstring step = PipStep(pipLog);
+            if (step.empty() || step == lastStep) return;
+            lastStep = step;
+            Report(notify, SoluSetupStage::PythonPackages, step);
+        };
+        if (RunTool(pyExe.wstring(), args, py, pipLog, &cancel_, true, tick) != 0)
             return Finish(notify, false, L"Installing Solu's Python packages failed (see solu\\pyruntime\\pip-install.log).");
         WriteFileText(py / L".packages-installed", currentReqs);
     }
@@ -624,12 +830,14 @@ void SoluSetup::Run(HWND notify, std::wstring modelId) {
         Report(notify, SoluSetupStage::OllamaStarting, L"Starting Ollama...");
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
-        std::wstring cmd = L"\"" + ollamaExe + L"\"";
+        // "serve" is what starts the local server. Plain `ollama.exe` is the CLI: with no arguments it shows its own
+        // menu and waits, so it never listens - which looked exactly like Ollama failing to start.
+        std::wstring cmd = L"\"" + ollamaExe + L"\" serve";
         if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         }
-        for (int i = 0; i < 40 && !cancel_; ++i) {       // Ollama's tray app starts its server after a moment
+        for (int i = 0; i < 120 && !cancel_; ++i) {      // a first start reads its models off a cold disk: give it a minute
             if (OllamaReachable(400)) break;
             Sleep(500);
         }
@@ -670,6 +878,12 @@ void SoluSetup::Run(HWND notify, std::wstring modelId) {
         if (!success) return Finish(notify, false, L"Ollama ended the download without confirming it finished.");
     }
 
+    // Remember which brain this PC actually has, so Solu asks Ollama for that one and never for a bigger one.
+    if (const fs::path chosen = ChosenModelFile(); !chosen.empty() && !modelId.empty()) {
+        std::error_code dirEc;
+        fs::create_directories(chosen.parent_path(), dirEc);
+        std::ofstream(chosen, std::ios::binary) << ToUtf8(modelId);
+    }
     Finish(notify, true, L"");
 }
 

@@ -53,8 +53,11 @@ inline constexpr int kHitTourFirst = 3900;
 inline constexpr int kHitTourPrimary = 3900, kHitTourSecondary = 3901, kHitTourBack = 3902, kHitTourSkip = 3903;
 inline constexpr int kHitTourSwitch = 3904;                 // "Start Eflow with Windows"
 inline constexpr int kHitTourDot = 3910;                    // + step: jump back to a step already seen
+inline constexpr int kHitTourModel = 3920;                  // + row: which brain Solu should download
+inline constexpr int kTourModelRows = 6;
 inline constexpr int kHitTourLast = 3949;
 inline constexpr float kTourH = 286.0f;          // height of the island during the tour
+inline constexpr float kTourSoluH = 342.0f;      // ...and on the Solu step, where the list of brains needs the room
 inline constexpr float kTourInviteW = 318.0f;    // the closed island while it invites the user to open it
 inline constexpr UINT_PTR kTourTimer = 21;       // the last step's goodbye, before the island closes
 inline constexpr int kHitSoluSetup = 3950;       // the Solu tab's "Set up Solu" row, before it is installed

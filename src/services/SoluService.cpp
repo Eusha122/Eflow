@@ -9,6 +9,7 @@
 #include "core/Utf8.h"
 #include "core/Json.h"
 #include "core/Log.h"
+#include "services/SoluSetup.h"
 
 namespace eflow {
 
@@ -200,6 +201,10 @@ bool SoluService::Launch() {
     SetEnvironmentVariableW(L"PYTHONPATH", nullptr);
     SetEnvironmentVariableW(L"PYTHONHOME", nullptr);
     SetEnvironmentVariableW(L"EFLOW_SOLU_MODELS", ModelsDir(dir).c_str());   // read-only app folder: they live elsewhere
+    // The brain this PC chose during setup. Without it Solu would ask for the one config.py was written around,
+    // which a lighter PC never downloaded.
+    const std::wstring brain = SoluChosenModel();
+    SetEnvironmentVariableW(L"EFLOW_SOLU_BRAIN", brain.empty() ? nullptr : brain.c_str());
     PROCESS_INFORMATION pi{};
     const BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
                                    dir.c_str(), &si, &pi);

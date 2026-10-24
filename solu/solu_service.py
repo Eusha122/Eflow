@@ -29,6 +29,10 @@ import time
 OUT = sys.stdout
 sys.stdout = sys.stderr                                      # prints in solu_chat go to the log, not into the event stream
 os.chdir(os.path.dirname(os.path.abspath(__file__)))         # models/ is relative to this folder
+# An installed Eflow runs this on the embeddable Python, whose ._pth file fixes sys.path outright: neither this
+# folder nor the working directory is on it, so every import below would be a ModuleNotFoundError. A development
+# checkout runs on a venv, which adds this folder itself - which is why only installed copies ever saw it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import solu_chat  # noqa: E402
 import gpu  # noqa: E402

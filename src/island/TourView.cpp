@@ -105,6 +105,7 @@ void IslandWindow::StartTour(TourStep startAt) {
     tourTime_ = tourPrevTime_ = tourClock_ = 0;
     tourSwap_ = 1;
     tourAskedNotifications_ = tourAskedPhone_ = tourAskedAgents_ = tourAskedSolu_ = false;
+    tourSoluPicking_ = false;
     std::fill(std::begin(tourDoneCheered_), std::end(tourDoneCheered_), false);
     tourFinishing_ = false;
     BOOL animations = TRUE;
@@ -163,6 +164,7 @@ void IslandWindow::TourGo(int step) {
     tourSeen_ = std::max(tourSeen_, step);
     hover_ = -1;
     TourEnter(static_cast<TourStep>(step));
+    ApplyHeightTarget();                        // the Solu step is taller: it carries the list of brains
     Animate();
 }
 
@@ -195,6 +197,13 @@ void IslandWindow::TourFinish(bool completed) {
 }
 
 #ifndef NDEBUG
+void IslandWindow::DebugTourHit(int id) {
+    if (!tourOn_ || id < kHitTourFirst || id > kHitTourLast) return;
+    TourClick(id);
+    ApplyHeightTarget();
+    Animate();
+}
+
 void IslandWindow::DebugTour(int step) {
     if (step < 0) {
         debugPinned_ = false;
@@ -286,6 +295,7 @@ IslandWindow::TourAction IslandWindow::TourActions() const {
         if (!soluPlanReady_) {
             a.status = L"Checking this PC…";
             a.statusKind = 2;
+            a.primary.clear();                      // there is nothing to move on to yet: the choice comes next
         } else if (soluSetupProgress_.stage != SoluSetupStage::Idle && soluSetupProgress_.stage != SoluSetupStage::Done &&
                   soluSetupProgress_.stage != SoluSetupStage::Failed) {
             a.status = SoluSetupStatusLine(soluSetupProgress_);
@@ -310,10 +320,17 @@ IslandWindow::TourAction IslandWindow::TourActions() const {
         } else if (tourAskedSolu_) {
             a.status = L"Waking Solu up…";
             a.statusKind = 2;
+        } else if (!soluPlan_.NothingToDo() && !tourSoluPicking_) {
+            a.primary = L"Set up Solu";             // the invitation first: the brains come when this is pressed
+            a.primaryAdvances = false;
+            a.secondary = L"Not now";
         } else if (!soluPlan_.NothingToDo()) {
-            const SoluModelChoice& model = soluPlan_.models[static_cast<size_t>(soluPlan_.recommended)];
-            a.status = L"Recommended for this PC: " + model.label + L"\nAbout " + FormatBytes(soluPlan_.EstimateBytes(model.id)) + L" to download";
-            a.primary = L"Set up Solu";
+            const SoluModelChoice& model = soluPlan_.models[static_cast<size_t>(TourModel())];
+            const std::wstring total = FormatBytes(soluPlan_.EstimateBytes(model.id)) + L" to download in all";
+            // The row already says how the chosen brain sits on this PC; repeat it here only when that is a warning.
+            a.status = model.fit == SoluModelFit::Comfortable ? total : model.fitNote + L"\n" + total;
+            a.statusKind = model.fit == SoluModelFit::Comfortable ? 0 : 3;
+            a.primary = L"Start setup";
             a.primaryAdvances = false;
             a.secondary = L"Not now";
         } else {
@@ -327,6 +344,25 @@ IslandWindow::TourAction IslandWindow::TourActions() const {
     }
     return a;
 }
+
+// The Solu step, before anything has been downloaded: the stage becomes a list of brains to choose between.
+bool IslandWindow::TourPicking() const {
+    if (!tourOn_ || tourStep_ != static_cast<int>(TourStep::Solu)) return false;
+    if (!tourSoluPicking_) return false;                       // the step opens on the invitation, not on the list
+    if (!soluPlanReady_ || soluPlan_.NothingToDo() || soluPlan_.models.empty()) return false;
+    if (solu_.enabled || tourAskedSolu_) return false;
+    const SoluSetupStage st = soluSetupProgress_.stage;
+    return st == SoluSetupStage::Idle || st == SoluSetupStage::Failed;
+}
+
+int IslandWindow::TourModel() const {
+    if (soluPlan_.models.empty()) return 0;
+    const int last = static_cast<int>(soluPlan_.models.size()) - 1;
+    if (tourModel_ < 0) return std::clamp(soluPlan_.recommended, 0, last);
+    return std::clamp(tourModel_, 0, last);
+}
+
+float IslandWindow::TourHeight() const { return TourPicking() ? kTourSoluH : kTourH; }
 
 IslandWindow::TourLayout IslandWindow::TourGeometry(const D2D1_RECT_F& island) const {
     TourLayout g;
@@ -349,7 +385,8 @@ IslandWindow::TourLayout IslandWindow::TourGeometry(const D2D1_RECT_F& island) c
     IDWriteTextFormat* button = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     const float h = 32, y1 = g.text.bottom, y0 = y1 - h;
     const float pw = std::ceil(gfx_.MeasureWidth(act.primary.c_str(), button)) + 34;
-    g.primary = D2D1::RectF(g.text.right - pw, y0, g.text.right, y1);
+    if (!act.primary.empty()) g.primary = D2D1::RectF(g.text.right - pw, y0, g.text.right, y1);
+    else g.primary = D2D1::RectF(g.text.right, y0, g.text.right, y1);   // nothing to press: it takes no room
     if (!act.secondary.empty()) {
         const float sw = std::ceil(gfx_.MeasureWidth(act.secondary.c_str(), button)) + 28;
         g.secondary = D2D1::RectF(g.primary.left - 8 - sw, y0, g.primary.left - 8, y1);
@@ -361,6 +398,15 @@ IslandWindow::TourLayout IslandWindow::TourGeometry(const D2D1_RECT_F& island) c
         if (g.back.right > limit) g.back = {};                            // no room: the dots still go back
     }
     if (tourStep_ == static_cast<int>(TourStep::Done)) g.toggle = D2D1::RectF(g.text.left, y0 - 48, g.text.right, y0 - 14);
+    if (TourPicking()) {                        // the brains, filling the stage under their heading
+        const int rows = std::min(kTourModelRows, static_cast<int>(soluPlan_.models.size()));
+        const float listTop = g.stage.top + 34, listBottom = g.stage.bottom - 10;
+        const float rowH = std::min(40.0f, (listBottom - listTop - (rows - 1) * 3.0f) / static_cast<float>(std::max(rows, 1)));
+        for (int i = 0; i < rows; ++i) {
+            const float y = listTop + i * (rowH + 3.0f);
+            g.models[static_cast<size_t>(i)] = D2D1::RectF(g.stage.left + 10, y, g.stage.right - 10, y + rowH);
+        }
+    }
     return g;
 }
 
@@ -375,6 +421,8 @@ int IslandWindow::TourHit(D2D1_POINT_2F p, const D2D1_RECT_F& island) const {
     if (in(g.back)) return kHitTourBack;
     if (in(g.skip)) return kHitTourSkip;
     if (in(g.toggle)) return kHitTourSwitch;
+    for (int i = 0; i < kTourModelRows; ++i)
+        if (in(g.models[static_cast<size_t>(i)])) return kHitTourModel + i;
     for (int i = 0; i < kTourSteps; ++i)
         if (i + 1 != tourStep_ && i + 1 <= tourSeen_ && in(g.dots[static_cast<size_t>(i)], 5)) return kHitTourDot + i;
     return -1;
@@ -384,8 +432,22 @@ void IslandWindow::TourClick(int id) {
     const TourAction act = TourActions();
     const auto step = static_cast<TourStep>(tourStep_);
     if (id == kHitTourSkip) return TourFinish(false);
-    if (id == kHitTourBack) return TourGo(tourStep_ - 1);
+    if (id == kHitTourBack) {
+        if (TourPicking()) {                         // out of the list, back to the invitation
+            tourSoluPicking_ = false;
+            ApplyHeightTarget();
+            return;
+        }
+        return TourGo(tourStep_ - 1);
+    }
     if (id >= kHitTourDot && id < kHitTourDot + kTourSteps) return TourGo(id - kHitTourDot + 1);
+    if (id >= kHitTourModel && id < kHitTourModel + kTourModelRows) {
+        const int k = id - kHitTourModel;
+        if (k >= static_cast<int>(soluPlan_.models.size())) return;
+        tourModel_ = k;
+        Log("tour: Solu's brain set to %ls", soluPlan_.models[static_cast<size_t>(k)].id.c_str());
+        return;
+    }
     if (id == kHitTourSwitch) {
         tourStatus_.autostart = !tourStatus_.autostart;               // shown at once; the app confirms on its next refresh
         if (tour_.autostart) tour_.autostart(tourStatus_.autostart);
@@ -418,9 +480,15 @@ void IslandWindow::TourClick(int id) {
         if (tour_.allowPhone) tour_.allowPhone();
         break;
     case TourStep::Solu:
+        if (soluPlanReady_ && !soluPlan_.NothingToDo() && !tourSoluPicking_) {
+            tourSoluPicking_ = true;                 // "Set up Solu": now show which brain it should download
+            ApplyHeightTarget();
+            break;
+        }
         tourAskedSolu_ = true;
         if (soluPlanReady_ && !soluPlan_.NothingToDo()) {
-            if (tour_.soluSetupBegin) tour_.soluSetupBegin(soluPlan_.models[static_cast<size_t>(soluPlan_.recommended)].id);
+            if (tour_.soluSetupBegin) tour_.soluSetupBegin(soluPlan_.models[static_cast<size_t>(TourModel())].id);
+            ApplyHeightTarget();                     // the list goes away; the island settles back
         } else if (tour_.turnOnSolu) {
             tour_.turnOnSolu();
         }
@@ -439,6 +507,9 @@ bool IslandWindow::TourAnimate(float dt) {
         moving |= Approach(tourSwap_, 1.0f, dt, 7.5f);
     }
     for (int i = 0; i < 5; ++i) moving |= Approach(tourHover_[static_cast<size_t>(i)], hover_ == kHitTourPrimary + i ? 1.0f : 0.0f, dt, 22.0f);
+    moving |= Approach(tourPick_, TourPicking() ? 1.0f : 0.0f, dt, 9.0f);
+    for (int i = 0; i < kTourModelRows; ++i)
+        moving |= Approach(tourModelHover_[static_cast<size_t>(i)], hover_ == kHitTourModel + i ? 1.0f : 0.0f, dt, 22.0f);
     // A permission the user just gave: the cat is pleased (once per step).
     const bool asked = (tourStep_ == static_cast<int>(TourStep::Notifications) && tourAskedNotifications_) ||
                        (tourStep_ == static_cast<int>(TourStep::Agents) && tourAskedAgents_) ||
@@ -489,8 +560,12 @@ void IslandWindow::DrawTour(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
         DrawTourScene(dc, static_cast<TourStep>(tourPrev_), g.stage, alpha * (1 - e), tourPrevTime_);
     }
     dc->SetTransform(D2D1::Matrix3x2F::Translation(sliding ? tourDir_ * 36.0f * (1 - e) : 0.0f, 0) * old);
-    DrawTourScene(dc, static_cast<TourStep>(tourStep_), g.stage, alpha * (sliding ? e : 1.0f), tourTime_);
+    // While Solu asks which brain to download, the list covers the scene: once it has, the scene stops being drawn
+    // at all, so nothing of its glow shows through and no frame is spent animating what nobody can see.
+    if (tourPick_ < 0.995f)
+        DrawTourScene(dc, static_cast<TourStep>(tourStep_), g.stage, alpha * (sliding ? e : 1.0f) * (1 - tourPick_), tourTime_);
     dc->SetTransform(old);
+    if (tourPick_ > 0.004f) DrawTourModels(dc, g, alpha * tourPick_, sliding ? tourDir_ * 36.0f * (1 - e) : 0.0f);
     if (mask) dc->PopLayer();
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.07f * alpha));
     dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{Inflate(g.stage, -0.5f, -0.5f), 15.5f, 15.5f}, brush_.Get(), 1.0f);
@@ -498,6 +573,66 @@ void IslandWindow::DrawTour(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
     // The words, sliding the same way.
     if (sliding) DrawTourStep(dc, static_cast<TourStep>(tourPrev_), g, alpha * (1 - e), -tourDir_ * 18.0f * e, tourPrevTime_);
     DrawTourStep(dc, static_cast<TourStep>(tourStep_), g, alpha * (sliding ? e : 1.0f), sliding ? tourDir_ * 18.0f * (1 - e) : 0.0f, tourTime_);
+}
+
+// The brains Solu could run, smallest first. Every one is choosable - it is the user's PC - but the one this PC can
+// carry without taking the whole graphics card is marked, and the ones that would struggle say so rather than
+// pretending otherwise.
+void IslandWindow::DrawTourModels(ID2D1DeviceContext* dc, const TourLayout& g, float a, float dx) {
+    if (a < 0.004f || soluPlan_.models.empty()) return;
+    const int rows = std::min(kTourModelRows, static_cast<int>(soluPlan_.models.size()));
+    const int chosen = TourModel();
+    // The scene is still animating underneath: cover it, or its speech bubbles read through the rows.
+    brush_->SetColor(D2D1::ColorF(0.055f, 0.055f, 0.075f, a));
+    dc->FillRectangle(Shift(g.stage, dx, 0), brush_.Get());
+    DrawText(dc, L"Choose Solu's brain", gfx_.Text(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+             D2D1::RectF(g.stage.left + 16 + dx, g.stage.top + 10, g.stage.right - 12 + dx, g.stage.top + 28), WithAlpha(kText, 0.55f * a));
+    DrawText(dc, soluPlan_.hasDedicatedGpu ? FormatBytes(soluPlan_.vramBytes).append(L" card").c_str() : L"no graphics card",
+             gfx_.Text(10.5f, DWRITE_FONT_WEIGHT_NORMAL), D2D1::RectF(g.stage.left + 16 + dx, g.stage.top + 10, g.stage.right - 14 + dx, g.stage.top + 28),
+             WithAlpha(kText, 0.34f * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+    IDWriteTextFormat* nameFont = gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* smallFont = gfx_.Text(10.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* tagFont = gfx_.Text(9.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    for (int i = 0; i < rows; ++i) {
+        const SoluModelChoice& m = soluPlan_.models[static_cast<size_t>(i)];
+        const D2D1_RECT_F row = Shift(g.models[static_cast<size_t>(i)], dx, 0);
+        if (row.right <= row.left) continue;
+        const bool on = i == chosen;
+        const float hot = tourModelHover_[static_cast<size_t>(i)];
+        const float dim = m.fit == SoluModelFit::TooBig ? 0.45f : 1.0f;      // still choosable, just honest about it
+        brush_->SetColor(on ? WithAlpha(kBrandLight, 0.16f * a) : D2D1::ColorF(1, 1, 1, (0.04f + 0.05f * hot) * a));
+        dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{row, 10, 10}, brush_.Get());
+        if (on) {
+            brush_->SetColor(WithAlpha(kBrandLight, 0.55f * a));
+            dc->DrawRoundedRectangle(D2D1_ROUNDED_RECT{Inflate(row, -0.5f, -0.5f), 9.5f, 9.5f}, brush_.Get(), 1.2f);
+        }
+        const float cy = (row.top + row.bottom) / 2;
+        const D2D1_POINT_2F dot{row.left + 17, cy};
+        brush_->SetColor(on ? WithAlpha(kBrandLight, a) : D2D1::ColorF(1, 1, 1, 0.26f * a));
+        dc->DrawEllipse(D2D1::Ellipse(dot, 6.5f, 6.5f), brush_.Get(), 1.4f);
+        if (on) {
+            brush_->SetColor(WithAlpha(kBrandLight, a));
+            dc->FillEllipse(D2D1::Ellipse(dot, 3.4f, 3.4f), brush_.Get());
+        }
+        const float x = row.left + 32;
+        const std::wstring size = m.ready ? L"Already here" : FormatBytes(m.approxBytes);
+        const float sizeW = std::ceil(gfx_.MeasureWidth(size.c_str(), smallFont)) + 2;
+        DrawText(dc, size.c_str(), smallFont, D2D1::RectF(row.right - 12 - sizeW, row.top + 6, row.right - 12, row.top + 21),
+                 WithAlpha(m.ready ? kGreen : kText, (m.ready ? 0.85f : 0.45f) * dim * a), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        float nameRight = row.right - 18 - sizeW;
+        if (i == soluPlan_.recommended) {                                    // the one this PC runs comfortably
+            const float tagW = std::ceil(gfx_.MeasureWidth(L"Recommended", tagFont)) + 14;
+            const D2D1_RECT_F tag = D2D1::RectF(nameRight - tagW, row.top + 6, nameRight, row.top + 21);
+            brush_->SetColor(WithAlpha(kGreen, 0.18f * a));
+            dc->FillRoundedRectangle(D2D1_ROUNDED_RECT{tag, 7, 7}, brush_.Get());
+            DrawText(dc, L"Recommended", tagFont, D2D1::RectF(tag.left, tag.top + 1, tag.right, tag.bottom), WithAlpha(kGreen, 0.95f * a),
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+            nameRight = tag.left - 8;
+        }
+        DrawText(dc, m.label.c_str(), nameFont, D2D1::RectF(x, row.top + 4, nameRight, row.top + 22), WithAlpha(kText, dim * a));
+        DrawText(dc, m.id.c_str(), smallFont, D2D1::RectF(x, row.top + 21, row.right - 12, row.bottom - 3), WithAlpha(kText, 0.38f * dim * a));
+    }
 }
 
 void IslandWindow::DrawTourStep(ID2D1DeviceContext* dc, TourStep step, const TourLayout& g, float a, float dx, float time) {
@@ -583,7 +718,8 @@ void IslandWindow::DrawTourStep(ID2D1DeviceContext* dc, TourStep step, const Tou
         DrawText(dc, L"Back", gfx_.Text(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), Shift(g.back, dx, 0),
                  WithAlpha(kText, (0.50f + 0.45f * tourHover_[2]) * a), DWRITE_TEXT_ALIGNMENT_CENTER);
     if (!act.secondary.empty()) DrawShareButton(dc, Shift(g.secondary, dx, 0), act.secondary.c_str(), false, true, hover_ == kHitTourSecondary, a);
-    if (!tourFinishing_) DrawShareButton(dc, Shift(g.primary, dx, 0), act.primary.c_str(), true, true, hover_ == kHitTourPrimary, a);
+    if (!tourFinishing_ && !act.primary.empty())
+        DrawShareButton(dc, Shift(g.primary, dx, 0), act.primary.c_str(), true, true, hover_ == kHitTourPrimary, a);
 }
 
 // The closed island, inviting: the mark, a welcome, how to open it, and a soft pulse so it is noticed.

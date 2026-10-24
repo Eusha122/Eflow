@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/Gfx.h"
+#include "island/IslandStyle.h"
 #include "island/Spring.h"
 #include "mascot/Mascot.h"
 #include "services/AudioDevices.h"
@@ -205,6 +206,7 @@ public:
     void SetTourHandlers(TourHandlers handlers) { tour_ = std::move(handlers); }
 #ifndef NDEBUG
     void DebugTour(int step);                    // layout checks: the tour open on `step` (-1 ends it)
+    void DebugTourHit(int id);                   // ...and pressing one of its controls, without moving the mouse
 #endif
 
 private:
@@ -636,6 +638,7 @@ private:
     struct TourLayout {
         D2D1_RECT_F header, skip, stage, text, primary, secondary, back, toggle;
         std::array<D2D1_RECT_F, 7> dots{};      // one per step after the invite
+        std::array<D2D1_RECT_F, kTourModelRows> models{};   // the brains to choose between, on the Solu step
     };
     struct TourAction {                          // the step's buttons and its one line of status
         std::wstring primary, secondary, status;
@@ -657,6 +660,10 @@ private:
     void DrawTourInvite(ID2D1DeviceContext* dc, const D2D1_RECT_F& pill, float alpha);
     void DrawTourStep(ID2D1DeviceContext* dc, TourStep step, const TourLayout& g, float a, float dx, float time);
     void DrawTourScene(ID2D1DeviceContext* dc, TourStep step, D2D1_RECT_F stage, float a, float time);
+    bool TourPicking() const;                    // the Solu step is asking which brain to download
+    int TourModel() const;                       // the chosen brain, or this PC's recommendation while none is chosen
+    void DrawTourModels(ID2D1DeviceContext* dc, const TourLayout& g, float a, float dx);
+    float TourHeight() const;                    // the island's height for the step being shown
     void TourFinish(bool completed);             // completed: the cat cheers, then the island closes; else it closes now
     float TourInviteW() const;
     void DrawLogoMark(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float size, float a, bool tile);
@@ -693,6 +700,10 @@ private:
     bool soluPlanReady_ = false;
     SoluSetupPlan soluPlan_;
     SoluSetupProgress soluSetupProgress_;
+    bool tourSoluPicking_ = false;               // "Set up Solu" was pressed: the step shows the brains to choose from
+    int tourModel_ = -1;                         // which brain the user picked; -1 follows this PC's recommendation
+    std::array<float, kTourModelRows> tourModelHover_{};
+    float tourPick_ = 0.0f;                      // the list of brains fading in over the Solu scene
     bool reducedMotion_ = false;                 // Windows' "Animation effects" is off: still scenes
     std::array<Com<ID2D1PathGeometry>, 4> tourPaths_;
     Com<ID2D1StrokeStyle> tourStroke_;

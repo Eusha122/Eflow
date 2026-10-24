@@ -1407,7 +1407,12 @@ void IslandWindow::OnClick(int id) {
         if (popover_ == 3) {                                       // the gear's menu
             const int k = voiceScroll_ + (id - kHitPopRow);
             if (settingsPage_ == 0) {
-                if (k == 0) {                                      // Solu AI on / off
+                if (k == 0) {                                      // Solu AI on / off, or its guided setup
+                    if (solu_.state == SoluState::Missing) {
+                        OpenPopover(-1);
+                        StartTour(TourStep::Solu);
+                        return;
+                    }
                     solu_.enabled = !solu_.enabled;
                     if (soluEnable_) soluEnable_(solu_.enabled);
                 } else if (k == 1) {                               // live captions
@@ -2422,7 +2427,7 @@ void IslandWindow::DrawPermission(ID2D1DeviceContext* dc, D2D1_RECT_F base, floa
 // ---- messages --------------------------------------------------------------------------------
 
 float IslandWindow::TargetHeight() const {
-    if (TourShown()) return kTourH;
+    if (TourShown()) return TourHeight();
     if (popover_ >= 0) return std::clamp(MenuHeight(popover_), kExpandedH, kMaxPanelH);
     if (section_ == Section::Ai && !permissions_.empty())         // a long approval card (an email) makes the island taller
         return std::clamp(96.0f + PermissionDetailH() + 6.0f + 28.0f + 14.0f, kExpandedH, kMaxPanelH);
@@ -3011,7 +3016,16 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
     std::wstring soluNote;
     switch (solu_.state) {
     case SoluState::Off: soluNote = solu_.error.empty() ? L"Off — switch on to talk hands-free" : solu_.error; break;
-    case SoluState::Missing: soluNote = L"Not installed (run tools\\setup_solu.ps1)"; break;
+    case SoluState::Missing: {                   // never a switch here: there is nothing yet to switch on
+        const SoluSetupStage st = soluSetupProgress_.stage;
+        if (st != SoluSetupStage::Idle && st != SoluSetupStage::Done && st != SoluSetupStage::Failed)
+            soluNote = soluSetupProgress_.label.empty() ? L"Setting up…" : soluSetupProgress_.label;
+        else if (st == SoluSetupStage::Failed)
+            soluNote = L"Setting up didn’t finish · tap to try again";
+        else
+            soluNote = L"Not set up yet · tap to set it up";
+        break;
+    }
     case SoluState::Loading: soluNote = L"Waking up…"; break;
     case SoluState::Ready: soluNote = L"Listening for “Solu”"; break;
     case SoluState::Listening: soluNote = L"In a conversation"; break;
@@ -3033,7 +3047,12 @@ void IslandWindow::DrawSettingsMenu(ID2D1DeviceContext* dc, const PopoverLayout&
         bool isSwitch = false, on = false, chevron = false, selected = false;
         if (!voicePage && !mutePage && !islandPage) {              // the options page
             switch (k) {
-            case 0: title = L"Solu AI"; note = soluNote; isSwitch = true; on = solu_.enabled; break;
+            case 0:
+                title = L"Solu AI";
+                note = soluNote;
+                if (solu_.state == SoluState::Missing) chevron = true;    // it opens the guided setup instead
+                else { isSwitch = true; on = solu_.enabled; }
+                break;
             case 1: title = L"Solu's live captions"; note = L"Show your conversation with Solu on the island"; isSwitch = true; on = solu_.captions; break;
             case 2: title = L"Headphones mode"; note = solu_.headphones ? L"You can talk over Solu" : L"Solu waits until it has finished talking";
                     isSwitch = true; on = solu_.headphones; break;
@@ -3145,7 +3164,25 @@ void IslandWindow::DrawSolu(ID2D1DeviceContext* dc, D2D1_RECT_F base, float alph
         title = L"Solu is off";
         sub = solu_.error.empty() ? L"Switch it on in Settings (the gear) and just say “Solu”." : solu_.error;
         break;
-    case SoluState::Missing: title = L"Solu isn't set up yet"; sub = L"Tap to set it up"; tint = kAccent; break;
+    case SoluState::Missing: {
+        const SoluSetupStage st = soluSetupProgress_.stage;      // the guided setup can be running while Solu is still missing
+        if (st != SoluSetupStage::Idle && st != SoluSetupStage::Done && st != SoluSetupStage::Failed) {
+            title = L"Setting Solu up…";
+            sub = soluSetupProgress_.label;
+            if (soluSetupProgress_.totalBytes > 0)
+                sub += L" · " + std::to_wstring(std::min<uint64_t>(100, soluSetupProgress_.doneBytes * 100 / soluSetupProgress_.totalBytes)) + L"%";
+            tint = kAmber;
+        } else if (st == SoluSetupStage::Failed) {
+            title = L"Setting Solu up didn’t finish";
+            sub = L"Tap to try again";
+            tint = kAccent;
+        } else {
+            title = L"Solu isn't set up yet";
+            sub = L"Tap to set it up";
+            tint = kAccent;
+        }
+        break;
+    }
     case SoluState::Loading: title = L"Solu is waking up…"; sub = L"It loads its models, a few seconds."; tint = kAmber; break;
     case SoluState::Ready: title = L"Solu is listening"; sub = L"Say “Solu”, or press Ctrl+Alt+Space."; tint = kGreen; break;
     case SoluState::Listening: title = L"I'm listening"; sub = L"Go ahead."; tint = kGreen; break;
